@@ -15,6 +15,7 @@ body {
     padding: 20px;
     border-radius: 5px;
     box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+    text-align: center;
 }
 
 h2 {
@@ -24,6 +25,9 @@ h2 {
 
 form {
     margin-top: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
 }
 
 input[type="text"],
@@ -51,13 +55,14 @@ button:hover {
 }
 
 #generateBtn {
-    width: 100%;
+    width: 80%;
     padding: 10px;
     background-color: #4CAF50;
     color: #fff;
     border: none;
     border-radius: 3px;
     cursor: pointer;
+    margin-right: 10px;
 }
 
 #generateBtn:hover {
@@ -65,15 +70,20 @@ button:hover {
 }
 
 #notesBtn {
-    width: 100%;
+    width: 60%;
     padding: 10px;
     background-color: #008CBA;
     color: #fff;
     border: none;
     border-radius: 3px;
     cursor: pointer;
+    margin-top: 5px;
 }
 
 #notesBtn:hover {
     background-color: #006080;
+}
+
+.button-spacing {
+    margin-top: 10px;
 }
