@@ -1,4 +1,8 @@
 document.addEventListener('DOMContentLoaded', (event) => {
+    if (localStorage.getItem('loggedIn') === 'true') {
+        window.location.href = "nextpage.html";
+    }
+
     document.getElementById('loginBtn').addEventListener('click', function(event) {
         event.preventDefault();
 
@@ -6,7 +10,7 @@ document.addEventListener('DOMContentLoaded', (event) => {
         let password = document.getElementById('password').value;
 
         if (checkCredentials(username, password)) {
-            // Redirect to the next page
+            localStorage.setItem('loggedIn', 'true');
             window.location.href = "nextpage.html";
         } else {
             alert('Invalid username or password');
