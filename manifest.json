@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "GPT - Selection",
+  "version": "1.0",
+  "description": "A powerful Chrome extension leveraging AI to generate answers based on the selected text on a webpage. Explore the web with the power of AI at your fingertips.",
+  "permissions": ["activeTab"],
+  "action": {
+    "default_popup": "login.html",
+    "default_icon": {
+      "16": "Images/icon16.png",
+      "48": "Images/icon48.png",
+      "128": "Images/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["contentScript.js"]
+    }
+  ]
+}
