@@ -86,7 +86,7 @@ test("searches Persian content and distinguishes filtered results", async () => 
   await waitFor(() => setup.dom.window.document.querySelectorAll(".note-card").length === 1);
   assert.equal(setup.dom.window.document.querySelectorAll(".note-card").length, 1);
   assert.equal(setup.dom.window.document.querySelector(".note-title").textContent, "ماتریس");
-  assert.equal(setup.dom.window.document.getElementById("resultSummary").textContent, "Showing 1 of 2 notes");
+  assert.equal(setup.dom.window.document.getElementById("resultSummary").textContent, "1 matching note (2 total)");
   controller.destroy();
   setup.dom.window.close();
 });

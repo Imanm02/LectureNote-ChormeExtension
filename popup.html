@@ -39,7 +39,8 @@
 
         <div class="field">
           <label for="courseInput">Course <span class="optional">Optional</span></label>
-          <input id="courseInput" name="course" type="text" maxlength="80" autocomplete="off" dir="auto">
+          <input id="courseInput" name="course" type="text" maxlength="80" autocomplete="off" list="courseSuggestions" placeholder="Type or choose a course" dir="auto">
+          <datalist id="courseSuggestions"></datalist>
         </div>
 
         <div class="field">
@@ -60,7 +61,7 @@
         </div>
 
         <div id="duplicateNotice" class="notice notice-warning" role="alert" hidden>
-          <p>An identical note already exists.</p>
+          <p>A note with the same text, course, and source URL already exists.</p>
           <button id="saveCopyButton" class="button button-secondary compact" type="button">Save another copy</button>
         </div>
 

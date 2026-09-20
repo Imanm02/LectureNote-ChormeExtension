@@ -6,16 +6,16 @@ The extension uses plain HTML, CSS, and JavaScript modules. It has no runtime de
 
 ## What it does
 
-- Captures selected text, the page title, and a cleaned source URL when you open the popup.
+- Captures selected text, the page title, and a cleaned source URL, then keeps that source ready for another note.
 - Supports manual notes on pages where Chrome blocks selection access.
 - Saves unfinished popup drafts and restores them when the popup reopens.
 - Shows the three most recently updated notes in the popup.
-- Organizes notes with optional course labels.
-- Searches note titles, text, courses, and sources.
+- Organizes notes with optional course labels and suggests courses already in the library.
+- Searches note titles, text, courses, and sources using words in any order, with Persian and Arabic letter matching.
 - Filters by course and sorts by update time, creation time, or title.
-- Creates, edits, copies, deletes, and restores deleted notes.
-- Warns about exact duplicates while allowing an intentional copy.
-- Exports a restorable JSON backup or a readable Markdown file.
+- Creates, edits, copies, and deletes notes, with temporary undo for the latest deletion.
+- Warns when another note has the same text, course, and source URL, while allowing an intentional copy.
+- Exports the full library as a restorable JSON backup, or the current filtered and sorted view as Markdown.
 - Restores JSON backups by merging with or replacing the current library.
 - Supports system, light, and dark themes, plus RTL and Unicode text.
 
@@ -44,11 +44,13 @@ After pulling a source update, return to `chrome://extensions` and select **Relo
 ## Use it
 
 1. Select text on a lecture page, then open Lecture Notes from the toolbar or with `Ctrl+Shift+Y`.
-2. Review the captured title and text, add an optional course, then save.
+2. Review the captured title and text, choose or enter an optional course, then save.
 3. Open the library to search, filter, edit, copy, or delete notes.
 4. Export a backup before clearing the Chrome profile or replacing the library.
 
-If a note title is blank, the first nonempty line of the note becomes its title. During restore, **Merge notes** skips matching notes. **Replace library** removes the current library after confirmation.
+After a save, the popup clears the note text but keeps the current page source and course ready for the next note. If a note title is blank, the first nonempty line of the note becomes its title.
+
+JSON backups always include the full library. Markdown export follows the current search, course filter, and sort order. During restore, **Merge notes** preserves separately saved copies and skips a backup note only when its ID, text, course, and source URL match a note already present. **Replace library** removes the current library after confirmation.
 
 ### Keyboard shortcuts
 
@@ -84,7 +86,7 @@ Install Node.js 24.15 or newer in the Node 24 line, or Node.js 26 or newer. Then
 npm ci
 ```
 
-Run the main validation suite:
+Run the local validation suite before committing:
 
 ```bash
 npm run validate
@@ -111,7 +113,7 @@ npm audit --audit-level=moderate
 - `npm test` runs the Node unit, integration, and DOM tests.
 - `npm run check:extension` validates the manifest, permissions, icons, local resources, script syntax, unsafe HTML sinks, dynamic code, network calls, and common credential patterns.
 - `npm run validate` runs lint, tests, and extension validation.
-- `npm run test:browser` loads the unpacked extension in Playwright Chromium and checks selection handling, drafts, browser restart persistence, note operations, Persian search, backup restore, theme switching, and delete undo.
+- `npm run test:browser` loads the unpacked extension in Playwright Chromium against a local test page and checks selection handling, drafts, browser restart persistence, note operations, Persian search, backup restore, theme switching, and delete undo.
 - `npm run test:coverage` runs the test suite with Node's coverage reporter.
 
 Headless Chromium may not expose the browser action popup after the `_execute_action` command. The browser test reports that case, while still testing the popup directly and exercising the same selection reader in a real page.
@@ -152,7 +154,7 @@ The storage byte limit can be reached before the note-count limit when notes are
 - Chrome blocks selection injection on protected pages such as `chrome://` pages and the Chrome Web Store. Manual note entry still works.
 - Notes belong to one Chrome profile. There is no account sync, cloud backup, or collaboration.
 - Stored data and exported backups are not encrypted.
-- Delete undo is available only in the current open library session. There is no trash folder.
+- Delete undo is temporary. It is cleared when you dismiss it, change the library, restore a backup, or close the library tab. There is no trash folder.
 - Browser support outside Chrome 114 or newer has not been established.
 
 ## License

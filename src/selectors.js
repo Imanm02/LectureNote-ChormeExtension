@@ -1,7 +1,12 @@
 import { SORT_VALUES } from "./model.js";
 
 function searchText(value) {
-  return value.normalize("NFKC").toLowerCase();
+  return String(value)
+    .normalize("NFKD")
+    .replace(/\p{M}+/gu, "")
+    .replace(/[\u0649\u064a]/gu, "\u06cc")
+    .replace(/\u0643/gu, "\u06a9")
+    .toLowerCase();
 }
 
 function compareIdentifiers(left, right) {
@@ -9,24 +14,25 @@ function compareIdentifiers(left, right) {
 }
 
 export function selectNotes(notes, { query = "", course = "", sort = "updated-desc" } = {}) {
-  const normalizedQuery = searchText(String(query).trim());
+  const queryTokens = searchText(query).trim().split(/\s+/u).filter(Boolean);
   const normalizedCourse = searchText(String(course).trim());
   const selected = notes.filter((note) => {
     const courseMatches = !normalizedCourse || searchText(note.course) === normalizedCourse;
     if (!courseMatches) {
       return false;
     }
-    if (!normalizedQuery) {
+    if (queryTokens.length === 0) {
       return true;
     }
 
-    return [
+    const searchableText = searchText([
       note.title,
       note.body,
       note.course,
       note.source.title,
       note.source.url,
-    ].some((value) => searchText(value).includes(normalizedQuery));
+    ].join("\n"));
+    return queryTokens.every((token) => searchableText.includes(token));
   });
 
   const chosenSort = SORT_VALUES.includes(sort) ? sort : "updated-desc";

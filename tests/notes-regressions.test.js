@@ -44,7 +44,7 @@ function setupDocument() {
   return dom;
 }
 
-async function setupLibrary(t, notes, storage = null) {
+async function setupLibrary(t, notes, storage = null, options = {}) {
   const dom = setupDocument();
   const storageValue = storage || memoryStorage({
     [STORAGE_KEYS.state]: { ...createEmptyState(), notes },
@@ -53,8 +53,9 @@ async function setupLibrary(t, notes, storage = null) {
   const controller = await initLibrary({
     documentValue: dom.window.document,
     chromeApi,
-    navigatorValue: { clipboard: { async writeText() {} } },
-    urlApi: {
+    navigatorValue: options.navigatorValue || { clipboard: { async writeText() {} } },
+    timerApi: options.timerApi,
+    urlApi: options.urlApi || {
       createObjectURL() {
         return "blob:test";
       },
@@ -389,9 +390,106 @@ test("renders 101 notes in two batches", async (t) => {
   documentValue.getElementById("showMoreButton").click();
   assert.equal(documentValue.querySelectorAll(".note-card").length, 101);
   assert.equal(documentValue.getElementById("showMoreButton").hidden, true);
-  assert.equal(documentValue.getElementById("resultSummary").textContent, "Showing 101 of 101 notes");
+  assert.equal(documentValue.getElementById("resultSummary").textContent, "101 notes");
   assert.equal(
     documentValue.activeElement.closest("[data-note-id]"),
     documentValue.querySelectorAll("[data-note-id]")[100],
   );
+});
+
+test("suggests saved courses and labels the active date sort", async (t) => {
+  const first = note("first", "First body", { course: "Physics" });
+  const second = {
+    ...note("second", "Second body", { course: "CS 101" }),
+    updatedAt: "2026-09-20T12:00:00.000Z",
+  };
+  const setup = await setupLibrary(t, [first, second]);
+  const { controller, documentValue } = setup;
+
+  assert.deepEqual(
+    [...documentValue.querySelectorAll("#editorCourseSuggestions option")].map((option) => option.value),
+    ["CS 101", "Physics"],
+  );
+  assert.match(documentValue.querySelector(".note-time").textContent, /^Updated /u);
+
+  const sort = documentValue.getElementById("sortSelect");
+  sort.value = "created-desc";
+  sort.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  await waitFor(() => controller.getState().settings.sort === "created-desc");
+
+  assert.match(documentValue.querySelector(".note-time").textContent, /^Created /u);
+  assert.match(documentValue.querySelector(".note-time").title, /^Created /u);
+});
+
+test("exports only the current filtered view as Markdown", async (t) => {
+  const blobs = [];
+  const urlApi = {
+    createObjectURL(blob) {
+      blobs.push(blob);
+      return "blob:test";
+    },
+    revokeObjectURL() {},
+  };
+  const setup = await setupLibrary(
+    t,
+    [
+      note("graph", "Graph paths", { title: "Graph lecture", course: "CS 101" }),
+      note("history", "Ancient history", { title: "History lecture", course: "History" }),
+    ],
+    null,
+    { urlApi },
+  );
+  const { documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  const search = documentValue.getElementById("searchInput");
+  search.value = "graph";
+  search.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  await waitFor(() => documentValue.getElementById("resultSummary").textContent === "1 matching note (2 total)");
+
+  documentValue.getElementById("exportMarkdownButton").click();
+  await waitFor(() => blobs.length === 1);
+  const markdown = await blobs[0].text();
+
+  assert.match(markdown, /Graph lecture/u);
+  assert.doesNotMatch(markdown, /History lecture/u);
+  assert.equal(
+    documentValue.getElementById("libraryStatus").textContent,
+    "Exported 1 note from the current view as Markdown.",
+  );
+
+  search.value = "not present";
+  search.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  await waitFor(() => documentValue.getElementById("resultSummary").textContent === "No matching notes");
+  documentValue.getElementById("exportMarkdownButton").click();
+
+  assert.equal(blobs.length, 1);
+  assert.equal(documentValue.getElementById("libraryStatus").textContent, "No notes match the current view.");
+});
+
+test("shows copy feedback on the selected note", async (t) => {
+  const scheduled = [];
+  const copied = [];
+  const setup = await setupLibrary(
+    t,
+    [note("copy", "Copy body")],
+    null,
+    {
+      navigatorValue: { clipboard: { async writeText(value) { copied.push(value); } } },
+      timerApi: {
+        clearTimeout() {},
+        setTimeout(callback) {
+          scheduled.push(callback);
+          return scheduled.length;
+        },
+      },
+    },
+  );
+  const { documentValue } = setup;
+  const button = documentValue.querySelector("[data-action='copy']");
+  button.click();
+  await waitFor(() => button.textContent === "Copied");
+
+  assert.match(copied[0], /Copy body/u);
+  scheduled.shift()();
+  assert.equal(button.textContent, "Copy");
 });

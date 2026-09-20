@@ -46,6 +46,7 @@ function libraryElements(documentValue) {
     emptyNewNote: requiredElement(documentValue, "emptyNewNoteButton"),
     search: requiredElement(documentValue, "searchInput"),
     course: requiredElement(documentValue, "courseFilter"),
+    courseSuggestions: requiredElement(documentValue, "editorCourseSuggestions"),
     sort: requiredElement(documentValue, "sortSelect"),
     theme: requiredElement(documentValue, "themeSelect"),
     exportJson: requiredElement(documentValue, "exportJsonButton"),
@@ -210,11 +211,16 @@ export async function initLibrary({
     allOption.value = "";
     allOption.textContent = "All courses";
     elements.course.replaceChildren(allOption);
+    elements.courseSuggestions.replaceChildren();
     for (const course of courses) {
       const option = documentValue.createElement("option");
       option.value = course;
       option.textContent = course;
       elements.course.append(option);
+
+      const suggestion = documentValue.createElement("option");
+      suggestion.value = course;
+      elements.courseSuggestions.append(suggestion);
     }
     elements.course.value = [...elements.course.options].some((option) => option.value === selected)
       ? selected
@@ -232,9 +238,12 @@ export async function initLibrary({
     const title = fragment.querySelector(".note-title");
     title.textContent = note.title;
     const time = fragment.querySelector(".note-time");
-    time.dateTime = note.updatedAt;
-    time.textContent = formatDate(note.updatedAt);
-    time.title = `Updated ${note.updatedAt}`;
+    const showCreated = state.settings.sort.startsWith("created-");
+    const dateValue = showCreated ? note.createdAt : note.updatedAt;
+    const dateLabel = showCreated ? "Created" : "Updated";
+    time.dateTime = dateValue;
+    time.textContent = `${dateLabel} ${formatDate(dateValue)}`;
+    time.title = `${dateLabel} ${dateValue}`;
 
     const excerpt = fragment.querySelector(".note-excerpt");
     excerpt.textContent = note.body.length > 600 ? `${safeSlice(note.body, 600)}…` : note.body;
@@ -298,9 +307,13 @@ export async function initLibrary({
     } else if (notes.length === 0) {
       elements.summary.textContent = "No matching notes";
     } else if (shownNotes.length < notes.length) {
-      elements.summary.textContent = `Showing ${numberFormatter.format(shownNotes.length)} of ${numberFormatter.format(notes.length)} matching ${noteWord(notes.length)} (${numberFormatter.format(state.notes.length)} total)`;
+      elements.summary.textContent = hasFilters
+        ? `Showing ${numberFormatter.format(shownNotes.length)} of ${numberFormatter.format(notes.length)} matching ${noteWord(notes.length)} (${numberFormatter.format(state.notes.length)} total)`
+        : `Showing ${numberFormatter.format(shownNotes.length)} of ${numberFormatter.format(state.notes.length)} ${noteWord(state.notes.length)}`;
+    } else if (hasFilters) {
+      elements.summary.textContent = `${numberFormatter.format(notes.length)} matching ${noteWord(notes.length)} (${numberFormatter.format(state.notes.length)} total)`;
     } else {
-      elements.summary.textContent = `Showing ${numberFormatter.format(notes.length)} of ${numberFormatter.format(state.notes.length)} ${noteWord(state.notes.length)}`;
+      elements.summary.textContent = `${numberFormatter.format(state.notes.length)} ${noteWord(state.notes.length)}`;
     }
   }
 
@@ -486,7 +499,7 @@ export async function initLibrary({
       closeDialog(elements.deleteDialog);
       render();
       showUndo({ note: result.note, index: result.index, stateSnapshot: JSON.stringify(state) });
-      setStatus(elements.status, "Note deleted. Undo is available until it is dismissed or another library is restored.", "success");
+      setStatus(elements.status, "Note deleted. Undo is available in this tab until the library changes.", "success");
       const nextFocus = elements.list.querySelector("[data-action='edit']") || elements.newNote;
       nextFocus.focus();
     } catch (error) {
@@ -524,9 +537,15 @@ export async function initLibrary({
     }
   }
 
-  async function copyNote(note) {
+  async function copyNote(note, button) {
     try {
       await navigatorValue.clipboard.writeText(noteToPlainText(note));
+      button.textContent = "Copied";
+      timerApi.setTimeout(() => {
+        if (button.isConnected) {
+          button.textContent = "Copy";
+        }
+      }, 1_500);
       setStatusWithValue(elements.status, "Copied “", note.title, "”.", "success");
     } catch {
       setStatus(elements.status, "Chrome could not copy the note. Select its text in the editor instead.", "error");
@@ -553,9 +572,18 @@ export async function initLibrary({
       return;
     }
     try {
-      const text = notesToMarkdown(selectNotes(state.notes, { sort: state.settings.sort }));
+      const notes = selectedNotes();
+      if (notes.length === 0) {
+        setStatus(elements.status, "No notes match the current view.", "warning");
+        return;
+      }
+      const text = notesToMarkdown(notes);
       downloadText(text, backupFilename("md"), "text/markdown", documentValue, urlApi);
-      setStatus(elements.status, "Markdown exported.", "success");
+      setStatus(
+        elements.status,
+        `Exported ${numberFormatter.format(notes.length)} ${noteWord(notes.length)} from the current view as Markdown.`,
+        "success",
+      );
     } catch (error) {
       setStatus(elements.status, errorMessage(error), "error");
     }
@@ -607,7 +635,7 @@ export async function initLibrary({
       render();
       setStatus(
         elements.status,
-        `Restored ${numberFormatter.format(result.added)} ${noteWord(result.added)}. Skipped ${numberFormatter.format(result.skipped)} ${result.skipped === 1 ? "duplicate" : "duplicates"}.`,
+        `Restored ${numberFormatter.format(result.added)} ${noteWord(result.added)}. Skipped ${numberFormatter.format(result.skipped)} ${result.skipped === 1 ? "note" : "notes"} already present.`,
         "success",
       );
     } catch (error) {
@@ -719,7 +747,7 @@ export async function initLibrary({
     } else if (button.dataset.action === "delete") {
       openDelete(note, button);
     } else if (button.dataset.action === "copy") {
-      void copyNote(note);
+      void copyNote(note, button);
     }
   });
 

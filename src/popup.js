@@ -10,7 +10,7 @@ import {
   saveDraft,
   STORAGE_KEYS,
 } from "./storage.js";
-import { selectNotes } from "./selectors.js";
+import { listCourses, selectNotes } from "./selectors.js";
 import { applyTheme, formatDate, setStatus } from "./ui.js";
 
 function requiredElement(documentValue, identifier) {
@@ -26,6 +26,7 @@ function popupElements(documentValue) {
     form: requiredElement(documentValue, "noteForm"),
     title: requiredElement(documentValue, "titleInput"),
     course: requiredElement(documentValue, "courseInput"),
+    courseSuggestions: requiredElement(documentValue, "courseSuggestions"),
     body: requiredElement(documentValue, "bodyInput"),
     bodyCount: requiredElement(documentValue, "bodyCount"),
     sourceTitle: requiredElement(documentValue, "sourceTitle"),
@@ -53,6 +54,7 @@ export async function initPopup({
   documentValue = document,
   chromeApi = chrome,
   timerApi = globalThis,
+  confirmDiscard,
 } = {}) {
   const elements = popupElements(documentValue);
   const storage = chromeApi.storage.local;
@@ -65,6 +67,7 @@ export async function initPopup({
   let draftQueue = Promise.resolve();
   let draftGeneration = 0;
   let draftDirty = false;
+  let hasDiscardableDraft = false;
   let storedDraftSessionId = "";
   let ready = false;
   let destroyed = false;
@@ -77,9 +80,14 @@ export async function initPopup({
     elements.form.setAttribute("aria-busy", String(busy));
     elements.form.inert = busy;
     elements.save.disabled = busy;
-    elements.discard.disabled = busy;
+    elements.discard.disabled = busy || !hasDiscardableDraft;
     elements.useSelection.disabled = busy;
     elements.saveCopy.disabled = busy;
+  }
+
+  function updateDiscardControl() {
+    elements.discard.textContent = pageCapture ? "Reset draft" : "Discard draft";
+    elements.discard.disabled = elements.form.inert || !hasDiscardableDraft;
   }
 
   function showSource(source) {
@@ -97,8 +105,16 @@ export async function initPopup({
 
   function renderRecentNotes() {
     const notes = selectNotes(state.notes).slice(0, 3);
+    const courses = listCourses(state.notes);
     elements.noteCount.textContent = String(state.notes.length);
     elements.recentList.replaceChildren();
+    elements.courseSuggestions.replaceChildren(
+      ...courses.map((courseName) => {
+        const option = documentValue.createElement("option");
+        option.value = courseName;
+        return option;
+      }),
+    );
     elements.recentEmpty.hidden = state.notes.length > 0;
 
     for (const note of notes) {
@@ -120,7 +136,7 @@ export async function initPopup({
         course.textContent = note.course;
         metadata.append(course, " · ");
       }
-      metadata.append(formatDate(note.updatedAt));
+      metadata.append(`Updated ${formatDate(note.updatedAt)}`);
 
       link.append(title, metadata);
       item.append(link);
@@ -198,6 +214,29 @@ export async function initPopup({
     elements.body.removeAttribute("aria-invalid");
   }
 
+  function captureStatus(capture, context = "initial") {
+    if (capture.wasTruncated) {
+      const prefix = context === "replaced"
+        ? "The page selection replaced the recovered draft."
+        : context === "reset"
+          ? "The draft was reset to the current page selection."
+          : "The selection was captured.";
+      setStatus(
+        elements.status,
+        `${prefix} It was limited to ${numberFormatter.format(LIMITS.body)} characters.`,
+        "warning",
+      );
+    } else if (context === "replaced") {
+      setStatus(elements.status, "The page selection replaced the recovered draft.", "info");
+    } else if (context === "reset") {
+      setStatus(elements.status, "The draft was reset to the current page selection.", "success");
+    } else if (capture.text) {
+      setStatus(elements.status, "Selection captured. Edit it before saving.", "success");
+    } else {
+      setStatus(elements.status, "No selected text found. You can type a note.", "info");
+    }
+  }
+
   function fillFromDraft(draft) {
     elements.title.value = draft.title;
     elements.body.value = draft.body;
@@ -206,8 +245,29 @@ export async function initPopup({
     updateBodyCount();
   }
 
+  function prepareNextNote(course) {
+    elements.form.reset();
+    elements.course.value = course;
+    if (pageCapture) {
+      const source = normalizeSource({
+        title: pageCapture.title.slice(0, LIMITS.sourceTitle),
+        url: pageCapture.url.length <= LIMITS.captureUrl ? pageCapture.url : "",
+      });
+      elements.title.value = source.title.slice(0, LIMITS.title);
+      showSource(source);
+      elements.useSelection.hidden = !pageCapture.text;
+    } else {
+      showSource({});
+      elements.useSelection.hidden = true;
+    }
+    updateBodyCount();
+    hasDiscardableDraft = false;
+    updateDiscardControl();
+  }
+
   async function saveNote(allowDuplicate = false) {
     let focusTarget = null;
+    const savedCourse = elements.course.value;
     elements.duplicate.hidden = true;
     elements.body.removeAttribute("aria-invalid");
     setBusy(true);
@@ -246,11 +306,12 @@ export async function initPopup({
       } catch (error) {
         draftWarning = `Note saved, but the draft could not be cleared: ${errorMessage(error)}`;
       }
-      elements.form.reset();
-      showSource({});
-      updateBodyCount();
+      prepareNextNote(savedCourse);
       renderRecentNotes();
-      setStatus(elements.status, draftWarning || "Note saved.", draftWarning ? "warning" : "success");
+      const successMessage = currentSource.url || currentSource.title
+        ? "Note saved. Source kept for the next note."
+        : "Note saved.";
+      setStatus(elements.status, draftWarning || successMessage, draftWarning ? "warning" : "success");
       focusTarget = elements.body;
     } catch (error) {
       if (error instanceof ValidationError && error.code === "duplicate") {
@@ -279,10 +340,12 @@ export async function initPopup({
       return;
     }
     draftDirty = true;
+    hasDiscardableDraft = true;
     draftGeneration += 1;
     elements.duplicate.hidden = true;
     elements.body.removeAttribute("aria-invalid");
     updateBodyCount();
+    updateDiscardControl();
     scheduleDraftSave();
   });
   elements.form.addEventListener("keydown", (event) => {
@@ -296,13 +359,25 @@ export async function initPopup({
     if (pageCapture) {
       fillFromCapture(pageCapture);
       draftDirty = true;
+      hasDiscardableDraft = true;
       draftGeneration += 1;
       scheduleDraftSave();
-      setStatus(elements.status, "The active page selection replaced the recovered draft.", "info");
+      updateDiscardControl();
+      captureStatus(pageCapture, "replaced");
       elements.title.focus();
     }
   });
   elements.discard.addEventListener("click", async () => {
+    if (!hasDiscardableDraft) {
+      return;
+    }
+    const confirmReset = confirmDiscard || ((message) => documentValue.defaultView.confirm(message));
+    const prompt = pageCapture
+      ? "Reset this draft to the current page selection?"
+      : "Discard this unfinished draft?";
+    if (!confirmReset(prompt)) {
+      return;
+    }
     let shouldFocusBody = false;
     setBusy(true);
     cancelDraftTimer();
@@ -318,6 +393,7 @@ export async function initPopup({
       if (cleared) {
         storedDraftSessionId = "";
       }
+      hasDiscardableDraft = false;
       elements.form.reset();
       if (pageCapture) {
         fillFromCapture(pageCapture);
@@ -325,16 +401,19 @@ export async function initPopup({
         showSource({});
         updateBodyCount();
       }
-      setStatus(
-        elements.status,
-        pageCapture ? "Draft discarded. The current page selection is ready but not saved." : "Draft discarded.",
-        "success",
-      );
+      if (!cleared) {
+        setStatus(elements.status, "The local draft was reset. A newer draft from another popup was kept.", "warning");
+      } else if (pageCapture) {
+        captureStatus(pageCapture, "reset");
+      } else {
+        setStatus(elements.status, "Draft discarded.", "success");
+      }
       shouldFocusBody = true;
     } catch (error) {
       setStatus(elements.status, errorMessage(error), "error");
     } finally {
       setBusy(false);
+      updateDiscardControl();
     }
     if (shouldFocusBody) {
       elements.body.focus();
@@ -374,21 +453,12 @@ export async function initPopup({
     if (draft) {
       storedDraftSessionId = draft.sessionId;
       fillFromDraft(draft);
+      hasDiscardableDraft = true;
       elements.useSelection.hidden = !pageCapture?.text;
       setStatus(elements.status, "Recovered an unfinished draft.", "success");
     } else if (pageCapture) {
       fillFromCapture(pageCapture);
-      if (pageCapture.wasTruncated) {
-        setStatus(
-          elements.status,
-          `The selection was limited to ${numberFormatter.format(LIMITS.body)} characters.`,
-          "warning",
-        );
-      } else if (pageCapture.text) {
-        setStatus(elements.status, "Selection captured. Edit it before saving.", "success");
-      } else {
-        setStatus(elements.status, "No selected text found. You can type a note.", "info");
-      }
+      captureStatus(pageCapture);
     } else {
       showSource({});
       setStatus(elements.status, errorMessage(capture), capture instanceof CaptureError ? "warning" : "error");
@@ -409,6 +479,7 @@ export async function initPopup({
     setStatus(elements.status, `Notes could not be loaded: ${errorMessage(error)}`, "error");
   } finally {
     setBusy(!loadSucceeded);
+    updateDiscardControl();
     updateBodyCount();
     if (loadSucceeded) {
       (elements.body.value ? elements.title : elements.body).focus();

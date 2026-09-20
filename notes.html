@@ -57,7 +57,7 @@
 
       <section class="library-actions" aria-label="Backup and restore notes">
         <button id="exportJsonButton" class="button button-secondary" type="button" disabled>Export backup</button>
-        <button id="exportMarkdownButton" class="button button-secondary" type="button" disabled>Export Markdown</button>
+        <button id="exportMarkdownButton" class="button button-secondary" type="button" disabled>Export view as Markdown</button>
         <button id="importButton" class="button button-secondary" type="button" disabled>Restore backup</button>
         <input id="importFileInput" type="file" accept="application/json,.json" hidden>
       </section>
@@ -125,7 +125,8 @@
           </div>
           <div class="field">
             <label for="editorCourse">Course <span class="optional">Optional</span></label>
-            <input id="editorCourse" type="text" maxlength="80" autocomplete="off" dir="auto">
+            <input id="editorCourse" type="text" maxlength="80" autocomplete="off" list="editorCourseSuggestions" placeholder="Type or choose a course" dir="auto">
+            <datalist id="editorCourseSuggestions"></datalist>
           </div>
           <div class="field">
             <div class="label-row">
@@ -150,7 +151,7 @@
             </div>
           </details>
           <div id="editorDuplicateNotice" class="notice notice-warning" role="alert" hidden>
-            <p>An identical note already exists.</p>
+            <p>A note with the same text, course, and source URL already exists.</p>
             <button id="editorSaveDuplicateButton" class="button button-secondary compact" type="button">Save anyway</button>
           </div>
           <p id="editorStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>

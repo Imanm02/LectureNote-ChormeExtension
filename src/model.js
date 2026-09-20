@@ -442,7 +442,7 @@ export function addNote(stateValue, input, options = {}) {
   const fingerprint = noteFingerprint(note);
   const duplicate = state.notes.find((candidate) => noteFingerprint(candidate) === fingerprint) || null;
   if (duplicate && !options.allowDuplicate) {
-    throw new ValidationError("An identical note already exists.", "duplicate");
+    throw new ValidationError("A note with the same text, course, and source URL already exists.", "duplicate");
   }
 
   return {
@@ -481,7 +481,7 @@ export function updateNote(stateValue, identifier, changes, options = {}) {
       (candidate) => candidate.id !== identifier && noteFingerprint(candidate) === fingerprint,
     ) || null;
   if (duplicate && !options.allowDuplicate) {
-    throw new ValidationError("An identical note already exists.", "duplicate");
+    throw new ValidationError("A note with the same text, course, and source URL already exists.", "duplicate");
   }
 
   const notes = [...state.notes];
