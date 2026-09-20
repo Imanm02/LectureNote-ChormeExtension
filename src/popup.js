@@ -65,6 +65,7 @@ export async function initPopup({
   let draftQueue = Promise.resolve();
   let draftGeneration = 0;
   let draftDirty = false;
+  let storedDraftSessionId = "";
   let ready = false;
   let destroyed = false;
 
@@ -163,7 +164,8 @@ export async function initPopup({
         if (destroyed || !draftDirty || generation !== draftGeneration) {
           return;
         }
-        await saveDraft(draft, storage);
+        const saved = await saveDraft(draft, storage);
+        storedDraftSessionId = saved?.sessionId || "";
       });
     } catch (error) {
       if (draftDirty && generation === draftGeneration) {
@@ -230,9 +232,17 @@ export async function initPopup({
       draftGeneration += 1;
       let draftWarning = "";
       try {
-        await enqueueDraftOperation(() =>
-          clearDraft(storage, { expectedSessionId: draftSessionId, allowUnowned: true }),
+        const cleared = await enqueueDraftOperation(() =>
+          clearDraft(storage, {
+            expectedSessionId: storedDraftSessionId || draftSessionId,
+            allowUnowned: true,
+          }),
         );
+        if (cleared) {
+          storedDraftSessionId = "";
+        } else {
+          draftWarning = "Note saved. A newer draft from another popup was kept.";
+        }
       } catch (error) {
         draftWarning = `Note saved, but the draft could not be cleared: ${errorMessage(error)}`;
       }
@@ -299,9 +309,15 @@ export async function initPopup({
     draftDirty = false;
     draftGeneration += 1;
     try {
-      await enqueueDraftOperation(() =>
-        clearDraft(storage, { expectedSessionId: draftSessionId, allowUnowned: true }),
+      const cleared = await enqueueDraftOperation(() =>
+        clearDraft(storage, {
+          expectedSessionId: storedDraftSessionId || draftSessionId,
+          allowUnowned: true,
+        }),
       );
+      if (cleared) {
+        storedDraftSessionId = "";
+      }
       elements.form.reset();
       if (pageCapture) {
         fillFromCapture(pageCapture);
@@ -356,6 +372,7 @@ export async function initPopup({
       pageCapture = capture;
     }
     if (draft) {
+      storedDraftSessionId = draft.sessionId;
       fillFromDraft(draft);
       elements.useSelection.hidden = !pageCapture?.text;
       setStatus(elements.status, "Recovered an unfinished draft.", "success");

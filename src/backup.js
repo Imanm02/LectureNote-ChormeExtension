@@ -1,5 +1,4 @@
 import {
-  createUniqueIdentifier,
   LIMITS,
   normalizeNote,
   normalizeState,
@@ -7,6 +6,11 @@ import {
   SCHEMA_VERSION,
   ValidationError,
 } from "./model.js";
+
+function importedIdentifier(identifier, attempt) {
+  const suffix = `_import_${attempt}`;
+  return `${identifier.slice(0, LIMITS.identifier - suffix.length)}${suffix}`;
+}
 
 function isRecord(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -87,36 +91,49 @@ export function mergeImportedNotes(stateValue, importedValue, options = {}) {
   }
 
   const imported = importedValue.map((note) => normalizeNote(note, options));
-  const fingerprints = new Set(state.notes.map(noteFingerprint));
-  const identifiers = new Set(state.notes.map((note) => note.id));
+  const notesByIdentifier = new Map(state.notes.map((note) => [note.id, note]));
   const addedNotes = [];
   let skipped = 0;
   let rekeyed = 0;
 
   for (const candidate of imported) {
     const fingerprint = noteFingerprint(candidate);
-    if (fingerprints.has(fingerprint)) {
-      skipped += 1;
-      continue;
-    }
-
     let note = candidate;
-    if (identifiers.has(note.id)) {
-      note = {
-        ...note,
-        id: createUniqueIdentifier(
-          identifiers,
-          options.idFactory || (() => crypto.randomUUID()),
-        ),
-      };
+    const existing = notesByIdentifier.get(note.id);
+    if (existing) {
+      if (noteFingerprint(existing) === fingerprint) {
+        skipped += 1;
+        continue;
+      }
+
+      let replacementId = "";
+      for (let attempt = 1; attempt <= LIMITS.notes; attempt += 1) {
+        const candidateId = importedIdentifier(note.id, attempt);
+        const priorImport = notesByIdentifier.get(candidateId);
+        if (!priorImport) {
+          replacementId = candidateId;
+          break;
+        }
+        if (noteFingerprint(priorImport) === fingerprint) {
+          skipped += 1;
+          replacementId = null;
+          break;
+        }
+      }
+      if (replacementId === null) {
+        continue;
+      }
+      if (!replacementId) {
+        throw new ValidationError("A unique imported note ID could not be created.", "id-collision");
+      }
+      note = { ...note, id: replacementId };
       rekeyed += 1;
     }
     if (state.notes.length + addedNotes.length >= LIMITS.notes) {
       throw new ValidationError("The imported notes would exceed the library limit.", "notes-limit");
     }
 
-    identifiers.add(note.id);
-    fingerprints.add(fingerprint);
+    notesByIdentifier.set(note.id, note);
     addedNotes.push(note);
   }
 

@@ -355,6 +355,26 @@ test("shows a failed delete inside the open confirmation dialog", async (t) => {
   assert.equal(controller.getState().notes.length, 1);
 });
 
+test("does not delete a note changed after confirmation opened", async (t) => {
+  const original = note("conflict-delete", "Original body");
+  const setup = await setupLibrary(t, [original]);
+  const { chromeApi, controller, documentValue, storage } = setup;
+  documentValue.querySelector("[data-action='delete']").click();
+
+  const changed = { ...original, body: "Newer body from another window" };
+  storage.values[STORAGE_KEYS.state] = {
+    ...controller.getState(),
+    revision: controller.getState().revision + 1,
+    notes: [changed],
+  };
+  await chromeApi.emitStorageChange({ [STORAGE_KEYS.state]: { newValue: storage.values[STORAGE_KEYS.state] } });
+  submit(documentValue, "deleteForm");
+  await waitFor(() => documentValue.getElementById("deleteStatus").textContent.includes("changed in another window"));
+
+  assert.equal(controller.getState().notes[0].body, "Newer body from another window");
+  assert.equal(documentValue.getElementById("deleteDialog").open, true);
+});
+
 test("renders 101 notes in two batches", async (t) => {
   const notes = Array.from({ length: 101 }, (_, index) =>
     note(`note-${index}`, `Body ${index}`),

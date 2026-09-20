@@ -302,7 +302,7 @@ test("ignores imported prototype keys and rebuilds allowed fields", () => {
   assert.equal("polluted" in restored.notes[0], false);
 });
 
-test("merges imports without overwriting IDs or exact duplicates", () => {
+test("merges imports without overwriting IDs or dropping intentional copies", () => {
   const existing = createNote(sample(), { idFactory: () => "same-id", now: START });
   const duplicate = createNote(sample(), { idFactory: () => "duplicate-id", now: LATER });
   const collision = createNote(sample({ body: "Different" }), {
@@ -312,13 +312,21 @@ test("merges imports without overwriting IDs or exact duplicates", () => {
   const merged = mergeImportedNotes(
     { ...createEmptyState(), notes: [existing] },
     [duplicate, collision],
-    { idFactory: identifiers("new-id"), now: LATER },
+    { now: LATER },
   );
 
-  assert.equal(merged.added, 1);
-  assert.equal(merged.skipped, 1);
+  assert.equal(merged.added, 2);
+  assert.equal(merged.skipped, 0);
   assert.equal(merged.rekeyed, 1);
-  assert.equal(merged.state.notes[0].id, "new-id");
+  assert.deepEqual(
+    merged.state.notes.slice(0, 2).map((note) => note.id),
+    ["duplicate-id", "same-id_import_1"],
+  );
+
+  const repeated = mergeImportedNotes(merged.state, [duplicate, collision], { now: LATER });
+  assert.equal(repeated.added, 0);
+  assert.equal(repeated.skipped, 2);
+  assert.equal(repeated.state.notes.length, 3);
 });
 
 test("rejects a non-list import instead of reporting an empty merge", () => {

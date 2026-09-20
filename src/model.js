@@ -1,6 +1,7 @@
 export const SCHEMA_VERSION = 1;
 
 export const LIMITS = Object.freeze({
+  identifier: 100,
   title: 160,
   body: 100_000,
   course: 80,
@@ -29,7 +30,7 @@ export class ValidationError extends Error {
   }
 }
 
-const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/u;
+const IDENTIFIER_PATTERN = new RegExp(`^[A-Za-z0-9][A-Za-z0-9_-]{0,${LIMITS.identifier - 1}}$`, "u");
 const IDENTIFIER_ATTEMPTS = 25;
 
 function isRecord(value) {
@@ -148,7 +149,7 @@ function normalizeTimestamp(value, fallback) {
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
 }
 
-const SENSITIVE_QUERY_PARAMETER = /^(?:(?:access|id|oauth|refresh)_?token|api_?key|auth|authorization|client_?secret|code|credential|fbclid|gclid|key|msclkid|pass|password|samlresponse|secret|session|session_?id|sig|signature|state|token|utm_.+|x-(?:amz|goog)-(?:credential|signature))$/iu;
+const SENSITIVE_QUERY_PARAMETER = /^(?:(?:access|auth|id|oauth|refresh|session)_?token|api_?key|auth|authorization|client_?secret|code|credential|fbclid|gclid|jsessionid|jwt|key|msclkid|pass|password|samlresponse|secret|session|session_?id|sig|signature|state|token|utm_.+|x-(?:amz|goog)-(?:credential|security-token|signature))$/iu;
 export function normalizeSource(value = {}, { strictUrl = false } = {}) {
   if (!isRecord(value)) {
     throw new ValidationError("Source details are invalid.", "source-type");
@@ -313,6 +314,10 @@ export function recoverState(value, options = {}) {
   const accepted = [];
   const rejected = [];
   value.notes.forEach((note, index) => {
+    if (accepted.length >= LIMITS.notes) {
+      rejected.push({ index, note, reason: "Library note limit exceeded" });
+      return;
+    }
     try {
       accepted.push(normalizeNote(note, options));
     } catch (error) {

@@ -467,7 +467,19 @@ export async function initLibrary({
     elements.confirmDelete.disabled = true;
     elements.cancelDelete.disabled = true;
     try {
-      const result = await mutateState((current) => removeNote(current, noteToDelete.id), storage);
+      const result = await mutateState((current) => {
+        const latest = current.notes.find((note) => note.id === noteToDelete.id);
+        if (!latest) {
+          throw new ValidationError("The note was deleted in another window.", "note-missing");
+        }
+        if (JSON.stringify(latest) !== JSON.stringify(noteToDelete)) {
+          throw new ValidationError(
+            "This note changed in another window. Close this confirmation and review it before deleting.",
+            "delete-conflict",
+          );
+        }
+        return removeNote(current, noteToDelete.id);
+      }, storage);
       state = result.state;
       pendingDelete = null;
       deleteReturnFocus = null;

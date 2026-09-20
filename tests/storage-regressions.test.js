@@ -166,7 +166,7 @@ test("converts old recovery records to counts without retaining raw data", async
 test("rejects strict invalid URLs and redacts captured source details", () => {
   const captured = normalizeSource({
     title: "Lecture page",
-    url: "https://student:password@example.com/watch?id=42&course=cs101&utm_source=mail&token=secret&id_token=jwt&refresh_token=refresh&oauth_token=oauth&client_secret=private&lang=fa#answer",
+    url: "https://student:password@example.com/watch?id=42&course=cs101&utm_source=mail&token=secret&id_token=jwt&refresh_token=refresh&oauth_token=oauth&auth_token=auth&client_secret=private&jwt=signed&JSESSIONID=session&X-Amz-Security-Token=aws&lang=fa#answer",
   });
 
   assert.deepEqual(captured, {
@@ -183,6 +183,30 @@ test("rejects strict invalid URLs and redacts captured source details", () => {
   );
   assert.throws(() => normalizeSource({ url: "not a URL" }, { strictUrl: true }), {
     code: "source-url-invalid",
+  });
+});
+
+test("recovers only the supported number of valid stored notes", async () => {
+  const notes = Array.from({ length: LIMITS.notes + 1 }, (_, index) => ({
+    id: `note-${index}`,
+    title: `Note ${index}`,
+    body: `Body ${index}`,
+    course: "",
+    source: {},
+    createdAt: NOW,
+    updatedAt: NOW,
+  }));
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes },
+  });
+
+  const recovered = await loadState(storage, { now: NOW });
+
+  assert.equal(recovered.notes.length, LIMITS.notes);
+  assert.equal(storage.values[STORAGE_KEYS.state].notes.length, LIMITS.notes);
+  assert.deepEqual(await loadRecoveryInfo(storage), {
+    rejectedNotes: 1,
+    rejectedDrafts: 0,
   });
 });
 

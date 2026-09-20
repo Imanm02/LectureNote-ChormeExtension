@@ -204,3 +204,54 @@ test("keeps the clear-draft warning after a note is saved", async () => {
   controller.destroy();
   dom.window.close();
 });
+
+test("clears a recovered owned draft when it is saved immediately", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.draft]: {
+      sessionId: "older-popup",
+      title: "Recovered",
+      body: "Save without another input event",
+      course: "CS 101",
+      source: {},
+    },
+  });
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+
+  submit(dom.window, dom.window.document.getElementById("noteForm"));
+  await waitFor(() => controller.getState().notes.length === 1);
+  await waitFor(() => dom.window.document.getElementById("status").textContent === "Note saved.");
+
+  assert.equal(STORAGE_KEYS.draft in storage.values, false);
+  controller.destroy();
+  dom.window.close();
+});
+
+test("clears a recovered owned draft when it is discarded immediately", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.draft]: {
+      sessionId: "older-popup",
+      title: "Recovered",
+      body: "Discard without another input event",
+      course: "",
+      source: {},
+    },
+  });
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+
+  dom.window.document.getElementById("discardButton").click();
+  await waitFor(() => dom.window.document.getElementById("status").textContent.startsWith("Draft discarded."));
+
+  assert.equal(STORAGE_KEYS.draft in storage.values, false);
+  controller.destroy();
+  dom.window.close();
+});
