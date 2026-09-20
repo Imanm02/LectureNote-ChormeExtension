@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +32,53 @@ function trackPage(page) {
     if (message.type() === "error") {
       browserErrors.push(`${page.url()}: ${message.text()}`);
     }
+  });
+}
+
+async function startFixtureServer() {
+  const server = createServer((request, response) => {
+    if (request.url === "/favicon.ico") {
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+    if (request.url !== "/lecture") {
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Not found");
+      return;
+    }
+
+    response.writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Type": "text/html; charset=utf-8",
+    });
+    response.end(
+      "<!doctype html><html><head><title>Lecture fixture</title><link rel=\"icon\" href=\"data:,\"></head><body><h1>Example Domain</h1><p>Local smoke-test page.</p></body></html>",
+    );
+  });
+
+  await new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", rejectListen);
+      resolveListen();
+    });
+  });
+
+  const address = server.address();
+  assert.ok(address && typeof address === "object", "The fixture server did not start");
+  return {
+    server,
+    url: `http://127.0.0.1:${address.port}/lecture`,
+  };
+}
+
+async function closeFixtureServer(server) {
+  if (!server?.listening) {
+    return;
+  }
+  await new Promise((resolveClose, rejectClose) => {
+    server.close((error) => (error ? rejectClose(error) : resolveClose()));
   });
 }
 
@@ -68,6 +116,7 @@ async function extensionId(context) {
 
 async function createPersianNote(page) {
   await page.getByRole("button", { name: "New note" }).click();
+  assert.equal(await page.locator("#editorCourseSuggestions option[value='CS 101']").count(), 1);
   await page.locator("#editorTitle").fill("ماتریس");
   await page.locator("#editorCourse").fill("ریاضی");
   await page.locator("#editorBody").fill("مقادیر ویژه و بردارهای ویژه");
@@ -76,15 +125,18 @@ async function createPersianNote(page) {
 }
 
 let context;
+let fixtureServer;
 let shortcutCaptureVerified = false;
 try {
+  const fixture = await startFixtureServer();
+  fixtureServer = fixture.server;
   context = await launch();
   const identifier = await extensionId(context);
   const popupUrl = `chrome-extension://${identifier}/popup.html`;
   const notesUrl = `chrome-extension://${identifier}/notes.html`;
 
   const sourcePage = await context.newPage();
-  await sourcePage.goto("https://example.com/");
+  await sourcePage.goto(fixture.url);
   await sourcePage.locator("h1").selectText();
   const headingCapture = await sourcePage.evaluate(readPageSelection, 100_000);
   assert.equal(headingCapture.text, "Example Domain");
@@ -100,7 +152,8 @@ try {
   assert.equal(passwordCapture.text, "");
   await sourcePage.locator("h1").selectText();
   const actionPopupPromise = context.waitForEvent("page", { timeout: 3_000 }).catch(() => null);
-  await sourcePage.keyboard.press("Control+Shift+Y");
+  const shortcut = process.platform === "darwin" ? "Meta+Shift+Y" : "Control+Shift+Y";
+  await sourcePage.keyboard.press(shortcut);
   const actionPopup = await actionPopupPromise;
   if (actionPopup) {
     await actionPopup.waitForLoadState();
@@ -163,10 +216,21 @@ try {
   assert.equal(await library.locator(".note-card").count(), 1);
 
   await createPersianNote(library);
-  await library.locator("#searchInput").fill("ویژه");
+  await library.locator("#searchInput").fill("رياضى ويژه");
   await library.getByRole("heading", { name: "ماتریس" }).waitFor();
   await library.locator(".note-card").nth(1).waitFor({ state: "detached" });
   assert.equal(await library.locator(".note-card").count(), 1);
+  assert.equal(await library.locator("#resultSummary").textContent(), "1 matching note (2 total)");
+
+  const markdownDownloadPromise = library.waitForEvent("download");
+  await library.getByRole("button", { name: "Export view as Markdown" }).click();
+  const markdownDownload = await markdownDownloadPromise;
+  const markdownPath = join(profile, "filtered-notes.md");
+  await markdownDownload.saveAs(markdownPath);
+  const markdown = await readFile(markdownPath, "utf8");
+  assert.match(markdown, /ماتریس/u);
+  assert.doesNotMatch(markdown, /Graph basics/u);
+
   await library.locator("#searchInput").fill("");
   await library.getByRole("heading", { name: "Graph basics" }).waitFor();
   await library.locator(".note-card").nth(1).waitFor();
@@ -191,7 +255,7 @@ try {
   await library.locator("#importFileInput").setInputFiles(backupPath);
   await library.getByRole("heading", { name: "Choose how to restore" }).waitFor();
   await library.getByRole("button", { name: "Merge notes" }).click();
-  await library.locator("#libraryStatus").filter({ hasText: "Restored 0 notes. Skipped 2 duplicates." }).waitFor();
+  await library.locator("#libraryStatus").filter({ hasText: "Restored 0 notes. Skipped 2 notes already present." }).waitFor();
 
   await library.locator("#themeSelect").selectOption("dark");
   await library.locator('html[data-theme="dark"]').waitFor();
@@ -214,6 +278,7 @@ try {
   console.log(`Browser smoke test passed: real selection handling, popup drafts, persistence, CRUD, search, backup, theme, and undo.${shortcutResult}`);
 } finally {
   await context?.close().catch(() => undefined);
+  await closeFixtureServer(fixtureServer).catch(() => undefined);
   const resolvedProfile = resolve(profile);
   const allowedPrefix = `${temporaryRoot}${sep}`;
   if (
