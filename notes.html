@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en" data-theme="system">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lecture Notes library</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="notes.css">
+  </head>
+  <body class="library-body">
+    <header class="library-header">
+      <div class="library-header-inner">
+        <div class="brand library-brand">
+          <img src="Images/icon48.png" width="40" height="40" alt="">
+          <div>
+            <p class="eyebrow">Lecture Notes</p>
+            <h1>Your note library</h1>
+            <p class="header-copy">Capture course material, keep its source, and find it later.</p>
+          </div>
+        </div>
+        <button id="newNoteButton" class="button button-primary" type="button" aria-label="New note, keyboard shortcut N" disabled>
+          New note <span class="key-hint" aria-hidden="true">N</span>
+        </button>
+      </div>
+    </header>
+
+    <main id="libraryMain" class="library-shell" aria-busy="true">
+      <section class="toolbar" aria-label="Find and sort notes">
+        <label class="field search-field" for="searchInput">
+          <span class="label-row"><span>Search notes</span><span class="key-hint" aria-hidden="true">/</span></span>
+          <input id="searchInput" type="search" autocomplete="off" placeholder="Title, text, course, or source" disabled>
+        </label>
+        <label class="field" for="courseFilter">
+          <span>Course</span>
+          <select id="courseFilter" disabled>
+            <option value="">All courses</option>
+          </select>
+        </label>
+        <label class="field" for="sortSelect">
+          <span>Sort</span>
+          <select id="sortSelect" disabled>
+            <option value="updated-desc">Recently updated</option>
+            <option value="created-desc">Newest created</option>
+            <option value="created-asc">Oldest created</option>
+            <option value="title-asc">Title</option>
+          </select>
+        </label>
+        <label class="field" for="themeSelect">
+          <span>Theme</span>
+          <select id="themeSelect" disabled>
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="library-actions" aria-label="Backup and restore notes">
+        <button id="exportJsonButton" class="button button-secondary" type="button" disabled>Export backup</button>
+        <button id="exportMarkdownButton" class="button button-secondary" type="button" disabled>Export Markdown</button>
+        <button id="importButton" class="button button-secondary" type="button" disabled>Restore backup</button>
+        <input id="importFileInput" type="file" accept="application/json,.json" hidden>
+      </section>
+
+      <div class="library-feedback">
+        <p id="resultSummary" class="result-summary" role="status" aria-live="polite" aria-atomic="true">Loading notes...</p>
+        <div class="feedback-actions">
+          <p id="libraryStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+          <button id="retryLoadButton" class="button button-secondary compact" type="button" hidden>Retry</button>
+        </div>
+      </div>
+
+      <section id="emptyState" class="empty-state" hidden>
+        <h2>No saved notes yet</h2>
+        <p>Your notes stay in this Chrome profile. Create one here, or select text on a page and open the extension.</p>
+        <button id="emptyNewNoteButton" class="button button-primary" type="button" data-empty-action disabled>Create your first note</button>
+      </section>
+
+      <section id="noResultsState" class="empty-state" hidden>
+        <h2>No matching notes</h2>
+        <p>Try a different search or course filter.</p>
+        <button id="clearFiltersButton" class="button button-secondary" type="button">Clear filters</button>
+      </section>
+
+      <section id="notesList" class="notes-grid" aria-label="Saved notes"></section>
+      <button id="showMoreButton" class="button button-secondary show-more" type="button" hidden>Show more notes</button>
+    </main>
+
+    <template id="noteCardTemplate">
+      <article class="note-card">
+        <header class="note-card-header">
+          <div class="note-heading">
+            <p class="note-course" dir="auto" hidden></p>
+            <h2 class="note-title" dir="auto"></h2>
+          </div>
+          <time class="note-time"></time>
+        </header>
+        <p class="note-excerpt" dir="auto"></p>
+        <div class="note-source-row">
+          <a class="note-source-link" target="_blank" rel="noreferrer" dir="auto" hidden>Open source</a>
+          <span class="note-source-title" dir="auto" hidden></span>
+        </div>
+        <footer class="note-actions">
+          <button class="button button-quiet compact" type="button" data-action="copy">Copy</button>
+          <button class="button button-secondary compact" type="button" data-action="edit">Edit</button>
+          <button class="button button-quiet compact danger-text" type="button" data-action="delete">Delete</button>
+        </footer>
+      </article>
+    </template>
+
+    <dialog id="editorDialog" class="dialog editor-dialog" aria-labelledby="editorHeading">
+      <form id="editorForm" class="dialog-form" novalidate>
+        <header class="dialog-header">
+          <div>
+            <p class="eyebrow">Note editor</p>
+            <h2 id="editorHeading">New note</h2>
+          </div>
+          <button id="closeEditorButton" class="button button-quiet compact" type="button" aria-label="Close editor">Close</button>
+        </header>
+
+        <div class="dialog-content editor-fields">
+          <div class="field">
+            <label for="editorTitle">Title</label>
+            <input id="editorTitle" type="text" maxlength="160" autocomplete="off" dir="auto">
+          </div>
+          <div class="field">
+            <label for="editorCourse">Course <span class="optional">Optional</span></label>
+            <input id="editorCourse" type="text" maxlength="80" autocomplete="off" dir="auto">
+          </div>
+          <div class="field">
+            <div class="label-row">
+              <label for="editorBody">Note text</label>
+              <output id="editorBodyCount" for="editorBody">0 / 100,000</output>
+            </div>
+            <textarea id="editorBody" rows="14" maxlength="100000" required dir="auto"></textarea>
+            <p class="field-hint">Save with Ctrl or Command + Enter.</p>
+          </div>
+          <details class="source-details">
+            <summary>Source details</summary>
+            <div class="source-fields">
+              <div class="field">
+                <label for="editorSourceTitle">Source title</label>
+                <input id="editorSourceTitle" type="text" maxlength="200" autocomplete="off" dir="auto">
+              </div>
+              <div class="field">
+                <label for="editorSourceUrl">Source URL</label>
+                <input id="editorSourceUrl" type="url" maxlength="2048" autocomplete="off" inputmode="url" aria-describedby="sourceUrlHint editorStatus">
+                <p id="sourceUrlHint" class="field-hint">Credentials, known token parameters, tracking parameters, and page fragments are removed when saved.</p>
+              </div>
+            </div>
+          </details>
+          <div id="editorDuplicateNotice" class="notice notice-warning" role="alert" hidden>
+            <p>An identical note already exists.</p>
+            <button id="editorSaveDuplicateButton" class="button button-secondary compact" type="button">Save anyway</button>
+          </div>
+          <p id="editorStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+
+        <footer class="dialog-actions">
+          <button id="cancelEditorButton" class="button button-secondary" type="button">Cancel</button>
+          <button id="saveEditorButton" class="button button-primary" type="submit">Save note</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="deleteDialog" class="dialog compact-dialog" aria-labelledby="deleteHeading" aria-describedby="deleteMessage deleteStatus">
+      <form id="deleteForm" class="dialog-form">
+        <div class="dialog-content">
+          <p class="eyebrow">Delete note</p>
+          <h2 id="deleteHeading">Delete this note?</h2>
+          <p id="deleteMessage" dir="auto"></p>
+          <p id="deleteStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions">
+          <button id="cancelDeleteButton" class="button button-secondary" type="button">Cancel</button>
+          <button id="confirmDeleteButton" class="button button-danger" type="submit">Delete note</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="importDialog" class="dialog compact-dialog" aria-labelledby="importHeading" aria-describedby="importMessage importExplanation importStatus">
+      <div class="dialog-form">
+        <div class="dialog-content">
+          <p class="eyebrow">Restore backup</p>
+          <h2 id="importHeading">Choose how to restore</h2>
+          <p id="importMessage"></p>
+          <p id="importExplanation">Merge keeps your current notes. Replace removes the current library first.</p>
+          <p id="importStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions stacked-actions">
+          <button id="cancelImportButton" class="button button-quiet" type="button">Cancel</button>
+          <button id="replaceImportButton" class="button button-secondary" type="button">Replace library</button>
+          <button id="mergeImportButton" class="button button-primary" type="button">Merge notes</button>
+        </footer>
+      </div>
+    </dialog>
+
+    <dialog id="replaceDialog" class="dialog compact-dialog" aria-labelledby="replaceHeading" aria-describedby="replaceMessage replaceWarning replaceStatus">
+      <form id="replaceForm" class="dialog-form">
+        <div class="dialog-content">
+          <p class="eyebrow">Replace library</p>
+          <h2 id="replaceHeading">Remove current notes?</h2>
+          <p id="replaceMessage"></p>
+          <p id="replaceWarning">This cannot be undone from the extension. Export a backup first if you need the current notes.</p>
+          <p id="replaceStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions">
+          <button id="cancelReplaceButton" class="button button-secondary" type="button">Cancel</button>
+          <button id="confirmReplaceButton" class="button button-danger" type="submit">Replace all notes</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <aside id="undoBar" class="undo-bar" role="status" aria-live="polite" hidden>
+      <span>Note deleted.</span>
+      <button id="undoButton" class="button button-secondary compact" type="button">Undo</button>
+      <button id="dismissUndoButton" class="button button-quiet compact" type="button">Dismiss</button>
+    </aside>
+
+    <script type="module" src="src/notes.js"></script>
+  </body>
+</html>

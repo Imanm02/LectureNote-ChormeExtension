@@ -181,7 +181,8 @@ test("quarantines a malformed stored note while keeping valid notes", async () =
 
   assert.deepEqual(state.notes, [valid]);
   assert.equal(recovery.rejectedNotes, 1);
-  assert.equal(storage.values[STORAGE_KEYS.recovery].rejectedNotes[0].note.id, "broken");
+  assert.equal(storage.values[STORAGE_KEYS.recovery].rejectedNotes, 1);
+  assert.equal(JSON.stringify(storage.values[STORAGE_KEYS.recovery]).includes("broken"), false);
 });
 
 test("migrates state and draft in one retryable storage write", async () => {

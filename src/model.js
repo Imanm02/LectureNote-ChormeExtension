@@ -6,8 +6,10 @@ export const LIMITS = Object.freeze({
   course: 80,
   sourceTitle: 200,
   sourceUrl: 2_048,
+  captureUrl: 100_000,
   notes: 2_000,
-  importBytes: 15_000_000,
+  importBytes: 8_000_000,
+  stateBytes: 7_000_000,
 });
 
 export const SORT_VALUES = Object.freeze([
@@ -146,13 +148,18 @@ function normalizeTimestamp(value, fallback) {
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : fallback;
 }
 
-export function normalizeSource(value = {}) {
+const SENSITIVE_QUERY_PARAMETER = /^(?:(?:access|id|oauth|refresh)_?token|api_?key|auth|authorization|client_?secret|code|credential|fbclid|gclid|key|msclkid|pass|password|samlresponse|secret|session|session_?id|sig|signature|state|token|utm_.+|x-(?:amz|goog)-(?:credential|signature))$/iu;
+export function normalizeSource(value = {}, { strictUrl = false } = {}) {
   if (!isRecord(value)) {
     throw new ValidationError("Source details are invalid.", "source-type");
   }
 
   const title = normalizeSingleLine(value.title, "Source title", LIMITS.sourceTitle);
-  const rawUrl = normalizeSingleLine(value.url, "Source URL", LIMITS.sourceUrl);
+  const rawUrl = normalizeSingleLine(
+    value.url,
+    "Source URL",
+    strictUrl ? LIMITS.sourceUrl : LIMITS.captureUrl,
+  );
   if (!rawUrl) {
     return { title, url: "" };
   }
@@ -161,18 +168,37 @@ export function normalizeSource(value = {}) {
   try {
     parsed = new URL(rawUrl);
   } catch {
+    if (strictUrl) {
+      throw new ValidationError("Enter a valid HTTP or HTTPS source URL.", "source-url-invalid");
+    }
     return { title, url: "" };
   }
 
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    if (strictUrl) {
+      throw new ValidationError("Enter a valid HTTP or HTTPS source URL.", "source-url-invalid");
+    }
     return { title, url: "" };
   }
 
   parsed.username = "";
   parsed.password = "";
-  parsed.search = "";
+  for (const name of [...parsed.searchParams.keys()]) {
+    if (SENSITIVE_QUERY_PARAMETER.test(name)) {
+      parsed.searchParams.delete(name);
+    }
+  }
   parsed.hash = "";
-  const url = parsed.href.length <= LIMITS.sourceUrl ? parsed.href : "";
+  if (parsed.href.length > LIMITS.sourceUrl) {
+    if (strictUrl) {
+      throw new ValidationError(
+        `Source URL must be ${LIMITS.sourceUrl.toLocaleString()} characters or fewer.`,
+        "source-url-length",
+      );
+    }
+    return { title, url: "" };
+  }
+  const url = parsed.href;
   return { title, url };
 }
 
@@ -190,7 +216,11 @@ export function createEmptyState() {
 
 export function normalizeNote(
   value,
-  { idFactory = () => crypto.randomUUID(), now = new Date().toISOString() } = {},
+  {
+    idFactory = () => crypto.randomUUID(),
+    now = new Date().toISOString(),
+    strictSourceUrl = false,
+  } = {},
 ) {
   if (!isRecord(value)) {
     throw new ValidationError("Each note must be an object.", "note-type");
@@ -208,7 +238,7 @@ export function normalizeNote(
   const sourceValue = isRecord(value.source)
     ? value.source
     : { title: value.sourceTitle, url: value.sourceUrl };
-  const source = normalizeSource(sourceValue);
+  const source = normalizeSource(sourceValue, { strictUrl: strictSourceUrl });
   const safeNow = normalizeTimestamp(now, new Date().toISOString());
   const createdAt = normalizeTimestamp(value.createdAt, safeNow);
   let updatedAt = normalizeTimestamp(value.updatedAt, createdAt);
@@ -338,6 +368,10 @@ export function normalizeDraft(value, { now = new Date().toISOString() } = {}) {
   }
 
   return {
+    sessionId:
+      typeof value.sessionId === "string" && isValidIdentifier(value.sessionId)
+        ? value.sessionId
+        : "",
     noteId: value.noteId === undefined || value.noteId === null || value.noteId === ""
       ? null
       : normalizeIdentifier(value.noteId, () => {
@@ -356,7 +390,11 @@ export function normalizeDraft(value, { now = new Date().toISOString() } = {}) {
 
 export function createNote(
   value,
-  { idFactory = () => crypto.randomUUID(), now = new Date().toISOString() } = {},
+  {
+    idFactory = () => crypto.randomUUID(),
+    now = new Date().toISOString(),
+    strictSourceUrl = false,
+  } = {},
 ) {
   return normalizeNote(
     {
@@ -365,7 +403,7 @@ export function createNote(
       createdAt: now,
       updatedAt: now,
     },
-    { idFactory, now },
+    { idFactory, now, strictSourceUrl },
   );
 }
 

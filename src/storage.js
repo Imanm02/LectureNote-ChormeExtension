@@ -1,6 +1,7 @@
 import {
   addNote,
   createEmptyState,
+  LIMITS,
   normalizeDraft,
   normalizeState,
   recoverState,
@@ -33,6 +34,28 @@ function sameData(left, right) {
   }
 }
 
+function encodedBytes(value) {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+function safeTextPrefix(value, maximumLength) {
+  let result = value.slice(0, maximumLength);
+  const lastCodeUnit = result.charCodeAt(result.length - 1);
+  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
+    result = result.slice(0, -1);
+  }
+  return result;
+}
+
+export function assertStateFits(value) {
+  if (encodedBytes(value) > LIMITS.stateBytes) {
+    throw new ValidationError(
+      "The note library is too large for local storage. Export a backup and remove some notes.",
+      "storage-size",
+    );
+  }
+}
+
 async function withStateLock(task, lockManager = globalThis.navigator?.locks) {
   if (lockManager && typeof lockManager.request === "function") {
     return lockManager.request(STATE_LOCK, task);
@@ -43,19 +66,35 @@ async function withStateLock(task, lockManager = globalThis.navigator?.locks) {
   return result;
 }
 
-function appendRecovery(existing, update) {
-  const prior = existing && typeof existing === "object" ? existing : {};
-  const priorNotes = Array.isArray(prior.rejectedNotes) ? prior.rejectedNotes : [];
-  const priorDrafts = Array.isArray(prior.rejectedDrafts) ? prior.rejectedDrafts : [];
+function recoveryCount(value, key) {
+  const stored = value?.[key];
+  if (Array.isArray(stored)) {
+    return stored.length;
+  }
+  return Number.isSafeInteger(stored) && stored >= 0 ? stored : 0;
+}
+
+function normalizeRecovery(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
   return {
-    createdAt: update.createdAt,
-    rejectedNotes: [...priorNotes, ...(update.rejectedNotes || [])],
-    rejectedDrafts: [...priorDrafts, ...(update.rejectedDrafts || [])],
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : "",
+    rejectedNotes: recoveryCount(value, "rejectedNotes"),
+    rejectedDrafts: recoveryCount(value, "rejectedDrafts"),
   };
 }
 
-export async function loadState(storage = chrome.storage.local, options = {}) {
-  const area = getStorage(storage);
+function appendRecovery(existing, update) {
+  const prior = existing && typeof existing === "object" ? existing : {};
+  return {
+    createdAt: update.createdAt,
+    rejectedNotes: recoveryCount(prior, "rejectedNotes") + (update.rejectedNotes || 0),
+    rejectedDrafts: recoveryCount(prior, "rejectedDrafts") + (update.rejectedDrafts || 0),
+  };
+}
+
+async function loadStateUnlocked(area, options) {
   const stored = await area.get([
     STORAGE_KEYS.state,
     STORAGE_KEYS.draft,
@@ -66,7 +105,14 @@ export async function loadState(storage = chrome.storage.local, options = {}) {
   const now = options.now || new Date().toISOString();
   const updates = {};
   let state;
-  let recovery = null;
+  let recovery = normalizeRecovery(stored[STORAGE_KEYS.recovery]);
+
+  if (
+    stored[STORAGE_KEYS.recovery] !== undefined &&
+    !sameData(stored[STORAGE_KEYS.recovery], recovery)
+  ) {
+    updates[STORAGE_KEYS.recovery] = recovery;
+  }
 
   if (stored[STORAGE_KEYS.state] === undefined) {
     state = createEmptyState();
@@ -82,7 +128,7 @@ export async function loadState(storage = chrome.storage.local, options = {}) {
       state = recovered.state;
       recovery = appendRecovery(stored[STORAGE_KEYS.recovery], {
         createdAt: now,
-        rejectedNotes: recovered.rejected,
+        rejectedNotes: recovered.rejected.length,
       });
       updates[STORAGE_KEYS.state] = state;
       updates[STORAGE_KEYS.recovery] = recovery;
@@ -96,15 +142,10 @@ export async function loadState(storage = chrome.storage.local, options = {}) {
       if (!sameData(stored[STORAGE_KEYS.draft], draft)) {
         updates[STORAGE_KEYS.draft] = draft;
       }
-    } catch (error) {
+    } catch {
       recovery = appendRecovery(recovery || stored[STORAGE_KEYS.recovery], {
         createdAt: now,
-        rejectedDrafts: [
-          {
-            draft: stored[STORAGE_KEYS.draft],
-            reason: error instanceof Error ? error.message : "Invalid draft",
-          },
-        ],
+        rejectedDrafts: 1,
       });
       draft = null;
       updates[STORAGE_KEYS.draft] = null;
@@ -114,12 +155,13 @@ export async function loadState(storage = chrome.storage.local, options = {}) {
 
   const legacyResult = stored[STORAGE_KEYS.legacyResult];
   if (typeof legacyResult === "string" && legacyResult.trim()) {
+    const truncated = legacyResult.length > LIMITS.body;
     try {
       const added = addNote(
         state,
         {
           title: "Imported generated note",
-          body: legacyResult,
+          body: safeTextPrefix(legacyResult, LIMITS.body),
           course: "",
           source: {},
         },
@@ -132,15 +174,33 @@ export async function loadState(storage = chrome.storage.local, options = {}) {
         throw error;
       }
     }
+    if (truncated) {
+      recovery = appendRecovery(recovery || stored[STORAGE_KEYS.recovery], {
+        createdAt: now,
+        rejectedNotes: 1,
+      });
+      updates[STORAGE_KEYS.recovery] = recovery;
+    }
   }
 
   const legacySelection = stored[STORAGE_KEYS.legacySelection];
   if (!draft && typeof legacySelection === "string" && legacySelection.trim()) {
-    draft = normalizeDraft({ body: legacySelection }, options);
+    const truncated = legacySelection.length > LIMITS.body;
+    draft = normalizeDraft({ body: safeTextPrefix(legacySelection, LIMITS.body) }, options);
     updates[STORAGE_KEYS.draft] = draft;
+    if (truncated) {
+      recovery = appendRecovery(recovery || stored[STORAGE_KEYS.recovery], {
+        createdAt: now,
+        rejectedDrafts: 1,
+      });
+      updates[STORAGE_KEYS.recovery] = recovery;
+    }
   }
 
   if (Object.keys(updates).length > 0) {
+    if (updates[STORAGE_KEYS.state]) {
+      assertStateFits(updates[STORAGE_KEYS.state]);
+    }
     await area.set(updates);
   }
 
@@ -157,9 +217,17 @@ export async function loadState(storage = chrome.storage.local, options = {}) {
   return state;
 }
 
-export async function saveState(value, storage = chrome.storage.local, options = {}) {
+export async function loadState(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
   const area = getStorage(storage);
+  return withStateLock(() => loadStateUnlocked(area, options), lockManager);
+}
+
+async function saveStateUnlocked(value, area, options) {
   const state = normalizeState(value, options);
+  assertStateFits(state);
   if (options.expectedRevision !== undefined) {
     const stored = await area.get(STORAGE_KEYS.state);
     const current = normalizeState(stored[STORAGE_KEYS.state], options);
@@ -178,6 +246,15 @@ export async function saveState(value, storage = chrome.storage.local, options =
   return state;
 }
 
+export async function saveState(
+  value,
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => saveStateUnlocked(value, area, options), lockManager);
+}
+
 export async function mutateState(
   mutation,
   storage = chrome.storage.local,
@@ -188,10 +265,14 @@ export async function mutateState(
   }
 
   return withStateLock(async () => {
-    const current = await loadState(storage, options);
+    const area = getStorage(storage);
+    const current = await loadStateUnlocked(area, options);
     const result = await mutation(current);
     const nextState = result?.state || result;
-    const saved = await saveState(nextState, storage, {
+    if (sameData(nextState, current)) {
+      return result;
+    }
+    const saved = await saveStateUnlocked(nextState, area, {
       ...options,
       expectedRevision: current.revision,
     });
@@ -208,31 +289,58 @@ export async function loadDraft(storage = chrome.storage.local, options = {}) {
   return normalizeDraft(stored[STORAGE_KEYS.draft], options);
 }
 
-export async function saveDraft(value, storage = chrome.storage.local, options = {}) {
-  const area = getStorage(storage);
-  const draft = normalizeDraft(value, options);
-  if (!draft) {
-    await clearDraft(area);
-    return null;
-  }
-  await area.set({ [STORAGE_KEYS.draft]: draft });
-  return draft;
-}
-
-export async function clearDraft(storage = chrome.storage.local) {
-  const area = getStorage(storage);
+async function clearDraftUnlocked(area, { expectedSessionId, allowUnowned = false } = {}) {
   if (typeof area.remove !== "function") {
     throw new TypeError("The storage area cannot remove draft data.");
   }
+  if (expectedSessionId) {
+    const stored = await area.get(STORAGE_KEYS.draft);
+    const current = stored[STORAGE_KEYS.draft];
+    if (current !== undefined && current !== null) {
+      const currentSessionId =
+        current && typeof current === "object" && typeof current.sessionId === "string"
+          ? current.sessionId
+          : "";
+      if (currentSessionId !== expectedSessionId && !(allowUnowned && !currentSessionId)) {
+        return false;
+      }
+    }
+  }
   await area.remove(STORAGE_KEYS.draft);
+  return true;
+}
+
+export async function saveDraft(
+  value,
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    const draft = normalizeDraft(value, options);
+    if (!draft) {
+      await clearDraftUnlocked(area);
+      return null;
+    }
+    await area.set({ [STORAGE_KEYS.draft]: draft });
+    return draft;
+  }, lockManager);
+}
+
+export async function clearDraft(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => clearDraftUnlocked(area, options), lockManager);
 }
 
 export async function loadRecoveryInfo(storage = chrome.storage.local) {
   const area = getStorage(storage);
   const stored = await area.get(STORAGE_KEYS.recovery);
-  const recovery = stored[STORAGE_KEYS.recovery];
+  const recovery = normalizeRecovery(stored[STORAGE_KEYS.recovery]);
   return {
-    rejectedNotes: Array.isArray(recovery?.rejectedNotes) ? recovery.rejectedNotes.length : 0,
-    rejectedDrafts: Array.isArray(recovery?.rejectedDrafts) ? recovery.rejectedDrafts.length : 0,
+    rejectedNotes: recovery?.rejectedNotes || 0,
+    rejectedDrafts: recovery?.rejectedDrafts || 0,
   };
 }

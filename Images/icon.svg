@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Lecture Notes</title>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="#17202a"/>
+  <path d="M32 22h49l19 19v65H32z" fill="#fffaf5" stroke="#f97316" stroke-linejoin="round" stroke-width="6"/>
+  <path d="M81 22v20h19" fill="none" stroke="#f97316" stroke-linejoin="round" stroke-width="6"/>
+  <path d="M47 56h38M47 70h38M67 84h18" fill="none" stroke="#52606d" stroke-linecap="round" stroke-width="6"/>
+  <path d="M44 82h17v27l-8.5-6-8.5 6z" fill="#f97316"/>
+</svg>

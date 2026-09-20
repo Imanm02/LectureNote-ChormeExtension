@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en" data-theme="system">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Capture a lecture note</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body class="popup-body">
+    <header class="app-header popup-header">
+      <div class="brand">
+        <img src="Images/icon48.png" width="32" height="32" alt="">
+        <div>
+          <p class="eyebrow">Lecture Notes</p>
+          <h1>Quick capture</h1>
+        </div>
+      </div>
+      <a class="button button-secondary compact" href="notes.html" target="_blank">Open library</a>
+    </header>
+
+    <main>
+      <section class="source-card" aria-labelledby="sourceHeading">
+        <div>
+          <h2 id="sourceHeading">Current source</h2>
+          <p id="sourceTitle" class="source-title" dir="auto">Checking the active page...</p>
+          <a id="sourceLink" class="source-link" target="_blank" rel="noreferrer" hidden>Open source page</a>
+        </div>
+        <button id="useSelectionButton" class="button button-quiet compact" type="button" hidden>
+          Use page selection
+        </button>
+      </section>
+
+      <form id="noteForm" novalidate inert aria-busy="true">
+        <div class="field">
+          <label for="titleInput">Title</label>
+          <input id="titleInput" name="title" type="text" maxlength="160" autocomplete="off" dir="auto">
+        </div>
+
+        <div class="field">
+          <label for="courseInput">Course <span class="optional">Optional</span></label>
+          <input id="courseInput" name="course" type="text" maxlength="80" autocomplete="off" dir="auto">
+        </div>
+
+        <div class="field">
+          <div class="label-row">
+            <label for="bodyInput">Note text</label>
+            <output id="bodyCount" for="bodyInput">0 / 100,000</output>
+          </div>
+          <textarea
+            id="bodyInput"
+            name="body"
+            rows="8"
+            maxlength="100000"
+            required
+            aria-describedby="bodyHint bodyCount"
+            dir="auto"
+          ></textarea>
+          <p id="bodyHint" class="field-hint">Select text before opening the extension, or type a note here. Save with Ctrl or Command + Enter.</p>
+        </div>
+
+        <div id="duplicateNotice" class="notice notice-warning" role="alert" hidden>
+          <p>An identical note already exists.</p>
+          <button id="saveCopyButton" class="button button-secondary compact" type="button">Save another copy</button>
+        </div>
+
+        <div class="form-actions">
+          <button id="saveButton" class="button button-primary" type="submit">Save note</button>
+          <button id="discardButton" class="button button-quiet" type="button">Discard draft</button>
+        </div>
+      </form>
+
+      <p id="status" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+
+      <section class="recent-section" aria-labelledby="recentHeading">
+        <div class="section-heading">
+          <h2 id="recentHeading">Recent notes</h2>
+          <span id="noteCount" class="count-badge">0</span>
+        </div>
+        <p id="recentEmpty" class="empty-copy">Your saved notes will appear here.</p>
+        <ul id="recentList" class="recent-list"></ul>
+      </section>
+    </main>
+
+    <footer class="popup-footer">Saved in this Chrome profile. Nothing is sent to a server.</footer>
+    <script type="module" src="src/popup.js"></script>
+  </body>
+</html>
