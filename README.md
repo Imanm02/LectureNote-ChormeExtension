@@ -78,7 +78,7 @@ Stored notes and exported files are not encrypted. Anyone with access to the Chr
 
 ## Development
 
-Install Node.js 24 or newer, then install the locked development dependencies:
+Install Node.js 24.15 or newer in the Node 24 line, or Node.js 26 or newer. Then install the locked development dependencies:
 
 ```bash
 npm ci
