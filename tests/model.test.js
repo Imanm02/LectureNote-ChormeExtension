@@ -7,6 +7,7 @@ import {
   createNote,
   LIMITS,
   normalizeDraft,
+  normalizeEditorDraft,
   normalizeNote,
   normalizeSource,
   removeNote,
@@ -342,6 +343,114 @@ test("normalizes drafts without silently truncating them", () => {
   assert.throws(() => normalizeDraft({ body: "x".repeat(LIMITS.body + 1) }, { now: START }), {
     code: "note-text-length",
   });
+});
+
+test("normalizes editor drafts without losing unfinished source fields", () => {
+  const baseNote = createNote(sample(), { idFactory: () => "note-1", now: START });
+  const draft = normalizeEditorDraft(
+    {
+      noteId: baseNote.id,
+      baseRevision: 4,
+      baseNote: { ...baseNote, ignored: "drop this" },
+      title: baseNote.title,
+      body: `${baseNote.body}\nیادداشت`,
+      course: baseNote.course,
+      source: { title: "Course page", url: "https://" },
+      ignored: "drop this",
+    },
+    { now: LATER },
+  );
+
+  assert.equal(draft.source.url, "https://");
+  assert.equal(draft.body, `${baseNote.body}\nیادداشت`);
+  assert.equal(draft.baseNote.id, baseNote.id);
+  assert.equal(Object.hasOwn(draft, "ignored"), false);
+  assert.equal(Object.hasOwn(draft.baseNote, "ignored"), false);
+});
+
+test("removes secrets from valid editor draft source URLs", () => {
+  const draft = normalizeEditorDraft(
+    {
+      body: "Pending note",
+      source: {
+        url: "https://student:password@example.com/lesson?chapter=2&token=secret&utm_source=mail#answers",
+      },
+    },
+    { now: START },
+  );
+
+  assert.equal(draft.source.url, "https://example.com/lesson?chapter=2");
+
+  const unsupported = normalizeEditorDraft(
+    {
+      body: "Pending note",
+      source: {
+        url: "ftp://student:password@example.com/lesson?chapter=2&token=secret#answers",
+      },
+    },
+    { now: START },
+  );
+  assert.equal(unsupported.source.url, "ftp://example.com/lesson?chapter=2");
+
+  const incomplete = normalizeEditorDraft(
+    {
+      body: "Pending note",
+      source: {
+        url: "https://student:password@?chapter=2&token=secret#answers",
+      },
+    },
+    { now: START },
+  );
+  assert.equal(incomplete.source.url, "https://?chapter=2");
+});
+
+test("drops blank and unchanged editor drafts but keeps cleared edits", () => {
+  const baseNote = createNote(sample(), { idFactory: () => "note-1", now: START });
+  assert.equal(normalizeEditorDraft({}, { now: START }), null);
+  assert.equal(
+    normalizeEditorDraft(
+      {
+        noteId: baseNote.id,
+        baseNote,
+        title: baseNote.title,
+        body: baseNote.body,
+        course: baseNote.course,
+        source: baseNote.source,
+      },
+      { now: START },
+    ),
+    null,
+  );
+
+  const cleared = normalizeEditorDraft(
+    {
+      noteId: baseNote.id,
+      baseNote,
+      title: "",
+      body: "",
+      course: "",
+      source: {},
+    },
+    { now: START },
+  );
+  assert.equal(cleared.noteId, baseNote.id);
+  assert.equal(cleared.body, "");
+});
+
+test("rejects invalid editor draft identity and field limits", () => {
+  const baseNote = createNote(sample(), { idFactory: () => "note-1", now: START });
+  assert.throws(
+    () => normalizeEditorDraft({ noteId: "note-1", body: "Changed" }, { now: START }),
+    { code: "draft-base-note" },
+  );
+  assert.throws(
+    () => normalizeEditorDraft({ noteId: "different", baseNote, body: "Changed" }, { now: START }),
+    { code: "draft-base-id" },
+  );
+  assert.throws(
+    () => normalizeEditorDraft({ body: "x".repeat(LIMITS.body + 1) }, { now: START }),
+    { code: "note-text-length" },
+  );
 });
 
 test("updates settings through the revision contract", () => {

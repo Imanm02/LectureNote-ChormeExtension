@@ -77,6 +77,24 @@
   gap: var(--space-2);
 }
 
+.draft-recovery {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.draft-recovery h2,
+.draft-recovery-message {
+  margin-block-end: var(--space-1);
+}
+
+.draft-recovery-actions {
+  display: flex;
+  flex: none;
+  gap: var(--space-2);
+}
+
 .key-hint {
   min-width: 1.5rem;
   padding: 1px 5px;
@@ -315,6 +333,7 @@
 @media (max-width: 560px) {
   .library-header-inner,
   .library-feedback,
+  .draft-recovery,
   .note-card-header {
     align-items: stretch;
     flex-direction: column;
@@ -334,8 +353,14 @@
   }
 
   .library-actions .button,
+  .draft-recovery-actions .button,
   .dialog-actions .button {
     flex: 1 1 auto;
+  }
+
+  .draft-recovery-actions {
+    width: 100%;
+    flex-wrap: wrap;
   }
 
   .note-time {

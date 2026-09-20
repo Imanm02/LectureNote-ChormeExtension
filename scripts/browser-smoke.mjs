@@ -238,7 +238,7 @@ try {
   const graphCard = library.locator(".note-card", { hasText: "Graph basics" });
   await graphCard.getByRole("button", { name: "Edit" }).click();
   await library.locator("#editorBody").fill("Edited graph theory note.");
-  await library.locator("#editorForm").getByRole("button", { name: "Save note" }).click();
+  await library.locator("#editorForm").getByRole("button", { name: "Save changes" }).click();
   await graphCard.getByText("Edited graph theory note.").waitFor();
   if (screenshotDirectory) {
     await library.screenshot({ path: join(screenshotDirectory, "library-light.png"), fullPage: true });
@@ -271,11 +271,33 @@ try {
   await library.getByRole("heading", { name: "Graph basics" }).waitFor();
   assert.equal(await library.locator(".note-card").count(), 2);
 
+  await library.getByRole("button", { name: "New note" }).click();
+  await library.evaluate(() => {
+    const title = globalThis.document.querySelector("#editorTitle");
+    const body = globalThis.document.querySelector("#editorBody");
+    title.value = "Recovered browser draft";
+    body.value = "This editor text must survive a closed tab.";
+    body.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await library.close();
+
+  const recoveredLibrary = await context.newPage();
+  await recoveredLibrary.goto(notesUrl);
+  await recoveredLibrary.locator("#editorDraftRecovery").waitFor();
+  await recoveredLibrary.getByRole("button", { name: "Resume draft" }).click();
+  await recoveredLibrary.getByRole("heading", { name: "Resume draft" }).waitFor();
+  assert.equal(await recoveredLibrary.locator("#editorBody").inputValue(), "This editor text must survive a closed tab.");
+  await recoveredLibrary.locator("#editorForm").getByRole("button", { name: "Save note" }).click();
+  await recoveredLibrary.getByRole("heading", { name: "Recovered browser draft" }).waitFor();
+  await recoveredLibrary.reload();
+  await recoveredLibrary.locator("#libraryMain[aria-busy='false']").waitFor();
+  assert.equal(await recoveredLibrary.locator("#editorDraftRecovery").isHidden(), true);
+
   assert.deepEqual(browserErrors, []);
   const shortcutResult = shortcutCaptureVerified
     ? " Action shortcut capture also passed."
     : " Headless Chromium did not expose the action popup.";
-  console.log(`Browser smoke test passed: real selection handling, popup drafts, persistence, CRUD, search, backup, theme, and undo.${shortcutResult}`);
+  console.log(`Browser smoke test passed: selection handling, popup and editor draft recovery, persistence, CRUD, search, backup, theme, and undo.${shortcutResult}`);
 } finally {
   await context?.close().catch(() => undefined);
   await closeFixtureServer(fixtureServer).catch(() => undefined);

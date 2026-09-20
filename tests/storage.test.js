@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  clearEditorDraft,
   clearDraft,
+  loadEditorDraft,
   loadDraft,
   loadRecoveryInfo,
   loadState,
   mutateState,
+  mutateStateAndClearEditorDraft,
+  saveEditorDraft,
   saveDraft,
   saveState,
   STORAGE_KEYS,
@@ -45,6 +49,18 @@ function sample(body = "Graph theory") {
     body,
     course: "CS 101",
     source: { title: "Course page", url: "https://example.com/lecture" },
+  };
+}
+
+function editorDraft(body = "Unfinished graph note") {
+  return {
+    noteId: null,
+    baseRevision: 0,
+    baseNote: null,
+    title: "Draft lecture",
+    body,
+    course: "CS 101",
+    source: { title: "Course page", url: "https://" },
   };
 }
 
@@ -265,4 +281,335 @@ test("propagates storage failures without reporting success", async () => {
 
   await assert.rejects(() => loadState(storage, { now: NOW }), failure);
   await assert.rejects(() => saveDraft({ body: "Keep me" }, storage, { now: NOW }), failure);
+});
+
+test("keeps popup and editor drafts in separate records", async () => {
+  const storage = memoryStorage();
+  await saveDraft({ body: "Popup draft" }, storage, { now: NOW });
+  const saved = await saveEditorDraft(editorDraft(), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    now: NOW,
+  });
+
+  assert.equal(saved.saved, true);
+  assert.equal((await loadDraft(storage)).body, "Popup draft");
+  assert.equal((await loadEditorDraft(storage)).draft.body, "Unfinished graph note");
+  assert.equal((await loadEditorDraft(storage)).draft.source.url, "https://");
+});
+
+test("rejects stale editor writes and delayed resurrection", async () => {
+  const storage = memoryStorage();
+  const first = await saveEditorDraft(editorDraft("First"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    now: NOW,
+  });
+  const second = await saveEditorDraft(editorDraft("Second"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: first.record.ownerSessionId,
+    expectedGeneration: first.record.generation,
+    now: NOW,
+  });
+  const stale = await saveEditorDraft(editorDraft("Late first write"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: first.record.ownerSessionId,
+    expectedGeneration: first.record.generation,
+    now: NOW,
+  });
+
+  assert.equal(stale.saved, false);
+  assert.equal(stale.record.draft.body, "Second");
+
+  const cleared = await clearEditorDraft(storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: second.record.ownerSessionId,
+    expectedGeneration: second.record.generation,
+  });
+  const resurrected = await saveEditorDraft(editorDraft("Delayed page close"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: second.record.ownerSessionId,
+    expectedGeneration: second.record.generation,
+    now: NOW,
+  });
+
+  assert.equal(cleared.record.draft, null);
+  assert.equal(resurrected.saved, false);
+  assert.equal((await loadEditorDraft(storage)).draft, null);
+});
+
+test("orders stale-cursor writes within one editor session", async () => {
+  const storage = memoryStorage();
+  const first = await saveEditorDraft(editorDraft("First"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 1,
+    now: NOW,
+  });
+  const second = await saveEditorDraft(editorDraft("Second"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 2,
+    now: NOW,
+  });
+  const delayed = await saveEditorDraft(editorDraft("Delayed first"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 1,
+    now: NOW,
+  });
+  const repeated = await saveEditorDraft(
+    { ...editorDraft("Second"), updatedAt: "2026-09-20T11:00:00.000Z" },
+    storage,
+    {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 2,
+    now: NOW,
+    },
+  );
+  const conflictingRepeat = await saveEditorDraft(editorDraft("Different second"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 2,
+    now: NOW,
+  });
+
+  assert.equal(first.record.generation, 1);
+  assert.equal(second.saved, true);
+  assert.equal(second.record.generation, 2);
+  assert.equal(second.record.contentGeneration, 2);
+  assert.equal(delayed.saved, false);
+  assert.equal(repeated.saved, true);
+  assert.equal(repeated.record.generation, 2);
+  assert.equal(conflictingRepeat.saved, false);
+  assert.equal((await loadEditorDraft(storage)).draft.body, "Second");
+});
+
+test("orders editor tombstones without crossing owners", async () => {
+  const storage = memoryStorage();
+  const first = await saveEditorDraft(editorDraft("First"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 1,
+    now: NOW,
+  });
+  const cleared = await clearEditorDraft(storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: first.record.ownerSessionId,
+    expectedGeneration: first.record.generation,
+    contentGeneration: 3,
+  });
+  const delayed = await saveEditorDraft(editorDraft("Delayed"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: first.record.ownerSessionId,
+    expectedGeneration: first.record.generation,
+    contentGeneration: 2,
+    now: NOW,
+  });
+  const revived = await saveEditorDraft(editorDraft("New work"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: first.record.ownerSessionId,
+    expectedGeneration: first.record.generation,
+    contentGeneration: 4,
+    now: NOW,
+  });
+  const foreignClear = await clearEditorDraft(storage, {
+    sessionId: "editor-two",
+    expectedOwnerSessionId: revived.record.ownerSessionId,
+    expectedGeneration: revived.record.generation,
+    contentGeneration: 1,
+  });
+  const crossedOwner = await saveEditorDraft(editorDraft("Must not return"), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: revived.record.ownerSessionId,
+    expectedGeneration: revived.record.generation,
+    contentGeneration: 100,
+    now: NOW,
+  });
+
+  assert.equal(cleared.record.draft, null);
+  assert.equal(delayed.saved, false);
+  assert.equal(revived.saved, true);
+  assert.equal(revived.record.draft.body, "New work");
+  assert.equal(foreignClear.record.draft, null);
+  assert.equal(crossedOwner.saved, false);
+  assert.equal((await loadEditorDraft(storage)).draft, null);
+});
+
+test("saves a note and clears its editor draft in one update", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const savedDraft = await saveEditorDraft(editorDraft(), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    now: NOW,
+  });
+  const result = await mutateStateAndClearEditorDraft(
+    (state) => addNote(state, sample("Saved body"), { idFactory: () => "saved-note", now: NOW }),
+    storage,
+    {
+      sessionId: "editor-one",
+      expectedOwnerSessionId: savedDraft.record.ownerSessionId,
+      expectedGeneration: savedDraft.record.generation,
+      now: NOW,
+    },
+  );
+
+  assert.equal(result.editorDraftCleared, true);
+  assert.equal(result.state.notes[0].id, "saved-note");
+  assert.equal((await loadEditorDraft(storage)).draft, null);
+});
+
+test("keeps another tab's editor draft while saving a note", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  await saveEditorDraft(editorDraft("Other tab"), storage, {
+    sessionId: "editor-other",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    now: NOW,
+  });
+  const result = await mutateStateAndClearEditorDraft(
+    (state) => addNote(state, sample("Saved locally"), { idFactory: () => "saved-note", now: NOW }),
+    storage,
+    {
+      sessionId: "editor-local",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      now: NOW,
+    },
+  );
+
+  assert.equal(result.editorDraftCleared, false);
+  assert.equal(result.state.notes.length, 1);
+  assert.equal((await loadEditorDraft(storage)).draft.body, "Other tab");
+});
+
+test("quarantines a malformed editor draft without blocking the library", async () => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.editorDraft]: { version: 1, ownerSessionId: "bad id", generation: 1, draft: {} },
+  });
+
+  const state = await loadState(storage, { now: NOW });
+  const record = await loadEditorDraft(storage, { now: NOW });
+  const recovery = await loadRecoveryInfo(storage);
+
+  assert.deepEqual(state.notes, []);
+  assert.equal(record.draft, null);
+  assert.equal(recovery.rejectedDrafts, 1);
+});
+
+test("preserves editor drafts from a newer storage version", async () => {
+  const futureRecord = {
+    version: 2,
+    ownerSessionId: "future-editor",
+    generation: 4,
+    contentGeneration: 7,
+    draft: { body: "Future draft data" },
+  };
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.editorDraft]: futureRecord,
+  });
+  const before = structuredClone(storage.values);
+
+  await assert.rejects(() => loadEditorDraft(storage), { code: "editor-draft-version" });
+  await assert.rejects(
+    () =>
+      saveEditorDraft(editorDraft("Do not replace"), storage, {
+        sessionId: "older-editor",
+        expectedOwnerSessionId: "",
+        expectedGeneration: 0,
+        contentGeneration: 1,
+      }),
+    { code: "editor-draft-version" },
+  );
+  await assert.rejects(
+    () =>
+      mutateStateAndClearEditorDraft(
+        (state) => addNote(state, sample("Do not save"), { idFactory: () => "not-saved", now: NOW }),
+        storage,
+        {
+          sessionId: "older-editor",
+          expectedOwnerSessionId: "",
+          expectedGeneration: 0,
+        },
+      ),
+    { code: "editor-draft-version" },
+  );
+
+  assert.deepEqual(storage.values, before);
+});
+
+test("does not quarantine a draft when canonicalization storage fails", async () => {
+  const rawRecord = {
+    version: 1,
+    ownerSessionId: "editor-one",
+    generation: 1,
+    draft: { ...editorDraft(), ignored: "drop this" },
+  };
+  const storage = memoryStorage({ [STORAGE_KEYS.editorDraft]: rawRecord });
+  const before = structuredClone(storage.values);
+  const storedSet = storage.set.bind(storage);
+  let setCalls = 0;
+  storage.set = async (update) => {
+    setCalls += 1;
+    if (setCalls === 1) {
+      throw new Error("Canonical write failed");
+    }
+    return storedSet(update);
+  };
+
+  await assert.rejects(() => loadEditorDraft(storage, { now: NOW }), /Canonical write failed/u);
+  assert.deepEqual(storage.values, before);
+  assert.equal(storage.values[STORAGE_KEYS.recovery], undefined);
+
+  const recovered = await loadEditorDraft(storage, { now: NOW });
+  assert.equal(recovered.draft.body, rawRecord.draft.body);
+  assert.equal(recovered.contentGeneration, 0);
+  assert.equal(Object.hasOwn(storage.values[STORAGE_KEYS.editorDraft].draft, "ignored"), false);
+});
+
+test("does not save a note without clearing its owned draft when the combined write fails", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const savedDraft = await saveEditorDraft(editorDraft(), storage, {
+    sessionId: "editor-one",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    now: NOW,
+  });
+  const before = structuredClone(storage.values);
+  const originalSet = storage.set.bind(storage);
+  storage.set = async (update) => {
+    if (Object.hasOwn(update, STORAGE_KEYS.state) && Object.hasOwn(update, STORAGE_KEYS.editorDraft)) {
+      throw new Error("Combined write failed");
+    }
+    return originalSet(update);
+  };
+
+  await assert.rejects(
+    () =>
+      mutateStateAndClearEditorDraft(
+        (state) => addNote(state, sample("Do not save"), { idFactory: () => "not-saved", now: NOW }),
+        storage,
+        {
+          sessionId: "editor-one",
+          expectedOwnerSessionId: savedDraft.record.ownerSessionId,
+          expectedGeneration: savedDraft.record.generation,
+          now: NOW,
+        },
+      ),
+    /Combined write failed/u,
+  );
+
+  assert.deepEqual(storage.values, before);
 });

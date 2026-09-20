@@ -70,6 +70,18 @@
         </div>
       </div>
 
+      <section id="editorDraftRecovery" class="draft-recovery notice notice-warning" aria-labelledby="editorDraftHeading" aria-describedby="editorDraftMessage editorDraftStatus" hidden>
+        <div>
+          <h2 id="editorDraftHeading">Unfinished draft</h2>
+          <p id="editorDraftMessage" class="draft-recovery-message" role="status" aria-live="polite" aria-atomic="true"></p>
+          <p id="editorDraftStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <div class="draft-recovery-actions">
+          <button id="resumeEditorDraftButton" class="button button-primary" type="button">Resume draft</button>
+          <button id="discardEditorDraftButton" class="button button-quiet danger-text" type="button">Discard draft</button>
+        </div>
+      </section>
+
       <section id="emptyState" class="empty-state" hidden>
         <h2>No saved notes yet</h2>
         <p>Your notes stay in this Chrome profile. Create one here, or select text on a page and open the extension.</p>
@@ -108,7 +120,7 @@
       </article>
     </template>
 
-    <dialog id="editorDialog" class="dialog editor-dialog" aria-labelledby="editorHeading">
+    <dialog id="editorDialog" class="dialog editor-dialog" aria-labelledby="editorHeading" aria-describedby="editorStatus">
       <form id="editorForm" class="dialog-form" novalidate>
         <header class="dialog-header">
           <div>
@@ -136,7 +148,7 @@
             <textarea id="editorBody" rows="14" maxlength="100000" required dir="auto"></textarea>
             <p class="field-hint">Save with Ctrl or Command + Enter.</p>
           </div>
-          <details class="source-details">
+          <details id="editorSourceDetails" class="source-details">
             <summary>Source details</summary>
             <div class="source-fields">
               <div class="field">
@@ -154,11 +166,15 @@
             <p>A note with the same text, course, and source URL already exists.</p>
             <button id="editorSaveDuplicateButton" class="button button-secondary compact" type="button">Save anyway</button>
           </div>
+          <div id="editorConflictNotice" class="notice notice-warning" role="alert" hidden>
+            <p>The original note changed or was deleted. Save this draft as a new note without overwriting library changes.</p>
+            <button id="saveEditorAsNewButton" class="button button-secondary compact" type="button">Save as new note</button>
+          </div>
           <p id="editorStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
         </div>
 
         <footer class="dialog-actions">
-          <button id="cancelEditorButton" class="button button-secondary" type="button">Cancel</button>
+          <button id="cancelEditorButton" class="button button-secondary" type="button">Close</button>
           <button id="saveEditorButton" class="button button-primary" type="submit">Save note</button>
         </footer>
       </form>

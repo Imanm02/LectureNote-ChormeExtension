@@ -11,6 +11,7 @@ export const LIMITS = Object.freeze({
   notes: 2_000,
   importBytes: 8_000_000,
   stateBytes: 7_000_000,
+  editorDraftBytes: 1_500_000,
 });
 
 export const SORT_VALUES = Object.freeze([
@@ -150,6 +151,49 @@ function normalizeTimestamp(value, fallback) {
 }
 
 const SENSITIVE_QUERY_PARAMETER = /^(?:(?:access|auth|id|oauth|refresh|session)_?token|api_?key|auth|authorization|client_?secret|code|credential|fbclid|gclid|jsessionid|jwt|key|msclkid|pass|password|samlresponse|secret|session|session_?id|sig|signature|state|token|utm_.+|x-(?:amz|goog)-(?:credential|security-token|signature))$/iu;
+
+function sanitizeParsedUrl(parsed) {
+  parsed.username = "";
+  parsed.password = "";
+  for (const name of [...parsed.searchParams.keys()]) {
+    if (SENSITIVE_QUERY_PARAMETER.test(name)) {
+      parsed.searchParams.delete(name);
+    }
+  }
+  parsed.hash = "";
+  return parsed.href;
+}
+
+function sanitizeUnparsedDraftUrl(rawUrl) {
+  const withoutCredentials = rawUrl.replace(
+    /^([a-z][a-z\d+.-]*:\/\/)[^/?#@\s]+@/iu,
+    "$1",
+  );
+  const fragmentIndex = withoutCredentials.indexOf("#");
+  const withoutFragment = fragmentIndex === -1
+    ? withoutCredentials
+    : withoutCredentials.slice(0, fragmentIndex);
+  const queryIndex = withoutFragment.indexOf("?");
+  if (queryIndex === -1) {
+    return withoutFragment;
+  }
+  const base = withoutFragment.slice(0, queryIndex);
+  const retained = withoutFragment
+    .slice(queryIndex + 1)
+    .split("&")
+    .filter((parameter) => {
+      const rawName = parameter.split("=", 1)[0];
+      let name = rawName;
+      try {
+        name = decodeURIComponent(rawName.replace(/\+/gu, " "));
+      } catch {
+        // Keep malformed parameter names unless they match directly.
+      }
+      return !SENSITIVE_QUERY_PARAMETER.test(name);
+    });
+  return retained.length > 0 ? `${base}?${retained.join("&")}` : base;
+}
+
 export function normalizeSource(value = {}, { strictUrl = false } = {}) {
   if (!isRecord(value)) {
     throw new ValidationError("Source details are invalid.", "source-type");
@@ -182,15 +226,8 @@ export function normalizeSource(value = {}, { strictUrl = false } = {}) {
     return { title, url: "" };
   }
 
-  parsed.username = "";
-  parsed.password = "";
-  for (const name of [...parsed.searchParams.keys()]) {
-    if (SENSITIVE_QUERY_PARAMETER.test(name)) {
-      parsed.searchParams.delete(name);
-    }
-  }
-  parsed.hash = "";
-  if (parsed.href.length > LIMITS.sourceUrl) {
+  const url = sanitizeParsedUrl(parsed);
+  if (url.length > LIMITS.sourceUrl) {
     if (strictUrl) {
       throw new ValidationError(
         `Source URL must be ${LIMITS.sourceUrl.toLocaleString()} characters or fewer.`,
@@ -199,7 +236,6 @@ export function normalizeSource(value = {}, { strictUrl = false } = {}) {
     }
     return { title, url: "" };
   }
-  const url = parsed.href;
   return { title, url };
 }
 
@@ -356,6 +392,28 @@ function normalizeDraftField(value, label, maximum, allowNewlines = false) {
   return normalized;
 }
 
+function normalizeEditorDraftSourceUrl(value) {
+  const rawUrl = normalizeDraftField(value, "Source URL", LIMITS.sourceUrl);
+  if (!rawUrl) {
+    return "";
+  }
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    // Keep incomplete input so it can be resumed and corrected.
+    return sanitizeUnparsedDraftUrl(rawUrl);
+  }
+  const sanitizedUrl = sanitizeParsedUrl(parsed);
+  if (sanitizedUrl.length > LIMITS.sourceUrl) {
+    throw new ValidationError(
+      `Source URL must be ${LIMITS.sourceUrl.toLocaleString()} characters or fewer.`,
+      "source-url-length",
+    );
+  }
+  return sanitizedUrl;
+}
+
 export function normalizeDraft(value, { now = new Date().toISOString() } = {}) {
   if (value === undefined || value === null) {
     return null;
@@ -390,6 +448,71 @@ export function normalizeDraft(value, { now = new Date().toISOString() } = {}) {
     course,
     source,
     updatedAt: normalizeTimestamp(value.updatedAt, normalizeTimestamp(now, new Date().toISOString())),
+  };
+}
+
+export function normalizeEditorDraft(value, options = {}) {
+  if (!isRecord(value)) {
+    throw new ValidationError("The saved editor draft is invalid.", "editor-draft-type");
+  }
+
+  const title = normalizeDraftField(value.title, "Title", LIMITS.title);
+  const body = normalizeDraftField(value.body, "Note text", LIMITS.body, true);
+  const course = normalizeDraftField(value.course, "Course", LIMITS.course);
+  const sourceValue = isRecord(value.source)
+    ? value.source
+    : { title: value.sourceTitle, url: value.sourceUrl };
+  const source = {
+    title: normalizeDraftField(sourceValue.title, "Source title", LIMITS.sourceTitle),
+    url: normalizeEditorDraftSourceUrl(sourceValue.url),
+  };
+  const hasContent = [title, body, course, source.title, source.url].some((field) => field.trim());
+  const noteId = value.noteId === undefined || value.noteId === null || value.noteId === ""
+    ? null
+    : normalizeIdentifier(value.noteId, () => {
+        throw new ValidationError("The editor draft note ID is invalid.", "editor-draft-id");
+      });
+  if (!hasContent && !noteId) {
+    return null;
+  }
+
+  let baseNote = null;
+  if (noteId) {
+    if (!isRecord(value.baseNote)) {
+      throw new ValidationError("The editor draft is missing its original note.", "draft-base-note");
+    }
+    baseNote = normalizeNote(value.baseNote, options);
+    if (baseNote.id !== noteId) {
+      throw new ValidationError("The editor draft does not match its original note.", "draft-base-id");
+    }
+  }
+
+  if (
+    baseNote &&
+    JSON.stringify({ title, body, course, source }) ===
+      JSON.stringify({
+        title: baseNote.title,
+        body: baseNote.body,
+        course: baseNote.course,
+        source: baseNote.source,
+      })
+  ) {
+    return null;
+  }
+
+  return {
+    noteId,
+    baseRevision:
+      Number.isSafeInteger(value.baseRevision) && value.baseRevision >= 0 ? value.baseRevision : 0,
+    baseNote,
+    title,
+    body,
+    course,
+    source,
+    updatedAt: normalizeTimestamp(
+      value.updatedAt,
+      normalizeTimestamp(options.now, new Date().toISOString()),
+    ),
   };
 }
 

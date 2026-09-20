@@ -1,8 +1,10 @@
 import {
   addNote,
   createEmptyState,
+  isValidIdentifier,
   LIMITS,
   normalizeDraft,
+  normalizeEditorDraft,
   normalizeState,
   recoverState,
   ValidationError,
@@ -11,12 +13,14 @@ import {
 export const STORAGE_KEYS = Object.freeze({
   state: "lectureNoteState",
   draft: "lectureNoteDraft",
+  editorDraft: "lectureNoteEditorDraft",
   recovery: "lectureNoteRecovery",
   legacyResult: "result",
   legacySelection: "selectedText",
 });
 
 const STATE_LOCK = "lecture-note-state";
+const EDITOR_DRAFT_VERSION = 1;
 let localMutationQueue = Promise.resolve();
 
 function getStorage(storage) {
@@ -54,6 +58,73 @@ export function assertStateFits(value) {
       "storage-size",
     );
   }
+}
+
+function assertEditorDraftFits(value) {
+  if (encodedBytes(value) > LIMITS.editorDraftBytes) {
+    throw new ValidationError(
+      "The editor draft is too large for local storage. Copy its text before closing.",
+      "editor-draft-size",
+    );
+  }
+}
+
+function emptyEditorDraftRecord() {
+  return {
+    version: EDITOR_DRAFT_VERSION,
+    ownerSessionId: "",
+    generation: 0,
+    contentGeneration: 0,
+    draft: null,
+  };
+}
+
+function normalizeEditorDraftRecord(value, options = {}) {
+  if (value === undefined || value === null) {
+    return emptyEditorDraftRecord();
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new ValidationError("The saved editor draft record is invalid.", "editor-draft-record");
+  }
+  if (value.version !== EDITOR_DRAFT_VERSION) {
+    throw new ValidationError("The saved editor draft version is not supported.", "editor-draft-version");
+  }
+
+  const ownerSessionId = typeof value.ownerSessionId === "string" ? value.ownerSessionId : "";
+  const generation = Number.isSafeInteger(value.generation) && value.generation >= 0
+    ? value.generation
+    : -1;
+  const contentGeneration = Number.isSafeInteger(value.contentGeneration) && value.contentGeneration >= 0
+    ? value.contentGeneration
+    : 0;
+  if (
+    generation < 0 ||
+    (generation === 0 && (ownerSessionId || contentGeneration !== 0)) ||
+    (generation > 0 && !isValidIdentifier(ownerSessionId))
+  ) {
+    throw new ValidationError("The saved editor draft owner is invalid.", "editor-draft-owner");
+  }
+
+  const draft = value.draft === null ? null : normalizeEditorDraft(value.draft, options);
+  if (draft && (!isValidIdentifier(ownerSessionId) || generation === 0)) {
+    throw new ValidationError("The saved editor draft owner is missing.", "editor-draft-owner");
+  }
+  return { version: EDITOR_DRAFT_VERSION, ownerSessionId, generation, contentGeneration, draft };
+}
+
+function sameEditorDraftCursor(record, ownerSessionId, generation) {
+  return record.ownerSessionId === ownerSessionId && record.generation === generation;
+}
+
+function sameEditorDraftContent(left, right) {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  const { updatedAt: leftUpdatedAt, ...leftContent } = left;
+  const { updatedAt: rightUpdatedAt, ...rightContent } = right;
+  void leftUpdatedAt;
+  void rightUpdatedAt;
+  return sameData(leftContent, rightContent);
 }
 
 async function withStateLock(task, lockManager = globalThis.navigator?.locks) {
@@ -333,6 +404,198 @@ export async function clearDraft(
 ) {
   const area = getStorage(storage);
   return withStateLock(() => clearDraftUnlocked(area, options), lockManager);
+}
+
+async function loadEditorDraftUnlocked(area, options = {}) {
+  const stored = await area.get([STORAGE_KEYS.editorDraft, STORAGE_KEYS.recovery]);
+  const rawRecord = stored[STORAGE_KEYS.editorDraft];
+  let record;
+  try {
+    record = normalizeEditorDraftRecord(rawRecord, options);
+  } catch (error) {
+    if (
+      error instanceof ValidationError &&
+      error.code === "editor-draft-version" &&
+      Number.isSafeInteger(rawRecord?.version) &&
+      rawRecord.version > EDITOR_DRAFT_VERSION
+    ) {
+      throw error;
+    }
+    record = emptyEditorDraftRecord();
+    const recovery = appendRecovery(stored[STORAGE_KEYS.recovery], {
+      createdAt: options.now || new Date().toISOString(),
+      rejectedDrafts: 1,
+    });
+    await area.set({
+      [STORAGE_KEYS.editorDraft]: record,
+      [STORAGE_KEYS.recovery]: recovery,
+    });
+    return record;
+  }
+  if (rawRecord !== undefined && !sameData(rawRecord, record)) {
+    assertEditorDraftFits(record);
+    await area.set({ [STORAGE_KEYS.editorDraft]: record });
+  }
+  return record;
+}
+
+export async function loadEditorDraft(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => loadEditorDraftUnlocked(area, options), lockManager);
+}
+
+async function writeEditorDraftUnlocked(value, area, options) {
+  const {
+    sessionId,
+    expectedOwnerSessionId = "",
+    expectedGeneration = 0,
+    contentGeneration,
+    ...normalizeOptions
+  } = options;
+  if (!isValidIdentifier(sessionId)) {
+    throw new ValidationError("The editor draft session is invalid.", "editor-draft-session");
+  }
+  if (
+    typeof expectedOwnerSessionId !== "string" ||
+    !Number.isSafeInteger(expectedGeneration) ||
+    expectedGeneration < 0
+  ) {
+    throw new ValidationError("The editor draft cursor is invalid.", "editor-draft-cursor");
+  }
+  if (
+    contentGeneration !== undefined &&
+    (!Number.isSafeInteger(contentGeneration) || contentGeneration < 0)
+  ) {
+    throw new ValidationError("The editor draft content generation is invalid.", "editor-draft-content-generation");
+  }
+
+  const current = await loadEditorDraftUnlocked(area, normalizeOptions);
+  const draft = value === null ? null : normalizeEditorDraft(value, normalizeOptions);
+  const cursorMatches = sameEditorDraftCursor(
+    current,
+    expectedOwnerSessionId,
+    expectedGeneration,
+  );
+  const sameSession = current.ownerSessionId === sessionId;
+  if (
+    sameSession &&
+    contentGeneration === current.contentGeneration &&
+    sameEditorDraftContent(current.draft, draft)
+  ) {
+    return { saved: true, record: current };
+  }
+  const supersedesSameSession =
+    sameSession &&
+    contentGeneration !== undefined &&
+    contentGeneration > current.contentGeneration;
+  if (!cursorMatches && !supersedesSameSession) {
+    return { saved: false, record: current };
+  }
+  if (
+    sameSession &&
+    contentGeneration !== undefined &&
+    contentGeneration <= current.contentGeneration
+  ) {
+    return { saved: false, record: current };
+  }
+
+  const record = {
+    version: EDITOR_DRAFT_VERSION,
+    ownerSessionId: sessionId,
+    generation: current.generation + 1,
+    contentGeneration: contentGeneration ?? current.contentGeneration + 1,
+    draft,
+  };
+  assertEditorDraftFits(record);
+  await area.set({ [STORAGE_KEYS.editorDraft]: record });
+  return { saved: true, record };
+}
+
+export async function saveEditorDraft(
+  value,
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => writeEditorDraftUnlocked(value, area, options), lockManager);
+}
+
+export async function clearEditorDraft(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => writeEditorDraftUnlocked(null, area, options), lockManager);
+}
+
+export async function mutateStateAndClearEditorDraft(
+  mutation,
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  if (typeof mutation !== "function") {
+    throw new TypeError("A state mutation function is required.");
+  }
+
+  return withStateLock(async () => {
+    const area = getStorage(storage);
+    const expectedOwnerSessionId = options.expectedOwnerSessionId ?? "";
+    const expectedGeneration = options.expectedGeneration ?? 0;
+    if (
+      typeof expectedOwnerSessionId !== "string" ||
+      !Number.isSafeInteger(expectedGeneration) ||
+      expectedGeneration < 0
+    ) {
+      throw new ValidationError("The editor draft cursor is invalid.", "editor-draft-cursor");
+    }
+    const current = await loadStateUnlocked(area, options);
+    const result = await mutation(current);
+    const nextState = normalizeState(result?.state || result, options);
+    assertStateFits(nextState);
+    if (nextState.revision !== current.revision + 1) {
+      throw new ValidationError("The note update has an invalid revision.", "revision-invalid");
+    }
+
+    const currentDraft = await loadEditorDraftUnlocked(area, options);
+    const canClear = sameEditorDraftCursor(
+      currentDraft,
+      expectedOwnerSessionId,
+      expectedGeneration,
+    );
+    const updates = { [STORAGE_KEYS.state]: nextState };
+    let editorDraftRecord = currentDraft;
+    if (canClear) {
+      if (!isValidIdentifier(options.sessionId)) {
+        throw new ValidationError("The editor draft session is invalid.", "editor-draft-session");
+      }
+      editorDraftRecord = {
+        version: EDITOR_DRAFT_VERSION,
+        ownerSessionId: options.sessionId,
+        generation: currentDraft.generation + 1,
+        contentGeneration: currentDraft.contentGeneration + 1,
+        draft: null,
+      };
+      updates[STORAGE_KEYS.editorDraft] = editorDraftRecord;
+    }
+
+    await area.set(updates);
+    if (result && typeof result === "object" && "state" in result) {
+      return {
+        ...result,
+        state: nextState,
+        editorDraftCleared: canClear,
+        editorDraftRecord,
+      };
+    }
+    return {
+      state: nextState,
+      editorDraftCleared: canClear,
+      editorDraftRecord,
+    };
+  }, lockManager);
 }
 
 export async function loadRecoveryInfo(storage = chrome.storage.local) {

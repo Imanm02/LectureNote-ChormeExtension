@@ -8,7 +8,7 @@ The extension uses plain HTML, CSS, and JavaScript modules. It has no runtime de
 
 - Captures selected text, the page title, and a cleaned source URL, then keeps that source ready for another note.
 - Supports manual notes on pages where Chrome blocks selection access.
-- Saves unfinished popup drafts and restores them when the popup reopens.
+- Autosaves unfinished work in both quick capture and the full editor, then offers recovery when either page reopens.
 - Shows the three most recently updated notes in the popup.
 - Organizes notes with optional course labels and suggests courses already in the library.
 - Searches note titles, text, courses, and sources using words in any order, with Persian and Arabic letter matching.
@@ -50,7 +50,11 @@ After pulling a source update, return to `chrome://extensions` and select **Relo
 
 After a save, the popup clears the note text but keeps the current page source and course ready for the next note. If a note title is blank, the first nonempty line of the note becomes its title.
 
+Closing the full editor keeps changed fields as a local draft. The library shows that draft without opening it automatically. If its original note changed or was deleted, recovery creates a new note without overwriting library changes.
+
 JSON backups always include the full library. Markdown export follows the current search, course filter, and sort order. During restore, **Merge notes** preserves separately saved copies and skips a backup note only when its ID, text, course, and source URL match a note already present. **Replace library** removes the current library after confirmation.
+
+Unfinished drafts are recovery data, not saved notes, so they are not included in JSON or Markdown exports.
 
 ### Keyboard shortcuts
 
@@ -70,13 +74,13 @@ Chrome may decline the suggested capture shortcut if another extension already u
 | --- | --- |
 | `activeTab` | Grants temporary access to the current page after you invoke the extension |
 | `scripting` | Runs the selection reader on that active tab |
-| `storage` | Saves notes, settings, and drafts in `chrome.storage.local` |
+| `storage` | Saves notes, settings, and separate capture and editor drafts in `chrome.storage.local` |
 
 The extension has no host permissions or persistent content scripts. It makes no network requests. Notes remain in the current Chrome profile and do not use Chrome Sync.
 
 Password-field selections are ignored. Saved source URLs accept only HTTP or HTTPS. URL credentials, fragments, known authentication parameters, and tracking parameters are removed before storage. JSON backups and Markdown exports are generated locally.
 
-Stored notes and exported files are not encrypted. Anyone with access to the Chrome profile or an exported file may be able to read them.
+Stored notes, unfinished drafts, and exported files are not encrypted. Anyone with access to the Chrome profile or an exported file may be able to read them.
 
 ## Development
 
@@ -113,7 +117,7 @@ npm audit --audit-level=moderate
 - `npm test` runs the Node unit, integration, and DOM tests.
 - `npm run check:extension` validates the manifest, permissions, icons, local resources, script syntax, unsafe HTML sinks, dynamic code, network calls, and common credential patterns.
 - `npm run validate` runs lint, tests, and extension validation.
-- `npm run test:browser` loads the unpacked extension in Playwright Chromium against a local test page and checks selection handling, drafts, browser restart persistence, note operations, Persian search, backup restore, theme switching, and delete undo.
+- `npm run test:browser` loads the unpacked extension in Playwright Chromium against a local test page and checks selection handling, capture and editor draft recovery, browser restart persistence, note operations, Persian search, backup restore, theme switching, and delete undo.
 - `npm run test:coverage` runs the test suite with Node's coverage reporter.
 
 Headless Chromium may not expose the browser action popup after the `_execute_action` command. The browser test reports that case, while still testing the popup directly and exercising the same selection reader in a real page.
@@ -129,7 +133,7 @@ Headless Chromium may not expose the browser action popup after the `_execute_ac
 | `src/storage.js` | Local persistence, migration, locking, recovery, and revision checks |
 | `src/capture.js` | Active-page selection capture |
 | `src/backup.js` | JSON backup restore and Markdown export |
-| `src/background.js` | Internal draft handoff when the popup closes |
+| `src/background.js` | Internal draft handoff when an extension page closes |
 | `tests/` | Model, storage, popup, library, capture, and worker tests |
 | `scripts/` | Extension validation, browser smoke testing, and icon generation |
 
@@ -144,6 +148,7 @@ Headless Chromium may not expose the browser action popup after the `_execute_ac
 | Source URL | 2,048 characters |
 | Notes per library | 2,000 |
 | Stored library state | 7,000,000 bytes |
+| Full-editor recovery draft | 1,500,000 bytes |
 | Backup import or export | 8,000,000 bytes |
 | Initial library display | 100 notes |
 
