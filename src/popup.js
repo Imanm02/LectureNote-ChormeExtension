@@ -25,6 +25,23 @@ import {
 import { listCourses, selectNotes } from "./selectors.js";
 import { applyTheme, formatDate, setStatus } from "./ui.js";
 
+const CAPTURE_ERROR_MESSAGES = Object.freeze({
+  "pending-capture-limit":
+    "The capture queue is full. Use or discard a waiting capture before trying again.",
+  "pending-capture-size":
+    "The capture queue has no space for that selection. Use or discard a waiting capture before trying again.",
+  "capture-failed":
+    "Lecture Notes could not queue the selected text. Copy it from the page before trying again.",
+});
+
+function startupCaptureError(documentValue) {
+  const code = new URL(documentValue.location.href).searchParams.get("captureError");
+  if (!code) {
+    return "";
+  }
+  return CAPTURE_ERROR_MESSAGES[code] || CAPTURE_ERROR_MESSAGES["capture-failed"];
+}
+
 function requiredElement(documentValue, identifier) {
   const element = documentValue.getElementById(identifier);
   if (!element) {
@@ -110,6 +127,7 @@ export async function initPopup({
   confirmDiscard,
 } = {}) {
   const elements = popupElements(documentValue);
+  const captureStartupError = startupCaptureError(documentValue);
   const storage = chromeApi.storage.local;
   const consentEpoch = await requireDataConsent({ documentValue, chromeApi });
   const numberFormatter = new Intl.NumberFormat(documentValue.documentElement.lang || undefined);
@@ -1165,6 +1183,9 @@ export async function initPopup({
     helpSeen = savedHelpSeen;
     if (!helpSeen) {
       await showHelp();
+    }
+    if (captureStartupError) {
+      setStatus(elements.status, captureStartupError, "error");
     }
 
     } catch (error) {

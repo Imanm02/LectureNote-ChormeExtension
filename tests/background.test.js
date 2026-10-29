@@ -673,6 +673,27 @@ test("opens a captured draft in a popup window when allowed", async () => {
   ]);
 });
 
+test("passes a safe capture error code to the editor surface", async () => {
+  const createdWindows = [];
+  const opened = await openCaptureSurface(
+    {
+      runtime: { getURL: (path) => `chrome-extension://test/${path}` },
+      windows: {
+        async create(options) {
+          createdWindows.push(options);
+        },
+      },
+    },
+    { captureQueued: false, captureError: "pending-capture-limit" },
+  );
+
+  assert.equal(opened, "popup-window");
+  assert.equal(
+    createdWindows[0].url,
+    "chrome-extension://test/popup.html?captureError=pending-capture-limit",
+  );
+});
+
 test("reports when neither capture editor surface can open", async () => {
   await assert.rejects(
     () =>
@@ -788,34 +809,34 @@ test("does not open an editor for an empty context-menu selection", async () => 
   assert.equal(opened, false);
 });
 
-test("does not open an editor when a context capture cannot be queued", async () => {
+test("opens an error surface when a context capture cannot be queued", async () => {
   const storage = memoryStorage();
   storage.set = async () => {
     throw new Error("Storage unavailable");
   };
   let opened = false;
 
-  await assert.rejects(
-    () =>
-      handleContextMenuClick(
-        {
-          menuItemId: CAPTURE_CONTEXT_MENU_ID,
-          selectionText: "Keep this selection",
+  const result = await handleContextMenuClick(
+    {
+      menuItemId: CAPTURE_CONTEXT_MENU_ID,
+      selectionText: "Keep this selection",
+    },
+    {},
+    {
+      storage: { local: storage },
+      runtime: { getURL: () => "chrome-extension://test/popup.html" },
+      windows: {
+        async create(options) {
+          opened = options.url;
         },
-        {},
-        {
-          storage: { local: storage },
-          runtime: { getURL: () => "chrome-extension://test/popup.html" },
-          windows: {
-            async create() {
-              opened = true;
-            },
-          },
-        },
-      ),
-    /Storage unavailable/u,
+      },
+    },
   );
-  assert.equal(opened, false);
+
+  assert.equal(result.capture.saved, false);
+  assert.equal(result.capture.reason, "capture-failed");
+  assert.equal(result.surface, "popup-window");
+  assert.equal(opened, "chrome-extension://test/popup.html?captureError=capture-failed");
 });
 
 test("removes a queued capture only after its handed-off draft is saved", async () => {

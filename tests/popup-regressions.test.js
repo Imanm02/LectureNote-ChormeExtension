@@ -93,6 +93,28 @@ test("a first-use popup does not inspect the page or saved notes before consent"
   dom.window.close();
 });
 
+test("explains a failed context-menu capture in the popup", async () => {
+  const dom = loadPage("popup.html");
+  dom.reconfigure({
+    url: "https://extension.test/popup.html?captureError=pending-capture-limit",
+  });
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+
+  const status = dom.window.document.getElementById("status");
+  assert.equal(
+    status.textContent,
+    "The capture queue is full. Use or discard a waiting capture before trying again.",
+  );
+  assert.equal(status.dataset.kind, "error");
+  assert.equal(status.getAttribute("role"), "alert");
+  controller.destroy();
+  dom.window.close();
+});
+
 test("bounds long page metadata before saving a captured note", async () => {
   const dom = loadPage("popup.html");
   const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });

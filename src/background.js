@@ -274,17 +274,23 @@ export async function captureContextSelection(
 
 export async function openCaptureSurface(
   chromeApi = chrome,
-  { captureQueued = true } = {},
+  { captureQueued = true, captureError = "" } = {},
 ) {
-  const popupUrl = chromeApi.runtime.getURL("popup.html");
+  const popupUrl = new URL(chromeApi.runtime.getURL("popup.html"));
+  if (captureError) {
+    popupUrl.searchParams.set("captureError", captureError);
+  }
+  const surfaceUrl = popupUrl.href;
   const failureMessage = captureQueued
     ? "The captured selection was queued, but its editor could not open."
-    : "Lecture Notes could not open the consent gate.";
+    : captureError
+      ? "The selected text could not be queued, and Lecture Notes could not open the error."
+      : "Lecture Notes could not open the consent gate.";
   let windowError = null;
   if (typeof chromeApi.windows?.create === "function") {
     try {
       await chromeApi.windows.create({
-        url: popupUrl,
+        url: surfaceUrl,
         type: "popup",
         width: 430,
         height: 650,
@@ -298,7 +304,7 @@ export async function openCaptureSurface(
 
   if (typeof chromeApi.tabs?.create === "function") {
     try {
-      await chromeApi.tabs.create({ url: popupUrl });
+      await chromeApi.tabs.create({ url: surfaceUrl });
       return "tab";
     } catch (error) {
       const detail = windowError
@@ -361,7 +367,20 @@ export async function handleContextMenuClick(info, tab, chromeApi = chrome) {
         surface,
       };
     }
-    throw error;
+    const reason = error instanceof ValidationError ? error.code : "capture-failed";
+    const surface = await openCaptureSurface(chromeApi, {
+      captureQueued: false,
+      captureError: reason,
+    });
+    return {
+      handled: true,
+      capture: {
+        saved: false,
+        reason,
+        wasTruncated: false,
+      },
+      surface,
+    };
   }
   if (!capture.saved) {
     return { handled: true, capture, surface: null };
