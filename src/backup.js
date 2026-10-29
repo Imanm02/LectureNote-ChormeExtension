@@ -286,7 +286,7 @@ function markdownUrl(value) {
   return value.replace(/</gu, "%3C").replace(/>/gu, "%3E");
 }
 
-export function notesToMarkdown(notes) {
+export function notesToMarkdown(notes, { includeSource = true } = {}) {
   if (notes.length === 0) {
     return "# Lecture Notes\n\nNo saved notes.\n";
   }
@@ -296,11 +296,13 @@ export function notesToMarkdown(notes) {
     if (note.course) {
       lines.push("", `Course: ${escapeMarkdownText(note.course)}`);
     }
-    if (note.source.url) {
-      const label = escapeMarkdownText(note.source.title || note.source.url);
-      lines.push("", `Source: [${label}](<${markdownUrl(note.source.url)}>)`);
-    } else if (note.source.title) {
-      lines.push("", `Source: ${escapeMarkdownText(note.source.title)}`);
+    if (includeSource) {
+      if (note.source.url) {
+        const label = escapeMarkdownText(note.source.title || note.source.url);
+        lines.push("", `Source: [${label}](<${markdownUrl(note.source.url)}>)`);
+      } else if (note.source.title) {
+        lines.push("", `Source: ${escapeMarkdownText(note.source.title)}`);
+      }
     }
     lines.push("", `Updated: ${note.updatedAt}`, "", escapeMarkdownText(note.body));
     return lines.join("\n");

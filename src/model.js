@@ -11,8 +11,11 @@ export const LIMITS = Object.freeze({
   notes: 2_000,
   trash: 2_000,
   importBytes: 8_000_000,
+  localStorageBytes: 10_485_760,
   stateBytes: 7_000_000,
+  popupDraftBytes: 425_000,
   editorDraftBytes: 1_500_000,
+  pendingCapturesBytes: 750_000,
 });
 
 export const SORT_VALUES = Object.freeze([
@@ -249,6 +252,7 @@ export function createEmptyState() {
     settings: {
       theme: "system",
       sort: "updated-desc",
+      includeSourceOnShare: true,
     },
   };
 }
@@ -372,6 +376,7 @@ export function normalizeState(
   const settings = isRecord(value.settings) ? value.settings : {};
   const theme = THEME_VALUES.includes(settings.theme) ? settings.theme : "system";
   const sort = SORT_VALUES.includes(settings.sort) ? settings.sort : "updated-desc";
+  const includeSourceOnShare = settings.includeSourceOnShare !== false;
   const revision = Number.isSafeInteger(value.revision) && value.revision >= 0 ? value.revision : 0;
 
   return {
@@ -379,15 +384,19 @@ export function normalizeState(
     revision,
     notes,
     trash,
-    settings: { theme, sort },
+    settings: { theme, sort, includeSourceOnShare },
   };
 }
 
 export function measureLibraryUsage(stateValue, options = {}) {
   const state = normalizeState(stateValue, options);
-  const bytes = new TextEncoder().encode(JSON.stringify(state)).byteLength;
+  const stateBytes = new TextEncoder().encode(JSON.stringify(state)).byteLength;
+  const hasMeasuredStorageBytes =
+    Number.isSafeInteger(options.storageBytes) && options.storageBytes >= 0;
+  const bytes = hasMeasuredStorageBytes ? options.storageBytes : stateBytes;
   const ratios = [
-    bytes / LIMITS.stateBytes,
+    bytes / LIMITS.localStorageBytes,
+    stateBytes / LIMITS.stateBytes,
     state.notes.length / LIMITS.notes,
     state.trash.length / LIMITS.trash,
   ];
@@ -395,7 +404,10 @@ export function measureLibraryUsage(stateValue, options = {}) {
 
   return {
     bytes,
-    byteLimit: LIMITS.stateBytes,
+    byteLimit: LIMITS.localStorageBytes,
+    stateBytes,
+    stateByteLimit: LIMITS.stateBytes,
+    hasMeasuredStorageBytes,
     notes: state.notes.length,
     noteLimit: LIMITS.notes,
     trash: state.trash.length,
@@ -656,6 +668,7 @@ function normalizedCourseKey(value) {
   return value
     .normalize("NFKD")
     .replace(/\p{M}+/gu, "")
+    .replace(/\u200c/gu, "")
     .replace(/[\u0649\u064a]/gu, "\u06cc")
     .replace(/\u0643/gu, "\u06a9")
     .toLowerCase();
@@ -1060,9 +1073,12 @@ export function updateSettings(stateValue, changes, options = {}) {
   const state = normalizeState(stateValue, options);
   const theme = THEME_VALUES.includes(changes?.theme) ? changes.theme : state.settings.theme;
   const sort = SORT_VALUES.includes(changes?.sort) ? changes.sort : state.settings.sort;
+  const includeSourceOnShare = typeof changes?.includeSourceOnShare === "boolean"
+    ? changes.includeSourceOnShare
+    : state.settings.includeSourceOnShare;
   return {
     ...state,
     revision: nextRevision(state),
-    settings: { theme, sort },
+    settings: { theme, sort, includeSourceOnShare },
   };
 }

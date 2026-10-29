@@ -98,8 +98,23 @@
           <h2 id="storageUsageHeading">Local storage</h2>
           <p id="storageUsageText">Calculating library size...</p>
         </div>
-        <meter id="storageUsageMeter" min="0" max="7000000" value="0" aria-labelledby="storageUsageHeading storageUsageText">0 of 7 MB</meter>
+        <meter id="storageUsageMeter" min="0" max="10485760" value="0" aria-labelledby="storageUsageHeading storageUsageText">0 of 10 MB</meter>
         <p id="storageUsageWarning" class="storage-usage-warning" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+      </section>
+
+      <section class="data-privacy" aria-labelledby="dataPrivacyHeading">
+        <div class="data-privacy-copy">
+          <h2 id="dataPrivacyHeading">Data and privacy</h2>
+          <p>Notes and preferences stay in this Chrome profile. You can export a backup or clear all extension data here.</p>
+          <label class="share-source-setting" for="includeSourceOnShare">
+            <input id="includeSourceOnShare" type="checkbox" aria-describedby="includeSourceOnShareHint" disabled>
+            <span>
+              Include source details in copied notes and Markdown
+              <small id="includeSourceOnShareHint">JSON backups always include sources so they can be restored.</small>
+            </span>
+          </label>
+        </div>
+        <button id="clearLocalDataButton" class="button button-quiet danger-text" type="button" disabled>Clear local data</button>
       </section>
 
       <div class="library-feedback">
@@ -378,6 +393,30 @@
         <footer class="dialog-actions">
           <button id="cancelBulkConfirmButton" class="button button-secondary" type="button">Cancel</button>
           <button id="confirmBulkActionButton" class="button button-danger" type="submit">Continue</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="resetDialog" class="dialog compact-dialog" aria-labelledby="resetHeading" aria-describedby="resetMessage resetWarning resetConfirmationHint resetStatus">
+      <form id="resetForm" class="dialog-form">
+        <div class="dialog-content editor-fields">
+          <div>
+            <p class="eyebrow">Data and privacy</p>
+            <h2 id="resetHeading">Clear all local data?</h2>
+            <p id="resetMessage"></p>
+            <p id="resetWarning">This also removes popup and editor drafts, settings, pending captures, recovery notices, and onboarding status. This cannot be undone.</p>
+          </div>
+          <button id="resetExportButton" class="button button-secondary reset-export" type="button">Export backup first</button>
+          <label class="field" for="resetConfirmationInput">
+            <span>Type DELETE to confirm</span>
+            <input id="resetConfirmationInput" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-describedby="resetConfirmationHint">
+          </label>
+          <p id="resetConfirmationHint" class="field-hint">The word must match exactly.</p>
+          <p id="resetStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions">
+          <button id="cancelResetButton" class="button button-secondary" type="button">Cancel</button>
+          <button id="confirmResetButton" class="button button-danger" type="submit" disabled>Clear local data</button>
         </footer>
       </form>
     </dialog>

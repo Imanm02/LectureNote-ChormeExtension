@@ -503,7 +503,11 @@ test("resets all stored data and advances draft tombstones", async () => {
   assert.equal(reset.state.revision, 5);
   assert.deepEqual(reset.state.notes, []);
   assert.deepEqual(reset.state.trash, []);
-  assert.deepEqual(reset.state.settings, { theme: "system", sort: "updated-desc" });
+  assert.deepEqual(reset.state.settings, {
+    theme: "system",
+    sort: "updated-desc",
+    includeSourceOnShare: true,
+  });
   assert.deepEqual(storage.values[STORAGE_KEYS.draft], {
     version: 1,
     ownerSessionId: "reset_epoch-after",
@@ -529,6 +533,42 @@ test("resets all stored data and advances draft tombstones", async () => {
   ]) {
     assert.equal(key in storage.values, false);
   }
+});
+
+test("rejects a stale reviewed data reset", async () => {
+  const originalState = {
+    ...createEmptyState(),
+    revision: 4,
+    notes: [createNote(noteInput(), { idFactory: () => "saved-note", now: NOW })],
+  };
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: originalState,
+    [STORAGE_KEYS.dataEpoch]: "current-epoch",
+  });
+  const originalValues = structuredClone(storage.values);
+
+  await assert.rejects(
+    () =>
+      resetAllData(storage, {
+        expectedEpoch: "stale-epoch",
+        expectedRevision: 4,
+        epochFactory: () => "next-epoch",
+        lockManager: null,
+      }),
+    { code: "data-reset" },
+  );
+  await assert.rejects(
+    () =>
+      resetAllData(storage, {
+        expectedEpoch: "current-epoch",
+        expectedRevision: 3,
+        epochFactory: () => "next-epoch",
+        lockManager: null,
+      }),
+    { code: "state-conflict" },
+  );
+
+  assert.deepEqual(storage.values, originalValues);
 });
 
 test("rejects stale library and draft writers after a reset", async () => {

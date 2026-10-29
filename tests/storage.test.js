@@ -144,6 +144,34 @@ test("rejects a full pending capture queue without dropping stored captures", as
   assert.equal(captures.some((capture) => capture.id === "capture-overflow"), false);
 });
 
+test("bounds pending capture bytes without dropping the existing queue", async () => {
+  const storage = memoryStorage();
+  const largeSelection = "€".repeat(LIMITS.body);
+
+  for (const id of ["capture-large-first", "capture-large-second"]) {
+    await enqueuePendingCapture(
+      { id, text: largeSelection },
+      storage,
+      { lockManager: null, now: NOW },
+    );
+  }
+  await assert.rejects(
+    () =>
+      enqueuePendingCapture(
+        { id: "capture-large-third", text: largeSelection },
+        storage,
+        { lockManager: null, now: NOW },
+      ),
+    { code: "pending-capture-size" },
+  );
+
+  const captures = await loadPendingCaptures(storage, { lockManager: null, now: NOW });
+  assert.deepEqual(captures.map((capture) => capture.id), [
+    "capture-large-first",
+    "capture-large-second",
+  ]);
+});
+
 test("initializes an empty versioned state", async () => {
   const storage = memoryStorage();
   const state = await loadState(storage, { now: NOW });

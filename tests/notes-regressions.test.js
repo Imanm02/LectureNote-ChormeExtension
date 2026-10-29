@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { serializeBackup } from "../src/backup.js";
-import { addNote, createEmptyState, createNote, moveNoteToTrash } from "../src/model.js";
+import { addNote, createEmptyState, createNote, LIMITS, moveNoteToTrash } from "../src/model.js";
 import { initLibrary } from "../src/notes.js";
 import {
   clearEditorDraft,
@@ -122,6 +122,8 @@ test("keeps state actions disabled after load failure and supports retry", async
     "exportJsonButton",
     "exportMarkdownButton",
     "importButton",
+    "includeSourceOnShare",
+    "clearLocalDataButton",
     "showMoreButton",
   ]) {
     assert.equal(documentValue.getElementById(identifier).disabled, true, identifier);
@@ -512,7 +514,7 @@ test("previews restore effects before merging a colliding note", async (t) => {
   const current = {
     ...createEmptyState(),
     notes: [note("same-id", "Current body")],
-    settings: { theme: "light", sort: "created-desc" },
+    settings: { theme: "light", sort: "created-desc", includeSourceOnShare: true },
   };
   const storage = memoryStorage({ [STORAGE_KEYS.state]: current });
   const setup = await setupLibrary(t, [], storage);
@@ -520,7 +522,7 @@ test("previews restore effects before merging a colliding note", async (t) => {
   const imported = {
     ...createEmptyState(),
     notes: [note("same-id", "Imported body")],
-    settings: { theme: "dark", sort: "title-asc" },
+    settings: { theme: "dark", sort: "title-asc", includeSourceOnShare: false },
   };
   const backupText = serializeBackup(imported, { now: START });
   const importInput = documentValue.getElementById("importFileInput");
@@ -546,6 +548,10 @@ test("previews restore effects before merging a colliding note", async (t) => {
   assert.match(
     documentValue.getElementById("replaceSettingsMessage").textContent,
     /change the theme from Light to Dark and sorting from Newest created to Title/u,
+  );
+  assert.match(
+    documentValue.getElementById("replaceSettingsMessage").textContent,
+    /change to exclude source details/u,
   );
   assert.equal(documentValue.getElementById("mergeImportButton").disabled, false);
 
@@ -688,15 +694,87 @@ test("shows storage use and warns near a configured count limit", async (t) => {
   );
   assert.equal(documentValue.getElementById("storageUsageWarning").hidden, false);
   assert.match(documentValue.getElementById("storageUsageWarning").textContent, /nearing/u);
-  assert.equal(Number(documentValue.getElementById("storageUsageMeter").max), 7_000_000);
+  assert.equal(Number(documentValue.getElementById("storageUsageMeter").max), LIMITS.localStorageBytes);
 });
 
 test("reports small library sizes without rounding them to zero", async (t) => {
   const setup = await setupLibrary(t, []);
   const text = setup.documentValue.getElementById("storageUsageText").textContent;
 
-  assert.match(text, /^\d+ B of 7 MB used\./u);
+  assert.match(text, /^At least \d+ B of 10 MB used\./u);
   assert.doesNotMatch(text, /^0 MB/u);
+});
+
+test("reports total local storage use against the Chrome quota", async (t) => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [note("measured", "Saved body")] },
+  });
+  const requestedKeys = [];
+  storage.getBytesInUse = async (keys) => {
+    requestedKeys.push(keys);
+    return 2_621_440;
+  };
+  const setup = await setupLibrary(t, [], storage);
+  const { documentValue } = setup;
+  await waitFor(() => /^2\.5 MB of 10 MB used\./u.test(
+    documentValue.getElementById("storageUsageText").textContent,
+  ));
+
+  assert.deepEqual(requestedKeys, [null]);
+  assert.equal(Number(documentValue.getElementById("storageUsageMeter").value), 2_621_440);
+  assert.equal(Number(documentValue.getElementById("storageUsageMeter").max), 10_485_760);
+  assert.match(documentValue.getElementById("storageUsageText").textContent, /note library record uses \d+ B of 6\.68 MB/u);
+  assert.match(documentValue.getElementById("storageUsageText").textContent, /1 of 2,000 active notes/u);
+});
+
+test("falls back to state bytes when total storage cannot be measured", async (t) => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  storage.getBytesInUse = async () => {
+    throw new Error("Usage unavailable");
+  };
+  const setup = await setupLibrary(t, [], storage);
+  const { documentValue } = setup;
+  await waitFor(() => /^At least \d+ B of 10 MB used\./u.test(
+    documentValue.getElementById("storageUsageText").textContent,
+  ));
+
+  assert.equal(Number(documentValue.getElementById("storageUsageMeter").max), LIMITS.localStorageBytes);
+  assert.equal(documentValue.getElementById("storageUsageWarning").hidden, true);
+});
+
+test("keeps the newest storage measurement after draft and capture changes", async (t) => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const requests = [];
+  storage.getBytesInUse = () => {
+    const request = deferred();
+    requests.push(request);
+    return request.promise;
+  };
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, documentValue } = setup;
+  const initialRequestCount = requests.length;
+
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.draft]: { oldValue: undefined, newValue: { draft: { body: "Saved" } } },
+  });
+  await waitFor(() => requests.length === initialRequestCount + 1);
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.pendingCaptures]: { oldValue: undefined, newValue: { captures: [] } },
+  });
+  await waitFor(() => requests.length === initialRequestCount + 2);
+
+  const latestRequest = requests.at(-1);
+  latestRequest.resolve(3_145_728);
+  await waitFor(() => /^3 MB of 10 MB used\./u.test(
+    documentValue.getElementById("storageUsageText").textContent,
+  ));
+  for (const request of requests.slice(0, -1).reverse()) {
+    request.resolve(9_437_184);
+  }
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+
+  assert.match(documentValue.getElementById("storageUsageText").textContent, /^3 MB of 10 MB used\./u);
+  assert.equal(Number(documentValue.getElementById("storageUsageMeter").value), 3_145_728);
 });
 
 test("clears undo after an external library replacement", async (t) => {
@@ -1074,6 +1152,622 @@ test("exports only notes chosen in selection mode", async (t) => {
   );
 });
 
+test("blocks selected export when a saved note changed elsewhere", async (t) => {
+  const blobs = [];
+  const original = note("selected", "Original body", { title: "Selected lecture" });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const setup = await setupLibrary(t, [], storage, {
+    urlApi: {
+      createObjectURL(blob) {
+        blobs.push(blob);
+        return "blob:selected-conflict";
+      },
+      revokeObjectURL() {},
+    },
+  });
+  const { controller, documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  documentValue.getElementById("selectionModeButton").click();
+  const checkbox = documentValue.querySelector("[data-note-id='selected'] .note-select-checkbox");
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+
+  storage.values[STORAGE_KEYS.state] = {
+    ...storage.values[STORAGE_KEYS.state],
+    revision: storage.values[STORAGE_KEYS.state].revision + 1,
+    notes: [{
+      ...original,
+      body: "Body saved in another tab",
+      updatedAt: "2026-09-20T11:00:00.000Z",
+    }],
+  };
+  documentValue.getElementById("bulkExportButton").click();
+  await waitFor(() => documentValue.getElementById("libraryStatus").textContent.includes("changed in another window"));
+
+  assert.equal(blobs.length, 0);
+  assert.equal(controller.getState().notes[0].body, "Body saved in another tab");
+  assert.equal(
+    documentValue.querySelector("[data-note-id='selected'] .note-select-checkbox").checked,
+    true,
+  );
+});
+
+test("reviews exact reset counts and offers a backup before canceling", async (t) => {
+  const active = note("active", "Active body", { title: "Active lecture" });
+  const deleted = note("deleted", "Deleted body", { title: "Deleted lecture" });
+  const initialState = moveNoteToTrash(
+    { ...createEmptyState(), notes: [active, deleted] },
+    deleted.id,
+    { now: START },
+  ).state;
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: initialState });
+  const blobs = [];
+  const setup = await setupLibrary(t, [], storage, {
+    urlApi: {
+      createObjectURL(blob) {
+        blobs.push(blob);
+        return "blob:reset-backup";
+      },
+      revokeObjectURL() {},
+    },
+  });
+  const { controller, documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+
+  documentValue.getElementById("clearLocalDataButton").click();
+  const dialog = documentValue.getElementById("resetDialog");
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  const confirm = documentValue.getElementById("confirmResetButton");
+  assert.equal(dialog.open, true);
+  assert.equal(dialog.getAttribute("aria-labelledby"), "resetHeading");
+  assert.match(dialog.getAttribute("aria-describedby"), /resetConfirmationHint/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("cancelResetButton"));
+  assert.equal(
+    documentValue.getElementById("resetMessage").textContent,
+    "This will clear 1 active note and 1 Trash entry from this Chrome profile.",
+  );
+  assert.match(documentValue.getElementById("resetWarning").textContent, /pending captures/u);
+  assert.equal(confirm.disabled, true);
+
+  confirmation.value = "delete";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  assert.equal(confirm.disabled, true);
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  assert.equal(confirm.disabled, false);
+
+  documentValue.getElementById("resetExportButton").click();
+  await waitFor(() => blobs.length === 1);
+  const backup = JSON.parse(await blobs[0].text());
+  assert.equal(backup.notes.length, 1);
+  assert.equal(backup.trash.length, 1);
+  assert.match(documentValue.getElementById("resetStatus").textContent, /remains available/u);
+
+  documentValue.getElementById("cancelResetButton").click();
+  assert.equal(dialog.open, false);
+  assert.equal(controller.getState().notes.length, 1);
+  assert.equal(controller.getState().trash.length, 1);
+  assert.equal(storage.values[STORAGE_KEYS.state].revision, initialState.revision);
+});
+
+test("exports the latest saved data from the reset review", async (t) => {
+  const original = note("original", "Original body");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const blobs = [];
+  const setup = await setupLibrary(t, [], storage, {
+    urlApi: {
+      createObjectURL(blob) {
+        blobs.push(blob);
+        return "blob:fresh-reset-backup";
+      },
+      revokeObjectURL() {},
+    },
+  });
+  const { controller, documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+
+  storage.values[STORAGE_KEYS.state] = addNote(
+    storage.values[STORAGE_KEYS.state],
+    { title: "Latest lecture", body: "Saved elsewhere" },
+    { idFactory: () => "latest", now: "2026-09-20T11:00:00.000Z" },
+  ).state;
+  documentValue.getElementById("resetExportButton").click();
+  await waitFor(() => blobs.length === 1);
+
+  const backup = JSON.parse(await blobs[0].text());
+  assert.deepEqual(backup.notes.map((entry) => entry.id), ["latest", "original"]);
+  assert.equal(controller.getState().notes.length, 2);
+  assert.equal(confirmation.value, "");
+  assert.equal(documentValue.getElementById("confirmResetButton").disabled, true);
+  assert.equal(
+    documentValue.getElementById("resetMessage").textContent,
+    "This will clear 2 active notes and 0 Trash entries from this Chrome profile.",
+  );
+  assert.match(documentValue.getElementById("resetStatus").textContent, /latest saved data/u);
+});
+
+test("does not clear data while a requested reset backup is pending", async (t) => {
+  const original = note("backup-before-reset", "Keep this in the backup");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const blobs = [];
+  const setup = await setupLibrary(t, [], storage, {
+    urlApi: {
+      createObjectURL(blob) {
+        blobs.push(blob);
+        return "blob:pending-reset-backup";
+      },
+      revokeObjectURL() {},
+    },
+  });
+  const { documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  const originalGet = storage.get.bind(storage);
+  const stateRead = deferred();
+  let holdStateRead = false;
+  let stateReadStarted = false;
+  storage.get = async (keys) => {
+    const names = Array.isArray(keys) ? keys : [keys];
+    if (holdStateRead && names.includes(STORAGE_KEYS.state)) {
+      holdStateRead = false;
+      stateReadStarted = true;
+      await stateRead.promise;
+    }
+    return originalGet(keys);
+  };
+  t.after(() => stateRead.resolve());
+
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  holdStateRead = true;
+  documentValue.getElementById("resetExportButton").click();
+  await waitFor(() => stateReadStarted);
+
+  assert.equal(documentValue.getElementById("resetExportButton").disabled, true);
+  assert.equal(documentValue.getElementById("cancelResetButton").disabled, true);
+  assert.equal(documentValue.getElementById("confirmResetButton").disabled, true);
+  assert.equal(confirmation.disabled, true);
+  submit(documentValue, "resetForm");
+  assert.equal(storage.values[STORAGE_KEYS.state].notes.length, 1);
+
+  stateRead.resolve();
+  await waitFor(() => blobs.length === 1);
+  await waitFor(() => documentValue.getElementById("confirmResetButton").disabled === false);
+  const backup = JSON.parse(await blobs[0].text());
+  assert.deepEqual(backup.notes.map((entry) => entry.id), [original.id]);
+
+  submit(documentValue, "resetForm");
+  await waitFor(() => storage.values[STORAGE_KEYS.state].notes.length === 0);
+});
+
+test("stops reset backup when the saved data epoch changed", async (t) => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "reset-export-before",
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      notes: [note("before-reset", "Old saved body")],
+    },
+  });
+  const blobs = [];
+  const setup = await setupLibrary(t, [], storage, {
+    urlApi: {
+      createObjectURL(blob) {
+        blobs.push(blob);
+        return "blob:must-not-export";
+      },
+      revokeObjectURL() {},
+    },
+  });
+  const { documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  documentValue.getElementById("clearLocalDataButton").click();
+
+  storage.values[STORAGE_KEYS.dataEpoch] = "reset-export-after";
+  storage.values[STORAGE_KEYS.state] = createEmptyState();
+  documentValue.getElementById("resetExportButton").click();
+  await waitFor(() => documentValue.getElementById("resetDialog").open === false);
+
+  assert.equal(blobs.length, 0);
+  assert.equal(documentValue.getElementById("resultSummary").textContent, "Reload required");
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
+});
+
+test("clears local data and keeps the current library ready", async (t) => {
+  const initialState = {
+    ...createEmptyState(),
+    revision: 4,
+    notes: [note("saved", "Saved body")],
+    settings: {
+      ...createEmptyState().settings,
+      theme: "dark",
+      sort: "title-asc",
+    },
+  };
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: initialState,
+    [STORAGE_KEYS.dataEpoch]: "reset-ui-before",
+    [STORAGE_KEYS.pendingCaptures]: { version: 1, captures: [] },
+    [STORAGE_KEYS.recovery]: { createdAt: START, rejectedNotes: 1, rejectedDrafts: 0 },
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "resetForm");
+  await waitFor(() => controller.getState().notes.length === 0);
+
+  assert.equal(documentValue.getElementById("resetDialog").open, false);
+  assert.equal(controller.getState().revision, 5);
+  assert.equal(controller.getState().trash.length, 0);
+  assert.equal(controller.getState().settings.theme, "system");
+  assert.equal(documentValue.documentElement.dataset.theme, "system");
+  assert.equal(documentValue.getElementById("libraryMain").getAttribute("aria-busy"), "false");
+  assert.equal(documentValue.getElementById("newNoteButton").disabled, false);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("newNoteButton"));
+  assert.notEqual(storage.values[STORAGE_KEYS.dataEpoch], "reset-ui-before");
+  assert.equal(storage.values[STORAGE_KEYS.editorDraft].draft, null);
+  for (const key of [
+    STORAGE_KEYS.pendingCaptures,
+    STORAGE_KEYS.recovery,
+    STORAGE_KEYS.helpSeen,
+    STORAGE_KEYS.resetCleanup,
+  ]) {
+    assert.equal(key in storage.values, false, key);
+  }
+
+  documentValue.getElementById("newNoteButton").click();
+  documentValue.getElementById("editorTitle").value = "After reset";
+  documentValue.getElementById("editorBody").value = "The current page can save with the new data token.";
+  submit(documentValue, "editorForm");
+  await waitFor(() => controller.getState().notes.length === 1);
+  assert.equal(controller.getState().notes[0].title, "After reset");
+});
+
+test("requires a fresh reset confirmation after a hidden library change", async (t) => {
+  const original = note("first", "First body");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "reset-race-epoch",
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+
+  storage.values[STORAGE_KEYS.state] = addNote(
+    controller.getState(),
+    { title: "New elsewhere", body: "Saved in another window" },
+    { idFactory: () => "second", now: START },
+  ).state;
+  submit(documentValue, "resetForm");
+  await waitFor(() => documentValue.getElementById("resetStatus").textContent.includes("changed in another window"));
+
+  assert.equal(documentValue.getElementById("resetDialog").open, true);
+  assert.equal(controller.getState().notes.length, 2);
+  assert.equal(confirmation.value, "");
+  assert.equal(documentValue.getElementById("confirmResetButton").disabled, true);
+  assert.equal(documentValue.getElementById("resetConfirmationInput").disabled, false);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("resetConfirmationInput"));
+  assert.equal(
+    documentValue.getElementById("resetMessage").textContent,
+    "This will clear 2 active notes and 0 Trash entries from this Chrome profile.",
+  );
+  assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "reset-race-epoch");
+});
+
+test("reports a completed reset when supporting-data cleanup fails", async (t) => {
+  const stored = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "cleanup-before",
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      revision: 2,
+      notes: [note("saved", "Saved body")],
+    },
+    [STORAGE_KEYS.pendingCaptures]: { version: 1, captures: [] },
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const remove = stored.remove.bind(stored);
+  let failCleanup = true;
+  const storage = {
+    values: stored.values,
+    get: stored.get.bind(stored),
+    set: stored.set.bind(stored),
+    async remove(keys) {
+      if (
+        failCleanup &&
+        Array.isArray(keys) &&
+        keys.includes(STORAGE_KEYS.pendingCaptures)
+      ) {
+        throw new Error("Cleanup blocked");
+      }
+      await remove(keys);
+    },
+  };
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "resetForm");
+  await waitFor(() => documentValue.getElementById("retryLoadButton").textContent === "Retry cleanup");
+
+  assert.equal(controller.getState().notes.length, 0);
+  assert.equal(storage.values[STORAGE_KEYS.state].revision, 3);
+  assert.equal(storage.values[STORAGE_KEYS.resetCleanup], storage.values[STORAGE_KEYS.dataEpoch]);
+  assert.equal(documentValue.getElementById("newNoteButton").disabled, true);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /Local data was cleared/u);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /retry cleanup/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
+
+  failCleanup = false;
+  documentValue.getElementById("retryLoadButton").click();
+  await waitFor(() =>
+    !(STORAGE_KEYS.resetCleanup in storage.values) &&
+    !documentValue.getElementById("newNoteButton").disabled,
+  );
+  assert.equal(STORAGE_KEYS.resetCleanup in storage.values, false);
+  assert.equal(STORAGE_KEYS.pendingCaptures in storage.values, false);
+  assert.equal(documentValue.getElementById("newNoteButton").disabled, false);
+});
+
+test("requires a reload when a reset outcome cannot be read back", async (t) => {
+  const stored = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "unknown-before",
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      revision: 3,
+      notes: [note("saved", "Saved body")],
+    },
+    [STORAGE_KEYS.pendingCaptures]: { version: 1, captures: [] },
+  });
+  let failReadback = false;
+  const storage = {
+    values: stored.values,
+    async get(keys) {
+      if (failReadback) {
+        throw new Error("Readback blocked");
+      }
+      return stored.get(keys);
+    },
+    set: stored.set.bind(stored),
+    async remove(keys) {
+      if (Array.isArray(keys) && keys.includes(STORAGE_KEYS.pendingCaptures)) {
+        failReadback = true;
+        throw new Error("Cleanup blocked");
+      }
+      await stored.remove(keys);
+    },
+  };
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "resetForm");
+  await waitFor(() => documentValue.getElementById("retryLoadButton").textContent === "Reload page");
+
+  assert.equal(storage.values[STORAGE_KEYS.state].notes.length, 0);
+  assert.notEqual(storage.values[STORAGE_KEYS.dataEpoch], "unknown-before");
+  assert.equal(controller.getState().notes.length, 1);
+  assert.equal(documentValue.getElementById("resetDialog").open, false);
+  assert.equal(documentValue.getElementById("newNoteButton").disabled, true);
+  assert.equal(documentValue.getElementById("clearLocalDataButton").disabled, true);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /could not confirm/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
+});
+
+test("focuses Reload page after a stale reset confirmation", async (t) => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "stale-reset-before",
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      notes: [note("saved", "Saved body")],
+    },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { documentValue } = setup;
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  storage.values[STORAGE_KEYS.dataEpoch] = "stale-reset-after";
+  submit(documentValue, "resetForm");
+  await waitFor(() => documentValue.getElementById("resetDialog").open === false);
+
+  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
+  assert.equal(documentValue.getElementById("clearLocalDataButton").disabled, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+});
+
+test("closes a reset review when another window resets the data", async (t) => {
+  const original = note("saved", "Saved body");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "reset-dialog-before",
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, controller, documentValue } = setup;
+  const priorState = controller.getState();
+
+  documentValue.getElementById("clearLocalDataButton").click();
+  const dialog = documentValue.getElementById("resetDialog");
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  assert.equal(documentValue.getElementById("confirmResetButton").disabled, false);
+
+  const resetState = createEmptyState();
+  storage.values[STORAGE_KEYS.dataEpoch] = "reset-dialog-after";
+  storage.values[STORAGE_KEYS.state] = resetState;
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.dataEpoch]: {
+      oldValue: "reset-dialog-before",
+      newValue: "reset-dialog-after",
+    },
+    [STORAGE_KEYS.state]: { oldValue: priorState, newValue: resetState },
+  });
+
+  assert.equal(dialog.open, false);
+  assert.equal(confirmation.value, "");
+  assert.equal(documentValue.getElementById("clearLocalDataButton").disabled, true);
+  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
+  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+  assert.deepEqual(storage.values[STORAGE_KEYS.state], resetState);
+});
+
+test("discards an import file that finishes reading after reset", async (t) => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "import-reset-before",
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      notes: [note("current", "Current body")],
+    },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+  const imported = {
+    ...createEmptyState(),
+    notes: [note("imported", "Imported body")],
+  };
+  const backupText = serializeBackup(imported, { now: START });
+  const readGate = deferred();
+  let readStarted = false;
+  const importInput = documentValue.getElementById("importFileInput");
+  Object.defineProperty(importInput, "files", {
+    configurable: true,
+    value: [{
+      size: new TextEncoder().encode(backupText).byteLength,
+      async text() {
+        readStarted = true;
+        return readGate.promise;
+      },
+    }],
+  });
+  importInput.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  await waitFor(() => readStarted);
+
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "resetForm");
+  await waitFor(() => controller.getState().notes.length === 0);
+  readGate.resolve(backupText);
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+
+  assert.equal(documentValue.getElementById("importDialog").open, false);
+  assert.equal(controller.getState().notes.length, 0);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /Local notes/u);
+});
+
+test("reconciles storage events suppressed by a failed reset", async (t) => {
+  const stored = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "failed-reset-epoch",
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      notes: [note("first", "First body")],
+    },
+  });
+  const resetWriteGate = deferred();
+  let resetWriteStarted = false;
+  let blockResetWrite = true;
+  const storage = {
+    values: stored.values,
+    get: stored.get.bind(stored),
+    remove: stored.remove.bind(stored),
+    async set(update) {
+      if (blockResetWrite && Object.hasOwn(update, STORAGE_KEYS.resetCleanup)) {
+        resetWriteStarted = true;
+        await resetWriteGate.promise;
+        blockResetWrite = false;
+        throw new Error("Reset write blocked");
+      }
+      await stored.set(update);
+    },
+  };
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, controller, documentValue } = setup;
+  documentValue.getElementById("clearLocalDataButton").click();
+  const confirmation = documentValue.getElementById("resetConfirmationInput");
+  confirmation.value = "DELETE";
+  confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "resetForm");
+  await waitFor(() => resetWriteStarted);
+
+  const externalState = addNote(
+    controller.getState(),
+    { title: "Second", body: "Saved elsewhere" },
+    { idFactory: () => "second", now: START },
+  ).state;
+  const externalDraft = {
+    version: 1,
+    ownerSessionId: "external-editor",
+    generation: 1,
+    contentGeneration: 1,
+    draft: {
+      noteId: null,
+      baseRevision: externalState.revision,
+      baseNote: null,
+      title: "External draft",
+      body: "Draft saved elsewhere",
+      course: "CS 101",
+      source: { title: "", url: "" },
+      updatedAt: START,
+    },
+  };
+  const externalRecovery = {
+    createdAt: START,
+    rejectedNotes: 2,
+    rejectedDrafts: 1,
+  };
+  storage.values[STORAGE_KEYS.state] = externalState;
+  storage.values[STORAGE_KEYS.editorDraft] = externalDraft;
+  storage.values[STORAGE_KEYS.recovery] = externalRecovery;
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.state]: { oldValue: controller.getState(), newValue: externalState },
+    [STORAGE_KEYS.editorDraft]: { oldValue: undefined, newValue: externalDraft },
+    [STORAGE_KEYS.recovery]: { oldValue: undefined, newValue: externalRecovery },
+  });
+  resetWriteGate.resolve();
+  await waitFor(() => documentValue.getElementById("resetStatus").textContent.includes("Changes from another window"));
+
+  assert.equal(controller.getState().notes.length, 2);
+  assert.equal(documentValue.getElementById("editorDraftRecovery").hidden, false);
+  assert.match(documentValue.getElementById("editorDraftMessage").textContent, /draft saved/u);
+  assert.equal(documentValue.getElementById("recoveryNotice").hidden, false);
+  assert.match(documentValue.getElementById("recoveryMessage").textContent, /2 invalid notes/u);
+  assert.match(documentValue.getElementById("recoveryMessage").textContent, /1 invalid draft/u);
+  assert.equal(documentValue.getElementById("resetDialog").open, true);
+  assert.equal(confirmation.value, "");
+  assert.equal(confirmation.disabled, false);
+  assert.equal(documentValue.activeElement, confirmation);
+  assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "failed-reset-epoch");
+});
+
 test("keeps editor text visible and blocks writes after a data reset", async (t) => {
   const original = note("first", "Original body");
   const storage = memoryStorage({
@@ -1224,9 +1918,219 @@ test("exports only the current filtered view as Markdown", async (t) => {
   search.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
   await waitFor(() => documentValue.getElementById("resultSummary").textContent === "No matching notes");
   documentValue.getElementById("exportMarkdownButton").click();
-
+  await waitFor(() => documentValue.getElementById("libraryStatus").textContent === "No notes match the current view.");
   assert.equal(blobs.length, 1);
   assert.equal(documentValue.getElementById("libraryStatus").textContent, "No notes match the current view.");
+});
+
+test("exports saved changes before their storage event arrives", async (t) => {
+  const blobs = [];
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      notes: [note("original", "Original body", { title: "Original lecture" })],
+    },
+  });
+  const setup = await setupLibrary(t, [], storage, {
+    urlApi: {
+      createObjectURL(blob) {
+        blobs.push(blob);
+        return `blob:fresh-export-${blobs.length}`;
+      },
+      revokeObjectURL() {},
+    },
+  });
+  const { controller, documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+
+  storage.values[STORAGE_KEYS.state] = addNote(
+    storage.values[STORAGE_KEYS.state],
+    { title: "External lecture", body: "First external save" },
+    { idFactory: () => "external", now: "2026-09-20T11:00:00.000Z" },
+  ).state;
+  documentValue.getElementById("exportJsonButton").click();
+  await waitFor(() => blobs.length === 1);
+  const backup = JSON.parse(await blobs[0].text());
+  assert.deepEqual(backup.notes.map((entry) => entry.id), ["external", "original"]);
+
+  const latest = storage.values[STORAGE_KEYS.state];
+  storage.values[STORAGE_KEYS.state] = {
+    ...latest,
+    revision: latest.revision + 1,
+    notes: latest.notes.map((entry) => entry.id === "external"
+      ? {
+          ...entry,
+          body: "Phrase saved immediately before export",
+          updatedAt: "2026-09-20T12:00:00.000Z",
+        }
+      : entry),
+  };
+  documentValue.getElementById("searchInput").value = "immediately before";
+  documentValue.getElementById("exportMarkdownButton").click();
+  await waitFor(() => blobs.length === 2);
+  const markdown = await blobs[1].text();
+
+  assert.match(markdown, /Phrase saved immediately before export/u);
+  assert.doesNotMatch(markdown, /Original lecture/u);
+  assert.equal(controller.getState().notes[0].body, "Phrase saved immediately before export");
+  assert.equal(documentValue.getElementById("searchInput").value, "immediately before");
+});
+
+test("exports real update times while sorting Trash by deletion", async (t) => {
+  const first = {
+    ...note("first", "First body", { title: "First lecture" }),
+    updatedAt: "2026-09-20T15:00:00.000Z",
+  };
+  const second = {
+    ...note("second", "Second body", { title: "Second lecture" }),
+    updatedAt: "2026-09-20T10:30:00.000Z",
+  };
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      trash: [
+        { note: first, deletedAt: "2026-09-20T11:00:00.000Z", originalIndex: 0 },
+        { note: second, deletedAt: "2026-09-20T12:00:00.000Z", originalIndex: 1 },
+      ],
+    },
+  });
+  const blobs = [];
+  const setup = await setupLibrary(t, [], storage, {
+    urlApi: {
+      createObjectURL(blob) {
+        blobs.push(blob);
+        return "blob:trash-export";
+      },
+      revokeObjectURL() {},
+    },
+  });
+  const { documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  documentValue.getElementById("trashViewButton").click();
+
+  assert.deepEqual(
+    [...documentValue.querySelectorAll(".note-card")].map((card) => card.dataset.noteId),
+    ["second", "first"],
+  );
+  documentValue.getElementById("exportMarkdownButton").click();
+  await waitFor(() => blobs.length === 1);
+  const markdown = await blobs[0].text();
+
+  assert.match(markdown, /Second lecture[\s\S]*Updated: 2026-09-20T10:30:00\.000Z/u);
+  assert.match(markdown, /First lecture[\s\S]*Updated: 2026-09-20T15:00:00\.000Z/u);
+  assert.doesNotMatch(markdown, /Updated: 2026-09-20T1[12]:00:00\.000Z/u);
+});
+
+test("can omit sources from copied notes and Markdown without changing backups", async (t) => {
+  const blobs = [];
+  const copied = [];
+  const setup = await setupLibrary(
+    t,
+    [note("private-share", "Share this body")],
+    null,
+    {
+      navigatorValue: {
+        clipboard: {
+          async writeText(value) {
+            copied.push(value);
+          },
+        },
+      },
+      urlApi: {
+        createObjectURL(blob) {
+          blobs.push(blob);
+          return `blob:share-${blobs.length}`;
+        },
+        revokeObjectURL() {},
+      },
+    },
+  );
+  const { controller, documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  const includeSource = documentValue.getElementById("includeSourceOnShare");
+
+  assert.equal(includeSource.checked, true);
+  includeSource.checked = false;
+  includeSource.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  await waitFor(() => controller.getState().settings.includeSourceOnShare === false);
+
+  documentValue.querySelector("[data-action='copy']").click();
+  await waitFor(() => copied.length === 1);
+  documentValue.getElementById("exportMarkdownButton").click();
+  await waitFor(() => blobs.length === 1);
+  documentValue.getElementById("exportJsonButton").click();
+  await waitFor(() => blobs.length === 2);
+
+  const markdown = await blobs[0].text();
+  const backup = JSON.parse(await blobs[1].text());
+  assert.doesNotMatch(copied[0], /Source:|example\.com/u);
+  assert.doesNotMatch(markdown, /Source:|example\.com/u);
+  assert.match(copied[0], /Share this body/u);
+  assert.match(markdown, /Share this body/u);
+  assert.equal(backup.notes[0].source.title, "Lecture");
+  assert.equal(backup.notes[0].source.url, "https://example.com/lecture");
+});
+
+test("uses the visible source preference when its save fails", async (t) => {
+  const blobs = [];
+  const copied = [];
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      notes: [note("pending-source-setting", "Private source body")],
+    },
+  });
+  const originalSet = storage.set.bind(storage);
+  const settingsWrite = deferred();
+  let holdNextStateWrite = false;
+  let settingsWriteStarted = false;
+  storage.set = async (update) => {
+    if (holdNextStateWrite && STORAGE_KEYS.state in update) {
+      holdNextStateWrite = false;
+      settingsWriteStarted = true;
+      await settingsWrite.promise;
+      throw new Error("Settings save failed");
+    }
+    return originalSet(update);
+  };
+  t.after(() => settingsWrite.resolve());
+  const setup = await setupLibrary(t, [], storage, {
+    navigatorValue: {
+      clipboard: {
+        async writeText(value) {
+          copied.push(value);
+        },
+      },
+    },
+    urlApi: {
+      createObjectURL(blob) {
+        blobs.push(blob);
+        return "blob:pending-source-setting";
+      },
+      revokeObjectURL() {},
+    },
+  });
+  const { controller, documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  const includeSource = documentValue.getElementById("includeSourceOnShare");
+
+  holdNextStateWrite = true;
+  includeSource.checked = false;
+  includeSource.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  await waitFor(() => settingsWriteStarted);
+  documentValue.querySelector("[data-action='copy']").click();
+  documentValue.getElementById("exportMarkdownButton").click();
+  await waitFor(() => copied.length === 1);
+
+  assert.equal(controller.getState().settings.includeSourceOnShare, true);
+  assert.equal(includeSource.checked, false);
+  assert.doesNotMatch(copied[0], /Source:|example\.com/u);
+
+  settingsWrite.resolve();
+  await waitFor(() => blobs.length === 1);
+  assert.equal(controller.getState().settings.includeSourceOnShare, true);
+  assert.equal(includeSource.checked, true);
+  assert.doesNotMatch(await blobs[0].text(), /Source:|example\.com/u);
 });
 
 test("shows copy feedback on the selected note", async (t) => {

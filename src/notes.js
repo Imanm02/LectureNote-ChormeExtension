@@ -34,6 +34,7 @@ import {
   loadState,
   mutateState,
   mutateStateAndClearEditorDraft,
+  resetAllData,
   saveEditorDraft,
   STORAGE_KEYS,
 } from "./storage.js";
@@ -90,6 +91,8 @@ function libraryElements(documentValue) {
     storageUsageText: requiredElement(documentValue, "storageUsageText"),
     storageUsageMeter: requiredElement(documentValue, "storageUsageMeter"),
     storageUsageWarning: requiredElement(documentValue, "storageUsageWarning"),
+    includeSourceOnShare: requiredElement(documentValue, "includeSourceOnShare"),
+    clearLocalData: requiredElement(documentValue, "clearLocalDataButton"),
     summary: requiredElement(documentValue, "resultSummary"),
     status: requiredElement(documentValue, "libraryStatus"),
     retryLoad: requiredElement(documentValue, "retryLoadButton"),
@@ -185,6 +188,14 @@ function libraryElements(documentValue) {
     bulkConfirmStatus: requiredElement(documentValue, "bulkConfirmStatus"),
     cancelBulkConfirm: requiredElement(documentValue, "cancelBulkConfirmButton"),
     confirmBulkAction: requiredElement(documentValue, "confirmBulkActionButton"),
+    resetDialog: requiredElement(documentValue, "resetDialog"),
+    resetForm: requiredElement(documentValue, "resetForm"),
+    resetMessage: requiredElement(documentValue, "resetMessage"),
+    resetExport: requiredElement(documentValue, "resetExportButton"),
+    resetConfirmation: requiredElement(documentValue, "resetConfirmationInput"),
+    resetStatus: requiredElement(documentValue, "resetStatus"),
+    cancelReset: requiredElement(documentValue, "cancelResetButton"),
+    confirmReset: requiredElement(documentValue, "confirmResetButton"),
     importDialog: requiredElement(documentValue, "importDialog"),
     importMessage: requiredElement(documentValue, "importMessage"),
     importExportedAt: requiredElement(documentValue, "importExportedAt"),
@@ -287,11 +298,13 @@ export async function initLibrary({
   let emptyTrashSnapshot = null;
   let pendingImport = null;
   let pendingImportPreview = null;
+  let importReadGeneration = 0;
   let pendingReplaceStateSnapshot = null;
   let replaceInFlight = false;
   let recoveryInfo = { createdAt: "", rejectedNotes: 0, rejectedDrafts: 0 };
   let measuredUsageState = null;
   let measuredUsage = null;
+  let storageUsageRequestGeneration = 0;
   const copyResetTimers = new WeakMap();
   let undoRecord = null;
   let searchTimer = null;
@@ -302,6 +315,12 @@ export async function initLibrary({
   let selectionReturnFocus = null;
   let pendingBulkCourse = null;
   let pendingBulkAction = null;
+  let resetSnapshot = null;
+  let resetInFlight = false;
+  let resetExportInFlight = false;
+  let resetEventsSuppressed = false;
+  let resetOutcomeUnknown = false;
+  let resetReturnFocus = null;
   let courseSignature = "";
   let ready = false;
   let hashHandled = false;
@@ -397,13 +416,13 @@ export async function initLibrary({
   }
 
   function formatStorageSize(bytes) {
-    if (bytes < 1_000) {
+    if (bytes < 1_024) {
       return `${numberFormatter.format(bytes)} B`;
     }
-    if (bytes < 1_000_000) {
-      return `${numberFormatter.format(Number((bytes / 1_000).toFixed(1)))} KB`;
+    if (bytes < 1_048_576) {
+      return `${numberFormatter.format(Number((bytes / 1_024).toFixed(1)))} KB`;
     }
-    return `${numberFormatter.format(Number((bytes / 1_000_000).toFixed(2)))} MB`;
+    return `${numberFormatter.format(Number((bytes / 1_048_576).toFixed(2)))} MB`;
   }
 
   function themeLabel(value) {
@@ -419,6 +438,49 @@ export async function initLibrary({
     }[value] || value;
   }
 
+  function paintStorageUsage(usage) {
+    elements.storageUsage.dataset.level = usage.level;
+    elements.storageUsageMeter.max = usage.byteLimit;
+    elements.storageUsageMeter.value = usage.bytes;
+    elements.storageUsageMeter.textContent = `${formatStorageSize(usage.bytes)} of ${formatStorageSize(usage.byteLimit)}`;
+    const storagePrefix = usage.hasMeasuredStorageBytes ? "" : "At least ";
+    elements.storageUsageText.textContent = `${storagePrefix}${formatStorageSize(usage.bytes)} of ${formatStorageSize(usage.byteLimit)} used. The note library record uses ${formatStorageSize(usage.stateBytes)} of ${formatStorageSize(usage.stateByteLimit)}. ${numberFormatter.format(usage.notes)} of ${numberFormatter.format(usage.noteLimit)} active notes, ${numberFormatter.format(usage.trash)} of ${numberFormatter.format(usage.trashLimit)} Trash entries.`;
+    elements.storageUsageWarning.hidden = usage.level === "normal";
+    elements.storageUsageWarning.textContent = usage.level === "critical"
+      ? "The library is very close to a storage or note-count limit. Export a backup, then permanently remove notes you no longer need."
+      : usage.level === "warning"
+        ? "The library is nearing a storage or note-count limit. Export a backup before removing notes."
+        : "";
+  }
+
+  async function refreshStorageUsage() {
+    const requestedState = state;
+    const requestGeneration = ++storageUsageRequestGeneration;
+    if (!requestedState) {
+      return;
+    }
+
+    let storageBytes;
+    if (typeof storage.getBytesInUse === "function") {
+      try {
+        storageBytes = await storage.getBytesInUse(null);
+      } catch {
+        storageBytes = undefined;
+      }
+    }
+
+    if (
+      destroyed ||
+      requestGeneration !== storageUsageRequestGeneration ||
+      state !== requestedState
+    ) {
+      return;
+    }
+    measuredUsageState = requestedState;
+    measuredUsage = measureLibraryUsage(requestedState, { storageBytes });
+    paintStorageUsage(measuredUsage);
+  }
+
   function renderStorageUsage() {
     if (!state) {
       return;
@@ -426,19 +488,11 @@ export async function initLibrary({
     if (measuredUsageState !== state) {
       measuredUsageState = state;
       measuredUsage = measureLibraryUsage(state);
+      paintStorageUsage(measuredUsage);
+      void refreshStorageUsage();
+      return;
     }
-    const usage = measuredUsage;
-    elements.storageUsage.dataset.level = usage.level;
-    elements.storageUsageMeter.max = usage.byteLimit;
-    elements.storageUsageMeter.value = usage.bytes;
-    elements.storageUsageMeter.textContent = `${formatStorageSize(usage.bytes)} of ${formatStorageSize(usage.byteLimit)}`;
-    elements.storageUsageText.textContent = `${formatStorageSize(usage.bytes)} of ${formatStorageSize(usage.byteLimit)} used. ${numberFormatter.format(usage.notes)} of ${numberFormatter.format(usage.noteLimit)} active notes, ${numberFormatter.format(usage.trash)} of ${numberFormatter.format(usage.trashLimit)} Trash entries.`;
-    elements.storageUsageWarning.hidden = usage.level === "normal";
-    elements.storageUsageWarning.textContent = usage.level === "critical"
-      ? "The library is very close to a storage or note-count limit. Export a backup, then permanently remove notes you no longer need."
-      : usage.level === "warning"
-        ? "The library is nearing a storage or note-count limit. Export a backup before removing notes."
-        : "";
+    paintStorageUsage(measuredUsage);
   }
 
   function renderRecoveryNotice() {
@@ -486,6 +540,8 @@ export async function initLibrary({
       elements.exportJson,
       elements.exportMarkdown,
       elements.importButton,
+      elements.includeSourceOnShare,
+      elements.clearLocalData,
       elements.showMore,
       elements.resumeEditorDraft,
       elements.discardEditorDraft,
@@ -502,15 +558,30 @@ export async function initLibrary({
     }
   }
 
-  function selectedNotes() {
-    const notes = viewMode === "trash"
-      ? state.trash.map((entry) => ({ ...entry.note, updatedAt: entry.deletedAt }))
-      : state.notes;
-    return selectNotes(notes, {
+  function currentViewOptions() {
+    return {
+      view: viewMode,
       query: elements.search.value,
       course: elements.course.value,
       sort: elements.sort.value,
-    });
+    };
+  }
+
+  function notesForView(stateValue, options = currentViewOptions()) {
+    if (options.view !== "trash") {
+      return selectNotes(stateValue.notes, options);
+    }
+
+    const notesById = new Map(stateValue.trash.map((entry) => [entry.note.id, entry.note]));
+    const sorted = selectNotes(
+      stateValue.trash.map((entry) => ({ ...entry.note, updatedAt: entry.deletedAt })),
+      options,
+    );
+    return sorted.map((note) => notesById.get(note.id));
+  }
+
+  function selectedNotes() {
+    return notesForView(state);
   }
 
   function currentViewRecord(identifier, stateValue = state, mode = viewMode) {
@@ -546,7 +617,7 @@ export async function initLibrary({
       JSON.stringify(currentRecords) !== JSON.stringify(snapshot.records)
     ) {
       throw new ValidationError(
-        "A selected note changed in another window. Close this dialog and review the selection before trying again.",
+        "A selected note changed in another window. Review the selection before trying again.",
         "selection-conflict",
       );
     }
@@ -815,6 +886,7 @@ export async function initLibrary({
     elements.sort.value = state.settings.sort;
     elements.sort.options[0].textContent = viewMode === "trash" ? "Recently deleted" : "Recently updated";
     elements.theme.value = state.settings.theme;
+    elements.includeSourceOnShare.checked = state.settings.includeSourceOnShare;
     const notes = selectedNotes();
     const shownNotes = notes.slice(0, visibleLimit);
     elements.list.replaceChildren(...shownNotes.map(createNoteCard));
@@ -865,6 +937,7 @@ export async function initLibrary({
         : `${numberFormatter.format(total)} ${noteWord(total)}`;
     }
     renderStorageUsage();
+    refreshResetReview();
     renderDetail();
     renderEditorDraftRecovery();
   }
@@ -1719,7 +1792,9 @@ export async function initLibrary({
     const idleLabel = button.dataset.copyIdleLabel || button.textContent;
     button.dataset.copyIdleLabel = idleLabel;
     try {
-      await navigatorValue.clipboard.writeText(noteToPlainText(note));
+      await navigatorValue.clipboard.writeText(noteToPlainText(note, {
+        includeSource: elements.includeSourceOnShare.checked,
+      }));
       const pendingReset = copyResetTimers.get(button);
       if (pendingReset !== undefined) {
         timerApi.clearTimeout(pendingReset);
@@ -1738,17 +1813,51 @@ export async function initLibrary({
     }
   }
 
-  async function exportJson() {
-    if (!state) {
-      setStatus(elements.status, "The library is not available yet.", "error");
+  function adoptFreshExportState(nextState) {
+    const changed = !state || JSON.stringify(nextState) !== JSON.stringify(state);
+    if (!changed) {
       return;
     }
+    if (undoRecord && JSON.stringify(nextState) !== undoRecord.stateSnapshot) {
+      hideUndo();
+    }
+    state = nextState;
+    applyTheme(state.settings.theme, documentValue);
+    render();
+    if (pendingImport) {
+      renderImportPreview();
+    }
+  }
+
+  async function readFreshExportState(validate) {
+    const nextState = await readStateForPage();
+    let validationError = null;
     try {
-      const text = serializeBackup(state);
-      downloadText(text, backupFilename("json"), "application/json", documentValue, urlApi);
-      setStatus(elements.status, "Backup exported.", "success");
+      validate?.(nextState);
     } catch (error) {
-      setStatus(elements.status, errorMessage(error), "error");
+      validationError = error;
+    }
+    adoptFreshExportState(nextState);
+    if (validationError) {
+      throw validationError;
+    }
+    return nextState;
+  }
+
+  async function exportJson(statusElement = elements.status) {
+    if (!state) {
+      setStatus(statusElement, "The library is not available yet.", "error");
+      return false;
+    }
+    try {
+      const latestState = await readFreshExportState();
+      const text = serializeBackup(latestState);
+      downloadText(text, backupFilename("json"), "application/json", documentValue, urlApi);
+      setStatus(statusElement, "Backup exported.", "success");
+      return true;
+    } catch (error) {
+      reportActionError(error, statusElement);
+      return false;
     }
   }
 
@@ -1757,13 +1866,18 @@ export async function initLibrary({
       setStatus(elements.status, "The library is not available yet.", "error");
       return;
     }
+    const viewOptions = currentViewOptions();
+    const includeSource = elements.includeSourceOnShare.checked;
     try {
-      const notes = selectedNotes();
+      const latestState = await readFreshExportState();
+      const notes = notesForView(latestState, viewOptions);
       if (notes.length === 0) {
         setStatus(elements.status, "No notes match the current view.", "warning");
         return;
       }
-      const text = notesToMarkdown(notes);
+      const text = notesToMarkdown(notes, {
+        includeSource,
+      });
       downloadText(text, backupFilename("md"), "text/markdown", documentValue, urlApi);
       setStatus(
         elements.status,
@@ -1771,7 +1885,321 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
-      setStatus(elements.status, errorMessage(error), "error");
+      reportActionError(error);
+    }
+  }
+
+  function resetStateSignature() {
+    return JSON.stringify(state);
+  }
+
+  function renderResetMessage() {
+    if (!state) {
+      elements.resetMessage.textContent = "The library is not available.";
+      return;
+    }
+    const activeCount = state.notes.length;
+    const trashCount = state.trash.length;
+    elements.resetMessage.textContent = `This will clear ${numberFormatter.format(activeCount)} active ${noteWord(activeCount)} and ${numberFormatter.format(trashCount)} ${trashWord(trashCount)} from this Chrome profile.`;
+  }
+
+  function updateResetControls() {
+    const confirmed = elements.resetConfirmation.value === "DELETE";
+    const busy = resetInFlight || resetExportInFlight;
+    elements.confirmReset.disabled = busy || !confirmed;
+    elements.cancelReset.disabled = busy;
+    elements.resetExport.disabled = busy;
+    elements.resetConfirmation.disabled = busy;
+    elements.resetForm.setAttribute("aria-busy", String(busy));
+  }
+
+  function setResetSnapshot() {
+    resetSnapshot = state
+      ? {
+          epoch: dataEpoch,
+          revision: state.revision,
+          state: resetStateSignature(),
+        }
+      : null;
+    renderResetMessage();
+  }
+
+  function refreshResetReview() {
+    if (!elements.resetDialog.open || !state) {
+      return;
+    }
+    renderResetMessage();
+    const signature = resetStateSignature();
+    if (resetSnapshot && signature !== resetSnapshot.state) {
+      setResetSnapshot();
+      elements.resetConfirmation.value = "";
+      setStatus(
+        elements.resetStatus,
+        "The library changed in another window. Review the updated counts and type DELETE again.",
+        "warning",
+      );
+    }
+    updateResetControls();
+  }
+
+  function openResetDialog(trigger) {
+    if (!ready || !state) {
+      return;
+    }
+    resetReturnFocus = trigger || elements.clearLocalData;
+    elements.resetConfirmation.value = "";
+    setStatus(elements.resetStatus, "", "info");
+    setResetSnapshot();
+    updateResetControls();
+    showDialog(elements.resetDialog);
+    elements.cancelReset.focus();
+  }
+
+  function resetLocalPage(result) {
+    cancelEditorDraftTimer();
+    if (searchTimer !== null) {
+      timerApi.clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+    dataEpoch = result.epoch;
+    state = result.state;
+    dataResetConflict = false;
+    resetOutcomeUnknown = false;
+    resetEventsSuppressed = false;
+    editorDraftRecord = result.editorDraftRecord;
+    externalEditorDraftRecord = null;
+    editorDraftGeneration = result.editorDraftRecord?.contentGeneration || 0;
+    editorDraftSynced = true;
+    editorDraftBlocked = false;
+    editorDraftUnavailable = false;
+    editorDraftSaveAnnounced = false;
+    editingId = null;
+    editingSnapshot = null;
+    editingBaseNote = null;
+    editingBaseRevision = 0;
+    editorInitialInput = "";
+    editorDirty = false;
+    recoveringAsCopy = false;
+    editorReturnFocus = null;
+    editorSessionId = "";
+    detailNoteId = null;
+    detailReturnFocus = null;
+    pendingDelete = null;
+    deleteReturnFocus = null;
+    pendingPermanentDelete = null;
+    permanentDeleteReturnFocus = null;
+    emptyTrashSnapshot = null;
+    pendingBulkCourse = null;
+    pendingBulkAction = null;
+    importReadGeneration += 1;
+    pendingImport = null;
+    pendingImportPreview = null;
+    pendingReplaceStateSnapshot = null;
+    replaceInFlight = false;
+    recoveryInfo = { createdAt: "", rejectedNotes: 0, rejectedDrafts: 0 };
+    measuredUsageState = null;
+    measuredUsage = null;
+    selectionMode = false;
+    selectedIds.clear();
+    selectionReturnFocus = null;
+    viewMode = "notes";
+    visibleLimit = DISPLAY_BATCH;
+    courseSignature = "";
+    undoRecord = null;
+    elements.undoBar.hidden = true;
+    elements.search.value = "";
+    elements.course.value = "";
+    elements.importFile.value = "";
+    elements.editorTitle.value = "";
+    elements.editorCourse.value = "";
+    elements.editorBody.value = "";
+    elements.editorSourceTitle.value = "";
+    elements.editorSourceUrl.value = "";
+    elements.editorSourceDetails.open = false;
+    elements.editorDuplicate.hidden = true;
+    elements.editorConflict.hidden = true;
+    elements.editorDraftRecovery.hidden = true;
+    elements.recoveryNotice.hidden = true;
+    resetSnapshot = null;
+    resetReturnFocus = null;
+    for (const dialog of documentValue.querySelectorAll("dialog[open]")) {
+      closeDialog(dialog);
+    }
+    applyTheme(state.settings.theme, documentValue);
+    render();
+  }
+
+  async function inspectResetOutcome(previousEpoch) {
+    try {
+      const stored = await storage.get([
+        STORAGE_KEYS.dataEpoch,
+        STORAGE_KEYS.state,
+        STORAGE_KEYS.editorDraft,
+      ]);
+      const epoch = stored[STORAGE_KEYS.dataEpoch];
+      const resetState = stored[STORAGE_KEYS.state];
+      const editorRecord = stored[STORAGE_KEYS.editorDraft];
+      if (
+        typeof epoch === "string" &&
+        epoch !== previousEpoch &&
+        Array.isArray(resetState?.notes) &&
+        resetState.notes.length === 0 &&
+        Array.isArray(resetState?.trash) &&
+        resetState.trash.length === 0 &&
+        editorRecord?.draft === null
+      ) {
+        return {
+          status: "completed",
+          result: { epoch, state: resetState, editorDraftRecord: editorRecord },
+        };
+      }
+      return { status: epoch === previousEpoch ? "not-completed" : "unknown" };
+    } catch {
+      return { status: "unknown" };
+    }
+  }
+
+  async function reconcileAfterFailedReset() {
+    const hadSuppressedChanges = resetEventsSuppressed;
+    const nextState = await readStateForPage();
+    const nextEditorDraft = await readEditorDraftForPage();
+    const nextRecovery = await readRecoveryForPage();
+    if (undoRecord && JSON.stringify(nextState) !== undoRecord.stateSnapshot) {
+      hideUndo();
+    }
+    state = nextState;
+    editorDraftRecord = nextEditorDraft;
+    externalEditorDraftRecord = null;
+    editorDraftUnavailable = false;
+    recoveryInfo = nextRecovery;
+    resetEventsSuppressed = false;
+    applyTheme(state.settings.theme, documentValue);
+    render();
+    renderEditorDraftRecovery();
+    renderRecoveryNotice();
+    elements.resetConfirmation.value = "";
+    setResetSnapshot();
+    updateResetControls();
+    return hadSuppressedChanges;
+  }
+
+  function markResetOutcomeUnknown() {
+    resetOutcomeUnknown = true;
+    resetEventsSuppressed = false;
+    setLibraryAvailable(false);
+    elements.retryLoad.textContent = "Reload page";
+    elements.retryLoad.hidden = false;
+    elements.summary.textContent = "Reload required";
+    setStatus(
+      elements.status,
+      "Chrome could not confirm whether local data was cleared. Reload this page before making more changes.",
+      "error",
+    );
+  }
+
+  async function confirmDataReset() {
+    if (
+      resetInFlight ||
+      resetExportInFlight ||
+      !resetSnapshot ||
+      elements.resetConfirmation.value !== "DELETE"
+    ) {
+      return;
+    }
+    const reviewed = resetSnapshot;
+    let focusAfterReset = null;
+    resetInFlight = true;
+    resetEventsSuppressed = false;
+    updateResetControls();
+    setStatus(elements.resetStatus, "Clearing local data...", "info");
+    try {
+      const result = await resetAllData(storage, {
+        expectedEpoch: reviewed.epoch,
+        expectedRevision: reviewed.revision,
+      });
+      resetLocalPage(result);
+      setLibraryAvailable(true);
+      render();
+      setStatus(
+        elements.status,
+        "Local notes, drafts, settings, pending captures, and recovery data were cleared.",
+        "success",
+      );
+      elements.newNote.focus();
+    } catch (error) {
+      if (isDataResetError(error)) {
+        resetReturnFocus = null;
+        closeDialog(elements.resetDialog);
+        markDataResetConflict();
+        focusAfterReset = elements.retryLoad;
+      } else if (error instanceof ValidationError && error.code === "state-conflict") {
+        try {
+          await reconcileAfterFailedReset();
+          setStatus(
+            elements.resetStatus,
+            "The library changed in another window. Review the updated counts and type DELETE again.",
+            "warning",
+          );
+          focusAfterReset = elements.resetConfirmation;
+        } catch (readError) {
+          resetReturnFocus = null;
+          closeDialog(elements.resetDialog);
+          if (isDataResetError(readError)) {
+            markDataResetConflict();
+          } else {
+            markResetOutcomeUnknown();
+          }
+          focusAfterReset = elements.retryLoad;
+        }
+      } else {
+        const outcome = await inspectResetOutcome(reviewed.epoch);
+        if (outcome.status === "completed") {
+          resetLocalPage(outcome.result);
+          setLibraryAvailable(false);
+          elements.retryLoad.textContent = "Retry cleanup";
+          elements.retryLoad.hidden = false;
+          elements.summary.textContent = "Local data cleared";
+          setStatus(
+            elements.status,
+            "Local data was cleared, but Chrome could not finish removing supporting data. Reload the library or retry cleanup before creating new notes.",
+            "error",
+          );
+          focusAfterReset = elements.retryLoad;
+        } else if (outcome.status === "not-completed") {
+          try {
+            const restoredSuppressedChanges = await reconcileAfterFailedReset();
+            const restoredMessage = restoredSuppressedChanges
+              ? " Changes from another window were loaded."
+              : "";
+            setStatus(
+              elements.resetStatus,
+              `Local data was not cleared: ${errorMessage(error)}${restoredMessage}`,
+              "error",
+            );
+            focusAfterReset = elements.resetConfirmation;
+          } catch (readError) {
+            resetReturnFocus = null;
+            closeDialog(elements.resetDialog);
+            if (isDataResetError(readError)) {
+              markDataResetConflict();
+            } else {
+              markResetOutcomeUnknown();
+            }
+            focusAfterReset = elements.retryLoad;
+          }
+        } else {
+          resetReturnFocus = null;
+          closeDialog(elements.resetDialog);
+          markResetOutcomeUnknown();
+          focusAfterReset = elements.retryLoad;
+        }
+      }
+    } finally {
+      resetInFlight = false;
+      if (elements.resetDialog.open) {
+        updateResetControls();
+      }
+      focusAfterReset?.focus();
     }
   }
 
@@ -1948,13 +2376,22 @@ export async function initLibrary({
     }
   }
 
-  function exportBulkSelection() {
+  async function exportBulkSelection() {
     try {
       const snapshot = selectedRecordSnapshot();
       if (snapshot.view !== "notes") {
         return;
       }
-      const text = notesToMarkdown(snapshot.records);
+      const includeSource = elements.includeSourceOnShare.checked;
+      const latestState = await readFreshExportState((current) =>
+        assertSelectedRecords(current, snapshot),
+      );
+      const selected = snapshot.identifiers.map((identifier) =>
+        currentViewRecord(identifier, latestState, snapshot.view),
+      );
+      const text = notesToMarkdown(selected, {
+        includeSource,
+      });
       downloadText(text, backupFilename("md"), "text/markdown", documentValue, urlApi);
       setStatus(
         elements.status,
@@ -2006,9 +2443,20 @@ export async function initLibrary({
       : `${numberFormatter.format(preview.merge.rekeyed)} colliding note ${preview.merge.rekeyed === 1 ? "ID" : "IDs"} will be changed.`;
     elements.mergePreviewMessage.textContent = `Merge will add ${numberFormatter.format(preview.merge.added)} active ${noteWord(preview.merge.added)} and ${numberFormatter.format(preview.merge.trashAdded)} ${trashWord(preview.merge.trashAdded)}. ${skipMessage} ${rekeyMessage} The result will have ${numberFormatter.format(preview.merge.resultingNotes)} active ${noteWord(preview.merge.resultingNotes)} and ${numberFormatter.format(preview.merge.resultingTrash)} ${trashWord(preview.merge.resultingTrash)}.`;
     elements.replacePreviewMessage.textContent = `Replace will remove ${numberFormatter.format(preview.replace.removedNotes)} current active ${noteWord(preview.replace.removedNotes)} and ${numberFormatter.format(preview.replace.removedTrash)} current ${trashWord(preview.replace.removedTrash)}. The result will have ${numberFormatter.format(preview.replace.resultingNotes)} active ${noteWord(preview.replace.resultingNotes)} and ${numberFormatter.format(preview.replace.resultingTrash)} ${trashWord(preview.replace.resultingTrash)}.`;
-    elements.replaceSettingsMessage.textContent = preview.replace.settingsChanged
+    const displaySettingsChanged =
+      preview.replace.currentSettings.theme !== preview.replace.settings.theme ||
+      preview.replace.currentSettings.sort !== preview.replace.settings.sort;
+    const displaySettingsMessage = displaySettingsChanged
       ? `Replace will change the theme from ${themeLabel(preview.replace.currentSettings.theme)} to ${themeLabel(preview.replace.settings.theme)} and sorting from ${sortLabel(preview.replace.currentSettings.sort)} to ${sortLabel(preview.replace.settings.sort)}.`
       : `Replace will keep the ${themeLabel(preview.replace.settings.theme)} theme and ${sortLabel(preview.replace.settings.sort)} sorting.`;
+    const sourceSettingChanged =
+      preview.replace.currentSettings.includeSourceOnShare !==
+      preview.replace.settings.includeSourceOnShare;
+    const sourceAction = preview.replace.settings.includeSourceOnShare ? "include" : "exclude";
+    const sourceSettingsMessage = sourceSettingChanged
+      ? `Copied notes and Markdown will change to ${sourceAction} source details.`
+      : `Copied notes and Markdown will continue to ${sourceAction} source details.`;
+    elements.replaceSettingsMessage.textContent = `${displaySettingsMessage} ${sourceSettingsMessage}`;
     if (elements.replaceDialog.open) {
       renderReplaceConfirmation(preview);
     }
@@ -2031,6 +2479,9 @@ export async function initLibrary({
     if (!file || !state) {
       return;
     }
+    const generation = importReadGeneration + 1;
+    importReadGeneration = generation;
+    const expectedEpoch = dataEpoch;
     if (file.size > LIMITS.importBytes) {
       setStatus(elements.status, "The backup file is too large.", "error");
       elements.importFile.value = "";
@@ -2038,7 +2489,21 @@ export async function initLibrary({
     }
 
     try {
-      const parsed = parseBackup(await file.text());
+      const contents = await file.text();
+      if (
+        destroyed ||
+        generation !== importReadGeneration ||
+        expectedEpoch !== dataEpoch ||
+        dataResetConflict ||
+        resetOutcomeUnknown
+      ) {
+        return;
+      }
+      await assertCurrentDataEpoch();
+      if (generation !== importReadGeneration || expectedEpoch !== dataEpoch) {
+        return;
+      }
+      const parsed = parseBackup(contents);
       assertStateFits(replaceImportedNotes(state, parsed));
       pendingImport = parsed;
       pendingReplaceStateSnapshot = null;
@@ -2047,12 +2512,17 @@ export async function initLibrary({
       showDialog(elements.importDialog);
       elements.cancelImport.focus();
     } catch (error) {
+      if (generation !== importReadGeneration || expectedEpoch !== dataEpoch) {
+        return;
+      }
       pendingImport = null;
       pendingImportPreview = null;
       pendingReplaceStateSnapshot = null;
-      setStatus(elements.status, errorMessage(error), "error");
+      reportActionError(error);
     } finally {
-      elements.importFile.value = "";
+      if (generation === importReadGeneration) {
+        elements.importFile.value = "";
+      }
     }
   }
 
@@ -2177,6 +2647,7 @@ export async function initLibrary({
       if (state) {
         elements.sort.value = state.settings.sort;
         elements.theme.value = state.settings.theme;
+        elements.includeSourceOnShare.checked = state.settings.includeSourceOnShare;
       }
     }
   }
@@ -2253,6 +2724,9 @@ export async function initLibrary({
   elements.bulkPermanentDelete.addEventListener("click", () =>
     openBulkConfirmation("permanent-delete"),
   );
+  elements.clearLocalData.addEventListener("click", (event) =>
+    openResetDialog(event.currentTarget),
+  );
   elements.search.addEventListener("input", () => {
     if (searchTimer !== null) {
       timerApi.clearTimeout(searchTimer);
@@ -2286,6 +2760,9 @@ export async function initLibrary({
   elements.emptyTrash.addEventListener("click", openEmptyTrash);
   elements.sort.addEventListener("change", () => void changeSettings({ sort: elements.sort.value }));
   elements.theme.addEventListener("change", () => void changeSettings({ theme: elements.theme.value }));
+  elements.includeSourceOnShare.addEventListener("change", () =>
+    void changeSettings({ includeSourceOnShare: elements.includeSourceOnShare.checked }),
+  );
   elements.clearFilters.addEventListener("click", () => {
     if (searchTimer !== null) {
       timerApi.clearTimeout(searchTimer);
@@ -2550,6 +3027,56 @@ export async function initLibrary({
     }
   });
 
+  elements.resetConfirmation.addEventListener("input", updateResetControls);
+  elements.resetExport.addEventListener("click", async () => {
+    if (resetInFlight || resetExportInFlight) {
+      return;
+    }
+    const reviewedState = resetSnapshot?.state || null;
+    resetExportInFlight = true;
+    updateResetControls();
+    try {
+      const exported = await exportJson(elements.resetStatus);
+      if (exported) {
+        const reviewChanged = reviewedState !== null && resetSnapshot?.state !== reviewedState;
+        setStatus(
+          elements.resetStatus,
+          reviewChanged
+            ? "Backup exported from the latest saved data. Review the updated counts and type DELETE again."
+            : "Backup exported. The downloaded file remains available after local data is cleared.",
+          reviewChanged ? "warning" : "success",
+        );
+      } else if (dataResetConflict) {
+        resetReturnFocus = null;
+        closeDialog(elements.resetDialog);
+        elements.retryLoad.focus();
+      }
+    } finally {
+      resetExportInFlight = false;
+      if (elements.resetDialog.open) {
+        updateResetControls();
+      }
+    }
+  });
+  elements.resetForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void confirmDataReset();
+  });
+  elements.cancelReset.addEventListener("click", () => closeDialog(elements.resetDialog));
+  elements.resetDialog.addEventListener("cancel", (event) => {
+    if (resetInFlight || resetExportInFlight) {
+      event.preventDefault();
+    }
+  });
+  elements.resetDialog.addEventListener("close", () => {
+    resetSnapshot = null;
+    elements.resetConfirmation.value = "";
+    setStatus(elements.resetStatus, "", "info");
+    const target = resetReturnFocus;
+    resetReturnFocus = null;
+    target?.focus?.();
+  });
+
   elements.exportJson.addEventListener("click", () => void exportJson());
   elements.exportMarkdown.addEventListener("click", () => void exportMarkdown());
   elements.importButton.addEventListener("click", () => elements.importFile.click());
@@ -2746,11 +3273,14 @@ export async function initLibrary({
     const editorDraftChanged = Boolean(changes[STORAGE_KEYS.editorDraft]);
     const recoveryChanged = Boolean(changes[STORAGE_KEYS.recovery]);
     const dataEpochChanged = Boolean(changes[STORAGE_KEYS.dataEpoch]);
-    if (
-      destroyed ||
-      areaName !== "local" ||
-      (!stateChanged && !editorDraftChanged && !recoveryChanged && !dataEpochChanged)
-    ) {
+    const storageUsageChanged = Object.keys(changes).some((key) =>
+      Object.values(STORAGE_KEYS).includes(key),
+    );
+    if (destroyed || areaName !== "local") {
+      return;
+    }
+    if (resetInFlight) {
+      resetEventsSuppressed = true;
       return;
     }
     if (
@@ -2758,10 +3288,24 @@ export async function initLibrary({
       dataEpoch &&
       changes[STORAGE_KEYS.dataEpoch].newValue !== dataEpoch
     ) {
+      const resetDialogWasOpen = elements.resetDialog.open;
+      if (resetDialogWasOpen) {
+        resetReturnFocus = null;
+        closeDialog(elements.resetDialog);
+      }
       markDataResetConflict();
+      if (resetDialogWasOpen) {
+        elements.retryLoad.focus();
+      }
       return;
     }
     if (dataResetConflict) {
+      return;
+    }
+    if (storageUsageChanged) {
+      void refreshStorageUsage();
+    }
+    if (!stateChanged && !editorDraftChanged && !recoveryChanged && !dataEpochChanged) {
       return;
     }
     try {
@@ -2937,7 +3481,7 @@ export async function initLibrary({
     }
   }
   elements.retryLoad.addEventListener("click", () => {
-    if (dataResetConflict) {
+    if (dataResetConflict || resetOutcomeUnknown) {
       documentValue.defaultView?.location.reload();
       return;
     }
@@ -2953,6 +3497,7 @@ export async function initLibrary({
     openEditor,
     destroy() {
       destroyed = true;
+      storageUsageRequestGeneration += 1;
       if (searchTimer !== null) {
         timerApi.clearTimeout(searchTimer);
       }

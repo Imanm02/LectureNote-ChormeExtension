@@ -22,15 +22,17 @@ export function formatDate(value, locale) {
   }).format(new Date(timestamp));
 }
 
-export function noteToPlainText(note) {
+export function noteToPlainText(note, { includeSource = true } = {}) {
   const sections = [note.title];
   if (note.course) {
     sections.push(`Course: ${note.course}`);
   }
-  if (note.source.url) {
-    sections.push(`Source: ${note.source.url}`);
-  } else if (note.source.title) {
-    sections.push(`Source: ${note.source.title}`);
+  if (includeSource) {
+    if (note.source.url) {
+      sections.push(`Source: ${note.source.url}`);
+    } else if (note.source.title) {
+      sections.push(`Source: ${note.source.title}`);
+    }
   }
   sections.push(note.body);
   return sections.join("\n\n");

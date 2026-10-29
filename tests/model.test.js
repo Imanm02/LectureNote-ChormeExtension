@@ -15,6 +15,7 @@ import {
   normalizeEditorDraft,
   normalizeNote,
   normalizeSource,
+  normalizeState,
   permanentlyDeleteTrashedNote,
   permanentlyDeleteTrashedNotes,
   recoverState,
@@ -233,6 +234,22 @@ test("merges course names and can clear the merged course", () => {
   assert.equal(cleared.state.trash[0].note.course, "");
   assert.equal(cleared.changed, 3);
   assert.equal(cleared.state.revision, state.revision + 2);
+});
+
+test("matches Persian course names with or without a zero-width non-joiner", () => {
+  const stored = createNote(sample({ course: "روش‌های عددی" }), {
+    idFactory: () => "persian-course",
+    now: START,
+  });
+  const result = renameCourse(
+    { ...createEmptyState(), notes: [stored] },
+    "روشهای عددی",
+    "محاسبات عددی",
+    { now: LATER },
+  );
+
+  assert.equal(result.changed, 1);
+  assert.equal(result.state.notes[0].course, "محاسبات عددی");
 });
 
 test("assigns a normalized course to selected active notes", () => {
@@ -678,12 +695,12 @@ test("previews merge collisions with the same result as the real merge", () => {
   const current = {
     ...createEmptyState(),
     notes: [existing],
-    settings: { theme: "light", sort: "created-desc" },
+    settings: { theme: "light", sort: "created-desc", includeSourceOnShare: true },
   };
   const imported = {
     notes: [repeated, collision],
     trash: [],
-    settings: { theme: "dark", sort: "title-asc" },
+    settings: { theme: "dark", sort: "title-asc", includeSourceOnShare: false },
     schemaVersion: 2,
     exportedAt: LATER,
   };
@@ -757,7 +774,10 @@ test("measures serialized storage and warns near configured limits", () => {
   const normal = measureLibraryUsage(normalState);
 
   assert.equal(normal.bytes, new TextEncoder().encode(JSON.stringify(normalState)).byteLength);
-  assert.equal(normal.byteLimit, LIMITS.stateBytes);
+  assert.equal(normal.byteLimit, LIMITS.localStorageBytes);
+  assert.equal(normal.stateBytes, normal.bytes);
+  assert.equal(normal.stateByteLimit, LIMITS.stateBytes);
+  assert.equal(normal.hasMeasuredStorageBytes, false);
   assert.equal(normal.notes, 1);
   assert.equal(normal.noteLimit, LIMITS.notes);
   assert.equal(normal.level, "normal");
@@ -779,6 +799,32 @@ test("measures serialized storage and warns near configured limits", () => {
 
   assert.equal(warning.level, "warning");
   assert.equal(critical.level, "critical");
+
+  const measured = measureLibraryUsage(normalState, { storageBytes: 2_621_440 });
+  assert.equal(measured.bytes, 2_621_440);
+  assert.equal(measured.stateBytes, normal.bytes);
+  assert.equal(measured.byteLimit, LIMITS.localStorageBytes);
+  assert.equal(measured.hasMeasuredStorageBytes, true);
+
+  const storageWarning = measureLibraryUsage(normalState, {
+    storageBytes: LIMITS.localStorageBytes * 0.8,
+  });
+  const storageCritical = measureLibraryUsage(normalState, {
+    storageBytes: LIMITS.localStorageBytes * 0.95,
+  });
+  assert.equal(storageWarning.level, "warning");
+  assert.equal(storageCritical.level, "critical");
+});
+
+test("keeps record budgets below the Chrome local storage quota", () => {
+  const reservedBytes =
+    LIMITS.stateBytes +
+    LIMITS.popupDraftBytes +
+    LIMITS.editorDraftBytes +
+    LIMITS.pendingCapturesBytes;
+
+  assert.ok(reservedBytes < LIMITS.localStorageBytes);
+  assert.ok(LIMITS.localStorageBytes - reservedBytes >= 500_000);
 });
 
 test("replaces imported notes and advances the revision", () => {
@@ -1009,9 +1055,23 @@ test("rejects invalid editor draft identity and field limits", () => {
 });
 
 test("updates settings through the revision contract", () => {
-  const state = updateSettings(createEmptyState(), { theme: "dark", sort: "title-asc" });
+  const state = updateSettings(createEmptyState(), {
+    theme: "dark",
+    sort: "title-asc",
+    includeSourceOnShare: false,
+  });
   assert.equal(state.revision, 1);
-  assert.deepEqual(state.settings, { theme: "dark", sort: "title-asc" });
+  assert.deepEqual(state.settings, {
+    theme: "dark",
+    sort: "title-asc",
+    includeSourceOnShare: false,
+  });
+
+  const restoredDefault = normalizeState({
+    ...createEmptyState(),
+    settings: { theme: "light", sort: "created-desc" },
+  });
+  assert.equal(restoredDefault.settings.includeSourceOnShare, true);
 });
 
 test("creates readable Markdown while escaping active markup", () => {

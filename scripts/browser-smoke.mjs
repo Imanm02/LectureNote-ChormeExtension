@@ -16,6 +16,12 @@ const extensionManifest = JSON.parse(
   await readFile(join(extensionRoot, "manifest.json"), "utf8"),
 );
 assert.equal(extensionManifest.manifest_version, 3, "The extension root must contain an MV3 manifest");
+const serviceWorkerScript = extensionManifest.background?.service_worker;
+assert.equal(
+  typeof serviceWorkerScript,
+  "string",
+  "The extension must declare an MV3 service worker",
+);
 const screenshotDirectory = process.env.LECTURE_NOTES_SCREENSHOTS
   ? resolve(projectRoot, process.env.LECTURE_NOTES_SCREENSHOTS)
   : null;
@@ -31,14 +37,197 @@ if (screenshotDirectory) {
 const temporaryRoot = resolve(tmpdir());
 const profile = await mkdtemp(join(temporaryRoot, "lecture-notes-smoke-"));
 const browserErrors = [];
+const recordedBrowserErrors = new Set();
+const trackedServiceWorkers = new WeakSet();
+const workerTrackers = new Set();
 
-function trackPage(page) {
-  page.on("pageerror", (error) => browserErrors.push(`${page.url()}: ${error.message}`));
-  page.on("console", (message) => {
-    if (message.type() === "error") {
-      browserErrors.push(`${page.url()}: ${message.text()}`);
-    }
+function recordBrowserError(source, message) {
+  const entry = `${source}: ${message}`;
+  if (!recordedBrowserErrors.has(entry)) {
+    recordedBrowserErrors.add(entry);
+    browserErrors.push(entry);
+  }
+}
+
+function serviceWorkerSource(worker) {
+  return `service worker ${worker.url() || "at an unknown URL"}`;
+}
+
+function isExtensionServiceWorker(worker) {
+  try {
+    const workerUrl = new URL(worker.url());
+    return (
+      workerUrl.protocol === "chrome-extension:" &&
+      workerUrl.pathname === `/${serviceWorkerScript}`
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function installServiceWorkerErrorHooks(worker) {
+  if (!isExtensionServiceWorker(worker)) {
+    return;
+  }
+
+  try {
+    await worker.evaluate(() => {
+      const marker = Symbol.for("lectureNotes.browserSmokeErrorHooks");
+      if (globalThis[marker]) {
+        return;
+      }
+      globalThis[marker] = true;
+
+      const describe = (value) => {
+        if (value instanceof Error) {
+          return value.stack || value.message;
+        }
+        if (typeof value === "string") {
+          return value;
+        }
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return String(value);
+        }
+      };
+
+      globalThis.addEventListener("error", (event) => {
+        console.error("Uncaught service worker error:", describe(event.error || event.message));
+      });
+      globalThis.addEventListener("unhandledrejection", (event) => {
+        console.error("Unhandled service worker rejection:", describe(event.reason));
+      });
+    });
+  } catch (error) {
+    recordBrowserError(
+      serviceWorkerSource(worker),
+      `Could not install error listeners: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function trackServiceWorker(worker) {
+  if (trackedServiceWorkers.has(worker)) {
+    return;
+  }
+  trackedServiceWorkers.add(worker);
+  const tracker = installServiceWorkerErrorHooks(worker).finally(() => {
+    workerTrackers.delete(tracker);
   });
+  workerTrackers.add(tracker);
+}
+
+async function finishServiceWorkerTracking() {
+  await Promise.all([...workerTrackers]);
+}
+
+async function assertServiceWorkerHealth(context) {
+  const worker = context.serviceWorkers().find(isExtensionServiceWorker) ||
+    await context.waitForEvent("serviceworker", {
+      predicate: isExtensionServiceWorker,
+      timeout: 5_000,
+    });
+  trackServiceWorker(worker);
+  await finishServiceWorkerTracking();
+
+  const health = await worker.evaluate(() => {
+    const manifest = globalThis.chrome.runtime.getManifest();
+    return {
+      runtimeId: globalThis.chrome.runtime.id,
+      manifestVersion: manifest.manifest_version,
+      serviceWorker: manifest.background?.service_worker,
+      errorHooksInstalled: Boolean(
+        globalThis[Symbol.for("lectureNotes.browserSmokeErrorHooks")],
+      ),
+    };
+  });
+
+  assert.match(health.runtimeId, /^[a-p]{32}$/u, "The service worker runtime ID is invalid");
+  assert.equal(
+    health.runtimeId,
+    new URL(worker.url()).hostname,
+    "The service worker runtime ID does not match its extension URL",
+  );
+  assert.equal(health.manifestVersion, 3, "The running service worker is not MV3");
+  assert.equal(
+    health.serviceWorker,
+    serviceWorkerScript,
+    "The running service worker does not match the manifest",
+  );
+  assert.equal(
+    health.errorHooksInstalled,
+    true,
+    "The service worker error listeners were not installed",
+  );
+
+  const healthPage = await context.newPage();
+  try {
+    await healthPage.goto(`chrome-extension://${health.runtimeId}/manifest.json`);
+    const response = await healthPage.evaluate(async () => {
+      const epochKey = "lectureNoteDataEpoch";
+      const stored = await globalThis.chrome.storage.local.get(epochKey);
+      const hadEpoch = Object.hasOwn(stored, epochKey);
+      const previousEpoch = stored[epochKey];
+      const validEpoch = typeof previousEpoch === "string" &&
+        /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(previousEpoch);
+      const expectedEpoch = validEpoch ? previousEpoch : globalThis.crypto.randomUUID();
+      if (!validEpoch) {
+        await globalThis.chrome.storage.local.set({ [epochKey]: expectedEpoch });
+      }
+
+      try {
+        return await new Promise((resolveResponse, rejectResponse) => {
+          const timeout = globalThis.setTimeout(
+            () => rejectResponse(new Error("The service worker health request timed out.")),
+            5_000,
+          );
+          globalThis.chrome.runtime.sendMessage(
+            {
+              type: "save-draft",
+              draft: null,
+              sessionId: `browser-smoke-health-${globalThis.crypto.randomUUID()}`,
+              // The mismatched cursor exercises the real handler without writing a draft.
+              expectedOwnerSessionId:
+                `browser-smoke-mismatch-${globalThis.crypto.randomUUID()}`,
+              expectedGeneration: Number.MAX_SAFE_INTEGER,
+              contentGeneration: 1,
+              expectedEpoch,
+            },
+            (messageResponse) => {
+              globalThis.clearTimeout(timeout);
+              const lastError = globalThis.chrome.runtime.lastError;
+              if (lastError) {
+                rejectResponse(new Error(lastError.message));
+              } else {
+                resolveResponse(messageResponse);
+              }
+            },
+          );
+        });
+      } finally {
+        if (hadEpoch) {
+          await globalThis.chrome.storage.local.set({ [epochKey]: previousEpoch });
+        } else {
+          await globalThis.chrome.storage.local.remove(epochKey);
+        }
+      }
+    });
+
+    assert.equal(response?.ok, true, "The service worker health request failed");
+    assert.equal(
+      response?.saved,
+      false,
+      "The service worker health request unexpectedly changed the draft",
+    );
+    assert.equal(
+      typeof response?.cursor?.generation,
+      "number",
+      "The service worker health response is incomplete",
+    );
+  } finally {
+    await healthPage.close().catch(() => undefined);
+  }
 }
 
 async function startFixtureServer() {
@@ -98,11 +287,32 @@ async function launch() {
       `--load-extension=${extensionRoot}`,
     ],
   });
-  context.on("page", trackPage);
-  for (const page of context.pages()) {
-    trackPage(page);
+  try {
+    context.on("console", (message) => {
+      if (message.type() !== "error") {
+        return;
+      }
+      const worker = message.worker();
+      const source = worker
+        ? serviceWorkerSource(worker)
+        : message.page()?.url() || message.location().url || "browser console";
+      recordBrowserError(source, message.text());
+    });
+    context.on("weberror", (webError) => {
+      const location = webError.location();
+      const source = location.url || webError.page()?.url() || "browser page";
+      recordBrowserError(source, webError.error().message);
+    });
+    context.on("serviceworker", trackServiceWorker);
+    for (const worker of context.serviceWorkers()) {
+      trackServiceWorker(worker);
+    }
+    await assertServiceWorkerHealth(context);
+    return context;
+  } catch (error) {
+    await context.close().catch(() => undefined);
+    throw error;
   }
-  return context;
 }
 
 async function extensionId(context) {
@@ -339,11 +549,65 @@ try {
   await recoveredLibrary.locator("#libraryMain[aria-busy='false']").waitFor();
   assert.equal(await recoveredLibrary.locator("#editorDraftRecovery").isHidden(), true);
 
+  const epochBeforeReset = await recoveredLibrary.evaluate(async () => {
+    const stored = await globalThis.chrome.storage.local.get("lectureNoteDataEpoch");
+    return stored.lectureNoteDataEpoch;
+  });
+  await recoveredLibrary.getByRole("button", { name: "Clear local data" }).click();
+  assert.equal(
+    await recoveredLibrary.locator("#resetMessage").textContent(),
+    "This will clear 3 active notes and 0 Trash entries from this Chrome profile.",
+  );
+  assert.equal(await recoveredLibrary.locator("#confirmResetButton").isDisabled(), true);
+
+  const resetBackupDownloadPromise = recoveredLibrary.waitForEvent("download");
+  await recoveredLibrary.getByRole("button", { name: "Export backup first" }).click();
+  const resetBackupDownload = await resetBackupDownloadPromise;
+  const resetBackupPath = join(profile, "before-clear-backup.json");
+  await resetBackupDownload.saveAs(resetBackupPath);
+  const resetBackup = JSON.parse(await readFile(resetBackupPath, "utf8"));
+  assert.equal(resetBackup.notes.length, 3);
+  assert.equal(resetBackup.trash.length, 0);
+  await recoveredLibrary.getByRole("button", { name: "Cancel" }).click();
+  assert.equal(await recoveredLibrary.locator("#activeNoteCount").textContent(), "3");
+
+  await recoveredLibrary.getByRole("button", { name: "Clear local data" }).click();
+  await recoveredLibrary.locator("#resetConfirmationInput").fill("DELETE");
+  await recoveredLibrary.locator("#resetForm").getByRole("button", { name: "Clear local data" }).click();
+  await recoveredLibrary.locator("#libraryStatus").filter({ hasText: "Local notes" }).waitFor();
+  assert.equal(await recoveredLibrary.locator("#activeNoteCount").textContent(), "0");
+  assert.equal(await recoveredLibrary.locator("#trashNoteCount").textContent(), "0");
+  assert.equal(await recoveredLibrary.locator("html").getAttribute("data-theme"), "system");
+  assert.equal(await recoveredLibrary.getByRole("button", { name: /New note/u }).isEnabled(), true);
+  const resetValues = await recoveredLibrary.evaluate(async () =>
+    globalThis.chrome.storage.local.get([
+      "lectureNoteState",
+      "lectureNoteDataEpoch",
+      "lectureNotePendingCaptures",
+      "lectureNoteRecovery",
+      "lectureNoteHelpSeen",
+      "lectureNoteResetCleanup",
+    ]),
+  );
+  assert.notEqual(resetValues.lectureNoteDataEpoch, epochBeforeReset);
+  assert.deepEqual(resetValues.lectureNoteState.notes, []);
+  assert.deepEqual(resetValues.lectureNoteState.trash, []);
+  assert.equal("lectureNotePendingCaptures" in resetValues, false);
+  assert.equal("lectureNoteRecovery" in resetValues, false);
+  assert.equal("lectureNoteHelpSeen" in resetValues, false);
+  assert.equal("lectureNoteResetCleanup" in resetValues, false);
+
+  await recoveredLibrary.getByRole("button", { name: /New note/u }).click();
+  await recoveredLibrary.getByRole("heading", { name: "New note" }).waitFor();
+  await recoveredLibrary.locator("#cancelEditorButton").click();
+  await recoveredLibrary.locator("#editorDialog").waitFor({ state: "hidden" });
+
+  await finishServiceWorkerTracking();
   assert.deepEqual(browserErrors, []);
   const shortcutResult = shortcutCaptureVerified
     ? " Action shortcut capture also passed."
     : " Headless Chromium did not expose the action popup.";
-  console.log(`Browser smoke test passed: selection handling, popup and editor draft recovery, persistence, CRUD, search, Trash-aware backup and restore, theme, and undo.${shortcutResult}`);
+  console.log(`Browser smoke test passed: selection handling, popup and editor draft recovery, persistence, CRUD, search, Trash-aware backup and restore, theme, undo, and local data reset.${shortcutResult}`);
 } finally {
   await context?.close().catch(() => undefined);
   await closeFixtureServer(fixtureServer).catch(() => undefined);

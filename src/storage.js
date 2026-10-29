@@ -84,6 +84,24 @@ function assertEditorDraftFits(value) {
   }
 }
 
+function assertPopupDraftFits(value) {
+  if (encodedBytes(value) > LIMITS.popupDraftBytes) {
+    throw new ValidationError(
+      "The popup draft is too large for local storage. Copy its text before closing.",
+      "popup-draft-size",
+    );
+  }
+}
+
+function assertPendingCapturesFit(value) {
+  if (encodedBytes(value) > LIMITS.pendingCapturesBytes) {
+    throw new ValidationError(
+      "The pending capture queue needs too much local storage. Finish or discard a capture before adding another.",
+      "pending-capture-size",
+    );
+  }
+}
+
 function emptyPopupDraftRecord() {
   return {
     version: POPUP_DRAFT_VERSION,
@@ -446,11 +464,16 @@ export async function resetAllData(
   {
     lockManager = globalThis.navigator?.locks,
     epochFactory = () => crypto.randomUUID(),
+    expectedEpoch,
+    expectedRevision,
   } = {},
 ) {
   const area = getStorage(storage);
   return withStateLock(async () => {
-    const currentEpoch = await loadDataEpochUnlocked(area, { epochFactory });
+    const currentEpoch = await assertExpectedDataEpochUnlocked(area, {
+      epochFactory,
+      expectedEpoch,
+    });
     const nextEpoch = createDataEpoch(epochFactory, currentEpoch);
     const stored = await area.get([
       STORAGE_KEYS.state,
@@ -461,6 +484,18 @@ export async function resetAllData(
     const currentRevision = Number.isSafeInteger(storedRevision) && storedRevision >= 0
       ? storedRevision
       : 0;
+    if (
+      expectedRevision !== undefined &&
+      (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
+    ) {
+      throw new ValidationError("The expected library revision is invalid.", "revision-invalid");
+    }
+    if (expectedRevision !== undefined && expectedRevision !== currentRevision) {
+      throw new ValidationError(
+        "The note library changed after the data reset was reviewed.",
+        "state-conflict",
+      );
+    }
     if (currentRevision === Number.MAX_SAFE_INTEGER) {
       throw new ValidationError("The note library revision cannot be advanced.", "revision-invalid");
     }
@@ -813,11 +848,13 @@ export async function enqueuePendingCapture(
       );
     }
     const captures = [...current.captures, capture];
+    const record = {
+      version: PENDING_CAPTURE_VERSION,
+      captures,
+    };
+    assertPendingCapturesFit(record);
     await area.set({
-      [STORAGE_KEYS.pendingCaptures]: {
-        version: PENDING_CAPTURE_VERSION,
-        captures,
-      },
+      [STORAGE_KEYS.pendingCaptures]: record,
     });
     return { capture, captures };
   }, lockManager);
@@ -914,15 +951,15 @@ export async function saveDraft(
     }
     const current = await loadPopupDraftUnlocked(area, options);
     const ownerSessionId = draft.sessionId;
-    await area.set({
-      [STORAGE_KEYS.draft]: {
-        version: POPUP_DRAFT_VERSION,
-        ownerSessionId,
-        generation: ownerSessionId ? current.generation + 1 : 0,
-        contentGeneration: ownerSessionId ? current.contentGeneration + 1 : 0,
-        draft,
-      },
-    });
+    const record = {
+      version: POPUP_DRAFT_VERSION,
+      ownerSessionId,
+      generation: ownerSessionId ? current.generation + 1 : 0,
+      contentGeneration: ownerSessionId ? current.contentGeneration + 1 : 0,
+      draft,
+    };
+    assertPopupDraftFits(record);
+    await area.set({ [STORAGE_KEYS.draft]: record });
     return draft;
   }, lockManager);
 }
@@ -995,6 +1032,7 @@ async function writePopupDraftUnlocked(value, area, options) {
     contentGeneration,
     draft,
   };
+  assertPopupDraftFits(record);
   await area.set({ [STORAGE_KEYS.draft]: record });
   return { saved: true, record };
 }
