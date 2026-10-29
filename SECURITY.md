@@ -8,7 +8,7 @@ Until the first tagged release is published, security fixes are applied to the `
 
 Do not disclose an exploitable security flaw in a public issue.
 
-Submit the report through [GitHub private vulnerability reporting](https://github.com/Imanm02/LectureNote-ChormeExtension/security/advisories/new). If you cannot access that form, open a public issue that asks the maintainer to provide a private reporting channel. Do not include the exploit, private note data, credentials, or a backup file in the public issue.
+Submit the report through [GitHub private vulnerability reporting](https://github.com/Imanm02/LectureNote-ChromeExtension/security/advisories/new). If you cannot access that form, open a public issue that asks the maintainer to provide a private reporting channel. Do not include the exploit, private note data, credentials, or a backup file in the public issue.
 
 Include the following details in the private report:
 
@@ -23,9 +23,13 @@ Please wait for a fix or an agreed disclosure date before publishing details. Re
 
 ## Security boundaries
 
-Lecture Notes stores data in the current Chrome profile with `chrome.storage.local`. The data is not encrypted by the extension. Someone who can access the Chrome profile, its files, an unlocked browser session, or an exported backup may be able to read the notes.
+Lecture Notes stores active notes, Trash entries, settings, drafts, pending captures, and recovery records in the current Chrome profile with `chrome.storage.local`. The data is not encrypted by the extension. Someone who can access the Chrome profile, its files, an unlocked browser session, or an exported backup may be able to read the notes.
 
 The extension does not claim to protect data from a compromised browser, operating system, Chrome profile, or another process with access to local files. JSON backups and Markdown exports should be treated as private files.
+
+The extension has no runtime network requests, remote code, host permissions, persistent content scripts, or external messaging. Page content is read only after a capture action. Imported backups and page-derived text are treated as untrusted input, validated before storage, and rendered as text rather than executable markup.
+
+Moving a note to Trash is not secure deletion. Permanent deletion, Empty Trash, and **Clear local data** remove records from extension storage, but they cannot remove copies from downloaded backups, Markdown exports, browser backups, disk recovery tools, or operating-system snapshots.
 
 ## Safe testing
 

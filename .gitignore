@@ -1,6 +1,8 @@
 node_modules/
 coverage/
 dist/
+store-assets/.screenshots-stage-*/
+store-assets/.screenshots-backup-*/
 test-results/
 playwright-report/
 *.log

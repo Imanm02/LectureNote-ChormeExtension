@@ -1,0 +1,61 @@
+name: Feature request
+description: Suggest a focused improvement to Lecture Notes
+title: "[Feature] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the study or note-taking problem first. Do not include private notes, credentials, page URLs, or backup files.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is difficult in the current workflow, and when does it happen?
+      placeholder: I need to... because...
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired result
+      description: Describe the result you need without assuming a particular implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Current workaround
+      description: Explain how you handle this today, if there is a workaround.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Related area
+      options:
+        - Capture
+        - Library or side panel
+        - Search, filters, or courses
+        - Editing or note details
+        - Selection and bulk actions
+        - Trash
+        - Backup, restore, copy, or Markdown
+        - Privacy, storage, or data reset
+        - Accessibility or language support
+        - Development or packaging
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this request.
+          required: true
+        - label: I removed private data from this request.
+          required: true

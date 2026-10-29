@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a problem. Do not attach a note backup or include private note text, credentials, or private page URLs. Follow the [security policy](https://github.com/Imanm02/LectureNote-ChormeExtension/blob/main/SECURITY.md) instead if the problem could expose data or code execution.
+        Thanks for reporting a problem. Do not attach a note backup or include private note text, credentials, or private page URLs. Follow the [security policy](https://github.com/Imanm02/LectureNote-ChromeExtension/blob/main/SECURITY.md) instead if the problem could expose data or code execution.
 
   - type: input
     id: version
@@ -22,7 +22,7 @@ body:
     attributes:
       label: Chrome version
       description: Copy the version from chrome://version.
-      placeholder: 141.0.0.0
+      placeholder: Copy the full version number
     validations:
       required: true
 
@@ -40,8 +40,30 @@ body:
       label: Installation method
       options:
         - Loaded unpacked from this repository
-        - Installed from a packaged ZIP
+        - Loaded unpacked from an extracted release ZIP
         - Installed from the Chrome Web Store
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - First-use data choice
+        - Toolbar or keyboard capture
+        - Selection context menu
+        - Quick capture popup
+        - Library or side panel
+        - Search, filters, or courses
+        - Note details or editing
+        - Selection and bulk actions
+        - Trash or permanent deletion
+        - Backup, restore, copy, or Markdown
+        - Storage meter or data reset
+        - Theme, RTL, or accessibility
+        - Packaging or development checks
         - Other
     validations:
       required: true
