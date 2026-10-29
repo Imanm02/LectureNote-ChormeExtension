@@ -3,10 +3,12 @@ import { addNote, LIMITS, normalizeSource, ValidationError } from "./model.js";
 import { MESSAGE_TYPES } from "./messages.js";
 import {
   clearPopupDraft,
+  loadPendingCaptures,
   loadPopupDraft,
   loadRecoveryInfo,
   loadState,
   mutateStateAndClearPopupDraft,
+  removePendingCapture,
   savePopupDraft,
   STORAGE_KEYS,
 } from "./storage.js";
@@ -32,6 +34,7 @@ function popupElements(documentValue) {
     sourceTitle: requiredElement(documentValue, "sourceTitle"),
     sourceLink: requiredElement(documentValue, "sourceLink"),
     useSelection: requiredElement(documentValue, "useSelectionButton"),
+    discardSelection: requiredElement(documentValue, "discardSelectionButton"),
     save: requiredElement(documentValue, "saveButton"),
     discard: requiredElement(documentValue, "discardButton"),
     duplicate: requiredElement(documentValue, "duplicateNotice"),
@@ -40,6 +43,10 @@ function popupElements(documentValue) {
     recentList: requiredElement(documentValue, "recentList"),
     recentEmpty: requiredElement(documentValue, "recentEmpty"),
     noteCount: requiredElement(documentValue, "noteCount"),
+    help: requiredElement(documentValue, "helpButton"),
+    helpPanel: requiredElement(documentValue, "helpPanel"),
+    closeHelp: requiredElement(documentValue, "closeHelpButton"),
+    openSidePanel: requiredElement(documentValue, "openSidePanelButton"),
   };
 }
 
@@ -48,6 +55,38 @@ function errorMessage(error) {
     return error.message;
   }
   return "The action could not be completed.";
+}
+
+export async function openLibraryBesidePage(chromeApi = chrome) {
+  const libraryUrl = typeof chromeApi.runtime?.getURL === "function"
+    ? chromeApi.runtime.getURL("notes.html")
+    : "notes.html";
+  let panelError = null;
+
+  if (typeof chromeApi.sidePanel?.open === "function") {
+    try {
+      await chromeApi.sidePanel.open({
+        windowId: chromeApi.windows?.WINDOW_ID_CURRENT ?? -2,
+      });
+      return { opened: "side-panel" };
+    } catch (error) {
+      panelError = error;
+    }
+  }
+
+  if (typeof chromeApi.tabs?.create === "function") {
+    try {
+      await chromeApi.tabs.create({ url: libraryUrl });
+      return { opened: "tab", panelError };
+    } catch (error) {
+      const detail = panelError
+        ? `${errorMessage(panelError)} ${errorMessage(error)}`
+        : errorMessage(error);
+      throw new Error(`The library could not be opened. ${detail}`, { cause: error });
+    }
+  }
+
+  throw panelError || new Error("The library could not be opened in this Chrome version.");
 }
 
 export async function initPopup({
@@ -62,6 +101,10 @@ export async function initPopup({
   const draftSessionId = crypto.randomUUID();
   let state;
   let currentSource = { title: "", url: "" };
+  let livePageCapture = null;
+  let pendingCaptures = [];
+  let pendingCapture = null;
+  let appliedPendingCaptureId = "";
   let pageCapture = null;
   let draftTimer = null;
   let draftQueue = Promise.resolve();
@@ -76,6 +119,27 @@ export async function initPopup({
   };
   let ready = false;
   let destroyed = false;
+  let helpSeen = false;
+
+  async function showHelp({ persist = true } = {}) {
+    elements.helpPanel.hidden = false;
+    elements.help.setAttribute("aria-expanded", "true");
+    if (!persist || helpSeen) {
+      return;
+    }
+    try {
+      await storage.set({ [STORAGE_KEYS.helpSeen]: true });
+      helpSeen = true;
+    } catch (error) {
+      setStatus(elements.status, `Help preference not saved: ${errorMessage(error)}`, "warning");
+    }
+  }
+
+  function hideHelp() {
+    elements.helpPanel.hidden = true;
+    elements.help.setAttribute("aria-expanded", "false");
+    elements.help.focus();
+  }
 
   function updateBodyCount() {
     elements.bodyCount.textContent = `${numberFormatter.format(elements.body.value.length)} / ${numberFormatter.format(LIMITS.body)}`;
@@ -87,6 +151,7 @@ export async function initPopup({
     elements.save.disabled = busy;
     elements.discard.disabled = busy || !hasDiscardableDraft;
     elements.useSelection.disabled = busy;
+    elements.discardSelection.disabled = busy;
     elements.saveCopy.disabled = busy;
   }
 
@@ -184,10 +249,12 @@ export async function initPopup({
 
   async function persistDraft() {
     if (destroyed || !ready || !draftDirty) {
-      return;
+      return false;
     }
     const generation = draftGeneration;
     const draft = formDraft();
+    const pendingCaptureId = appliedPendingCaptureId;
+    let saved = false;
     try {
       await enqueueDraftOperation(async () => {
         if (destroyed || !draftDirty || generation !== draftGeneration) {
@@ -209,12 +276,26 @@ export async function initPopup({
         if (draftDirty && generation === draftGeneration) {
           draftDirty = false;
         }
+        saved = true;
       });
     } catch (error) {
       if (draftDirty && generation === draftGeneration) {
         setStatus(elements.status, `Draft not saved: ${errorMessage(error)}`, "error");
       }
+      return false;
     }
+    if (saved && pendingCaptureId) {
+      try {
+        await consumePendingCapture(pendingCaptureId);
+      } catch (error) {
+        setStatus(
+          elements.status,
+          `Draft saved, but the captured selection remains queued: ${errorMessage(error)}`,
+          "warning",
+        );
+      }
+    }
+    return saved;
   }
 
   function scheduleDraftSave() {
@@ -223,6 +304,40 @@ export async function initPopup({
       draftTimer = null;
       void persistDraft();
     }, 150);
+  }
+
+  function updateCaptureActions({ offerSelection = false } = {}) {
+    elements.useSelection.textContent = pendingCapture
+      ? "Use captured selection"
+      : "Use page selection";
+    if (!pageCapture?.text) {
+      elements.useSelection.hidden = true;
+    } else if (offerSelection) {
+      elements.useSelection.hidden = false;
+    }
+    elements.discardSelection.hidden = !pendingCapture;
+  }
+
+  function setPendingCaptureList(captures, { offerSelection = false } = {}) {
+    pendingCaptures = Array.isArray(captures) ? captures : [];
+    pendingCapture = pendingCaptures[0] || null;
+    if (
+      appliedPendingCaptureId &&
+      !pendingCaptures.some((capture) => capture.id === appliedPendingCaptureId)
+    ) {
+      appliedPendingCaptureId = "";
+    }
+    pageCapture = pendingCapture || livePageCapture;
+    updateCaptureActions({ offerSelection });
+  }
+
+  async function consumePendingCapture(identifier, { offerSelection = true } = {}) {
+    const result = await removePendingCapture(identifier, storage);
+    if (appliedPendingCaptureId === identifier) {
+      appliedPendingCaptureId = "";
+    }
+    setPendingCaptureList(result.captures, { offerSelection });
+    return result.removed;
   }
 
   function fillFromCapture(capture) {
@@ -242,11 +357,12 @@ export async function initPopup({
   }
 
   function captureStatus(capture, context = "initial") {
+    const selectionName = capture.id ? "captured selection" : "page selection";
     if (capture.wasTruncated) {
       const prefix = context === "replaced"
-        ? "The page selection replaced the recovered draft."
+        ? `The ${selectionName} replaced the recovered draft.`
         : context === "reset"
-          ? "The draft was reset to the current page selection."
+          ? `The draft was reset to the ${selectionName}.`
           : "The selection was captured.";
       setStatus(
         elements.status,
@@ -254,14 +370,32 @@ export async function initPopup({
         "warning",
       );
     } else if (context === "replaced") {
-      setStatus(elements.status, "The page selection replaced the recovered draft.", "info");
+      setStatus(elements.status, `The ${selectionName} replaced the recovered draft.`, "info");
     } else if (context === "reset") {
-      setStatus(elements.status, "The draft was reset to the current page selection.", "success");
+      setStatus(elements.status, `The draft was reset to the ${selectionName}.`, "success");
     } else if (capture.text) {
       setStatus(elements.status, "Selection captured. Edit it before saving.", "success");
     } else {
       setStatus(elements.status, "No selected text found. You can type a note.", "info");
     }
+  }
+
+  function pendingCaptureStatus(prefix = "") {
+    if (!pendingCapture) {
+      return;
+    }
+    const count = pendingCaptures.length;
+    const waiting = count === 1
+      ? "A captured selection is waiting."
+      : `${numberFormatter.format(count)} captured selections are waiting.`;
+    const truncation = pendingCapture.wasTruncated
+      ? ` The first was limited to ${numberFormatter.format(LIMITS.body)} characters.`
+      : "";
+    setStatus(
+      elements.status,
+      `${prefix ? `${prefix} ` : ""}${waiting}${truncation} Use it or discard it.`,
+      pendingCapture.wasTruncated ? "warning" : "info",
+    );
   }
 
   function fillFromDraft(draft) {
@@ -290,11 +424,13 @@ export async function initPopup({
     updateBodyCount();
     hasDiscardableDraft = false;
     updateDiscardControl();
+    updateCaptureActions();
   }
 
   async function saveNote(allowDuplicate = false) {
     let focusTarget = null;
     const savedCourse = elements.course.value;
+    const pendingCaptureId = appliedPendingCaptureId;
     elements.duplicate.hidden = true;
     elements.body.removeAttribute("aria-invalid");
     setBusy(true);
@@ -332,12 +468,22 @@ export async function initPopup({
       const draftWarning = result.popupDraftCleared
         ? ""
         : "Note saved. A newer draft from another popup was kept.";
+      let pendingWarning = "";
+      if (pendingCaptureId) {
+        try {
+          await consumePendingCapture(pendingCaptureId);
+        } catch (error) {
+          pendingWarning =
+            `Note saved, but the captured selection remains queued: ${errorMessage(error)}`;
+        }
+      }
       prepareNextNote(savedCourse);
       renderRecentNotes();
       const successMessage = currentSource.url || currentSource.title
         ? "Note saved. Source kept for the next note."
         : "Note saved.";
-      setStatus(elements.status, draftWarning || successMessage, draftWarning ? "warning" : "success");
+      const warning = draftWarning || pendingWarning;
+      setStatus(elements.status, warning || successMessage, warning ? "warning" : "success");
       focusTarget = elements.body;
     } catch (error) {
       if (draftDirty) {
@@ -359,6 +505,41 @@ export async function initPopup({
     }
     focusTarget?.focus();
   }
+
+  elements.help.addEventListener("click", () => {
+    if (elements.helpPanel.hidden) {
+      void showHelp();
+      elements.helpPanel.focus({ preventScroll: true });
+    } else {
+      hideHelp();
+    }
+  });
+  elements.closeHelp.addEventListener("click", hideHelp);
+  elements.openSidePanel.addEventListener("click", async () => {
+    elements.openSidePanel.disabled = true;
+    try {
+      const result = await openLibraryBesidePage(chromeApi);
+      if (result.opened === "side-panel") {
+        setStatus(elements.status, "Library opened beside the page.", "success");
+      } else if (result.panelError) {
+        setStatus(
+          elements.status,
+          `Side panel unavailable: ${errorMessage(result.panelError)} Opened the library in a tab.`,
+          "warning",
+        );
+      } else {
+        setStatus(
+          elements.status,
+          "Side panel unavailable. Opened the library in a tab.",
+          "warning",
+        );
+      }
+    } catch (error) {
+      setStatus(elements.status, errorMessage(error), "error");
+    } finally {
+      elements.openSidePanel.disabled = false;
+    }
+  });
 
   elements.form.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -384,25 +565,90 @@ export async function initPopup({
     }
   });
   elements.saveCopy.addEventListener("click", () => void saveNote(true));
-  elements.useSelection.addEventListener("click", () => {
-    if (pageCapture) {
-      fillFromCapture(pageCapture);
-      draftDirty = true;
-      hasDiscardableDraft = true;
-      draftGeneration += 1;
-      scheduleDraftSave();
-      updateDiscardControl();
-      captureStatus(pageCapture, "replaced");
-      elements.title.focus();
+  elements.useSelection.addEventListener("click", async () => {
+    if (!pageCapture) {
+      return;
     }
+    const capture = pageCapture;
+    const pendingCaptureId = pendingCapture?.id === capture.id ? capture.id : "";
+    fillFromCapture(capture);
+    appliedPendingCaptureId = pendingCaptureId;
+    draftDirty = true;
+    hasDiscardableDraft = true;
+    draftGeneration += 1;
+    updateDiscardControl();
+    captureStatus(capture, "replaced");
+    if (pendingCaptureId) {
+      setBusy(true);
+      await persistDraft();
+      setBusy(false);
+      updateDiscardControl();
+    } else {
+      scheduleDraftSave();
+    }
+    elements.title.focus();
+  });
+  elements.discardSelection.addEventListener("click", async () => {
+    if (!pendingCapture) {
+      return;
+    }
+    const confirmReset = confirmDiscard || ((message) => documentValue.defaultView.confirm(message));
+    if (!confirmReset("Discard this captured selection? This cannot be undone.")) {
+      return;
+    }
+    const captureId = pendingCapture.id;
+    const wasApplied = appliedPendingCaptureId === captureId;
+    setBusy(true);
+    try {
+      await consumePendingCapture(captureId, { offerSelection: !wasApplied });
+      if (wasApplied) {
+        const currentDraftRecord = await loadPopupDraft(storage);
+        updateDraftCursor(currentDraftRecord);
+        draftGeneration = Math.max(draftGeneration, currentDraftRecord.contentGeneration);
+        draftDirty = false;
+        elements.form.reset();
+        if (currentDraftRecord.draft) {
+          fillFromDraft(currentDraftRecord.draft);
+          hasDiscardableDraft = true;
+          updateCaptureActions({ offerSelection: Boolean(pageCapture?.text) });
+        } else if (pendingCapture) {
+          appliedPendingCaptureId = pendingCapture.id;
+          fillFromCapture(pendingCapture);
+          hasDiscardableDraft = false;
+          updateCaptureActions();
+        } else if (livePageCapture) {
+          fillFromCapture(livePageCapture);
+          hasDiscardableDraft = false;
+          updateCaptureActions();
+        } else {
+          showSource({});
+          updateBodyCount();
+          hasDiscardableDraft = false;
+          elements.useSelection.hidden = true;
+          updateCaptureActions();
+        }
+      }
+      updateDiscardControl();
+      const message = pendingCapture
+        ? "Captured selection discarded. The next capture is ready."
+        : "Captured selection discarded.";
+      setStatus(elements.status, message, "success");
+    } catch (error) {
+      setStatus(elements.status, `Captured selection not discarded: ${errorMessage(error)}`, "error");
+    } finally {
+      setBusy(false);
+    }
+    elements.body.focus();
   });
   elements.discard.addEventListener("click", async () => {
     if (!hasDiscardableDraft) {
       return;
     }
     const confirmReset = confirmDiscard || ((message) => documentValue.defaultView.confirm(message));
-    const prompt = pageCapture
-      ? "Reset this draft to the current page selection?"
+    const prompt = pendingCapture
+      ? "Discard this unfinished draft and start with the captured selection?"
+      : pageCapture
+        ? "Reset this draft to the current page selection?"
       : "Discard this unfinished draft?";
     if (!confirmReset(prompt)) {
       return;
@@ -429,6 +675,7 @@ export async function initPopup({
       elements.form.reset();
       if (pageCapture) {
         fillFromCapture(pageCapture);
+        appliedPendingCaptureId = pendingCapture?.id === pageCapture.id ? pageCapture.id : "";
       } else {
         showSource({});
         updateBodyCount();
@@ -453,13 +700,29 @@ export async function initPopup({
   });
 
   const storageChangeHandler = async (changes, areaName) => {
-    if (areaName !== "local" || !changes[STORAGE_KEYS.state] || destroyed) {
+    if (
+      areaName !== "local" ||
+      destroyed ||
+      (!changes[STORAGE_KEYS.state] && !changes[STORAGE_KEYS.pendingCaptures])
+    ) {
       return;
     }
     try {
-      state = await loadState(storage);
-      applyTheme(state.settings.theme, documentValue);
-      renderRecentNotes();
+      if (changes[STORAGE_KEYS.state]) {
+        state = await loadState(storage);
+        applyTheme(state.settings.theme, documentValue);
+        renderRecentNotes();
+      }
+      if (changes[STORAGE_KEYS.pendingCaptures]) {
+        const captures = await loadPendingCaptures(storage);
+        const offerSelection = Boolean(
+          captures[0] && captures[0].id !== appliedPendingCaptureId,
+        );
+        setPendingCaptureList(captures, { offerSelection });
+        if (captures[0] && !appliedPendingCaptureId) {
+          pendingCaptureStatus();
+        }
+      }
     } catch (error) {
       setStatus(elements.status, errorMessage(error), "error");
     }
@@ -472,10 +735,12 @@ export async function initPopup({
     const capturePromise = captureActivePage(chromeApi).catch((error) => error);
     state = await loadState(storage);
     applyTheme(state.settings.theme, documentValue);
-    const [draftRecord, capture, recovery] = await Promise.all([
+    const [draftRecord, capture, recovery, helpPreference, queuedCaptures] = await Promise.all([
       loadPopupDraft(storage),
       capturePromise,
       loadRecoveryInfo(storage),
+      storage.get(STORAGE_KEYS.helpSeen),
+      loadPendingCaptures(storage),
     ]);
     const draft = draftRecord.draft;
     updateDraftCursor(draftRecord);
@@ -483,15 +748,23 @@ export async function initPopup({
     renderRecentNotes();
 
     if (!(capture instanceof Error)) {
-      pageCapture = capture;
+      livePageCapture = capture;
     }
+    setPendingCaptureList(queuedCaptures);
     if (draft) {
       fillFromDraft(draft);
       hasDiscardableDraft = true;
       elements.useSelection.hidden = !pageCapture?.text;
-      setStatus(elements.status, "Recovered an unfinished draft.", "success");
+      updateCaptureActions();
+      if (pendingCapture) {
+        pendingCaptureStatus("Recovered an unfinished draft.");
+      } else {
+        setStatus(elements.status, "Recovered an unfinished draft.", "success");
+      }
     } else if (pageCapture) {
+      appliedPendingCaptureId = pendingCapture?.id === pageCapture.id ? pageCapture.id : "";
       fillFromCapture(pageCapture);
+      updateCaptureActions();
       captureStatus(pageCapture);
     } else {
       showSource({});
@@ -508,6 +781,11 @@ export async function initPopup({
 
     ready = true;
     loadSucceeded = true;
+
+    helpSeen = helpPreference[STORAGE_KEYS.helpSeen] === true;
+    if (!helpSeen) {
+      await showHelp();
+    }
 
   } catch (error) {
     setStatus(elements.status, `Notes could not be loaded: ${errorMessage(error)}`, "error");
@@ -529,6 +807,7 @@ export async function initPopup({
     const contentGeneration = draftGeneration;
     const expectedOwnerSessionId = draftCursor.ownerSessionId;
     const expectedGeneration = draftCursor.generation;
+    const pendingCaptureId = appliedPendingCaptureId;
     draftDirty = false;
     const saveDirectly = async () => {
       const result = await savePopupDraft(draft, storage, {
@@ -542,6 +821,9 @@ export async function initPopup({
         result.record.contentGeneration >= draftCursor.contentGeneration
       ) {
         updateDraftCursor(result.record);
+        if (pendingCaptureId) {
+          await removePendingCapture(pendingCaptureId, storage);
+        }
       }
     };
     let operation;
@@ -554,6 +836,7 @@ export async function initPopup({
           expectedOwnerSessionId,
           expectedGeneration,
           contentGeneration,
+          pendingCaptureId,
         })
         .then((response) => {
           if (!response?.ok) {

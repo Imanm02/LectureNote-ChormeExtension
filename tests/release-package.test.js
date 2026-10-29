@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -9,6 +16,7 @@ import {
   buildStoredZip,
   checksumFileContents,
   crc32,
+  getExtensionPackageFiles,
   projectRoot,
   readStoredZip,
   sha256,
@@ -49,6 +57,32 @@ test("release package includes the extension pages and privacy notice", () => {
     "LICENSE",
   ]) {
     assert.ok(release.files.includes(name), `Release package is missing ${name}`);
+  }
+});
+
+test("release discovery starts from the side-panel manifest page", () => {
+  const root = mkdtempSync(join(tmpdir(), "lecture-notes-package-"));
+  try {
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "package.json"), '{"version":"1.0.0"}');
+    writeFileSync(
+      join(root, "manifest.json"),
+      JSON.stringify({
+        version: "1.0.0",
+        background: { service_worker: "src/background.js" },
+        side_panel: { default_path: "panel.html" },
+      }),
+    );
+    writeFileSync(join(root, "src", "background.js"), "");
+    writeFileSync(join(root, "panel.html"), '<link rel="stylesheet" href="panel.css">');
+    writeFileSync(join(root, "panel.css"), "body { color: black; }");
+
+    const files = getExtensionPackageFiles(root);
+
+    assert.ok(files.includes("panel.html"));
+    assert.ok(files.includes("panel.css"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

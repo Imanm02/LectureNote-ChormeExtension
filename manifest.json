@@ -3,9 +3,9 @@
   "name": "Lecture Notes",
   "short_name": "Lecture Notes",
   "version": "2.0.0",
-  "minimum_chrome_version": "114",
+  "minimum_chrome_version": "116",
   "description": "Capture selected text and keep searchable lecture notes in local Chrome storage.",
-  "permissions": ["activeTab", "scripting", "storage"],
+  "permissions": ["activeTab", "contextMenus", "scripting", "sidePanel", "storage"],
   "background": {
     "service_worker": "src/background.js",
     "type": "module"
@@ -19,6 +19,9 @@
       "48": "Images/icon48.png",
       "128": "Images/icon128.png"
     }
+  },
+  "side_panel": {
+    "default_path": "notes.html"
   },
   "icons": {
     "16": "Images/icon16.png",

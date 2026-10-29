@@ -16,20 +16,53 @@
           <h1>Quick capture</h1>
         </div>
       </div>
-      <a class="button button-secondary compact" href="notes.html" target="_blank">Open library</a>
+      <div class="popup-header-actions">
+        <button
+          id="helpButton"
+          class="button button-quiet compact"
+          type="button"
+          aria-expanded="false"
+          aria-controls="helpPanel"
+        >Help</button>
+        <a class="button button-secondary compact" href="notes.html" target="_blank">Library</a>
+      </div>
     </header>
 
     <main>
+      <section id="helpPanel" class="help-card" aria-labelledby="helpHeading" tabindex="-1" hidden>
+        <div class="help-heading">
+          <h2 id="helpHeading">Capture your first note</h2>
+          <button id="closeHelpButton" class="button button-quiet compact" type="button">Close</button>
+        </div>
+        <ol>
+          <li>Select lecture text, then open Lecture Notes from the toolbar or right-click the selection.</li>
+          <li>Review the note and course, then save it. Ctrl or Command + Enter also saves.</li>
+          <li>Open the library to search, edit, restore, or export notes.</li>
+        </ol>
+        <p><strong>Shortcut not opening?</strong> Another extension may use it. Change it on Chrome's extension shortcuts page.</p>
+        <p>Chrome blocks toolbar capture on protected pages, including the Web Store. You can still type a note there.</p>
+        <p>Notes stay in this Chrome profile. Create JSON backups from the library so browser data loss does not remove your only copy.</p>
+      </section>
+
       <section class="source-card" aria-labelledby="sourceHeading">
         <div>
           <h2 id="sourceHeading">Current source</h2>
           <p id="sourceTitle" class="source-title" dir="auto">Checking the active page...</p>
           <a id="sourceLink" class="source-link" target="_blank" rel="noreferrer" hidden>Open source page</a>
         </div>
-        <button id="useSelectionButton" class="button button-quiet compact" type="button" hidden>
-          Use page selection
-        </button>
+        <div class="selection-actions">
+          <button id="useSelectionButton" class="button button-quiet compact" type="button" hidden>
+            Use page selection
+          </button>
+          <button id="discardSelectionButton" class="button button-quiet compact danger-text" type="button" hidden>
+            Discard captured selection
+          </button>
+        </div>
       </section>
+
+      <button id="openSidePanelButton" class="button button-secondary side-panel-button" type="button">
+        Open library beside this page
+      </button>
 
       <form id="noteForm" novalidate inert aria-busy="true">
         <div class="field">

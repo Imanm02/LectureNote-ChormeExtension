@@ -11,7 +11,7 @@ const readText = (path) => readFileSync(join(root, path), "utf8");
 const manifest = JSON.parse(readText("manifest.json"));
 const packageJson = JSON.parse(readText("package.json"));
 const packageLock = JSON.parse(readText("package-lock.json"));
-const expectedPermissions = ["activeTab", "scripting", "storage"];
+const expectedPermissions = ["activeTab", "contextMenus", "scripting", "sidePanel", "storage"];
 const expectedCommand = {
   suggested_key: {
     default: "Ctrl+Shift+Y",
@@ -29,7 +29,7 @@ assert.deepEqual(
   packageJson.devDependencies,
   "Lockfile development dependencies do not match package.json",
 );
-assert.equal(manifest.minimum_chrome_version, "114", "Chrome 114 or newer is required");
+assert.equal(manifest.minimum_chrome_version, "116", "Chrome 116 or newer is required");
 assert.ok(manifest.name?.trim(), "Manifest name is required");
 assert.ok(manifest.description?.trim(), "Manifest description is required");
 assert.ok(manifest.description.length <= 132, "Manifest description is too long");
@@ -49,6 +49,7 @@ assert.deepEqual(manifest.background, {
   type: "module",
 });
 assert.equal(manifest.action.default_popup, "popup.html");
+assert.deepEqual(manifest.side_panel, { default_path: "notes.html" });
 assert.deepEqual(manifest.commands, { _execute_action: expectedCommand });
 
 function listFiles(directory) {
@@ -108,8 +109,9 @@ for (const [size, path] of Object.entries(manifest.action.default_icon)) {
 }
 validateManifestResource(manifest.background.service_worker);
 validateManifestResource(manifest.action.default_popup);
+validateManifestResource(manifest.side_panel.default_path);
 
-const htmlFiles = [manifest.action.default_popup, "notes.html"];
+const htmlFiles = [...new Set([manifest.action.default_popup, manifest.side_panel.default_path])];
 const extensionScripts = new Set([manifest.background.service_worker]);
 const extensionStyles = new Set();
 for (const htmlFile of htmlFiles) {

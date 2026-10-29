@@ -119,6 +119,7 @@ export function getExtensionPackageFiles(root = projectRoot) {
   const manifestResources = [
     manifest.background?.service_worker,
     manifest.action?.default_popup,
+    manifest.side_panel?.default_path,
     ...Object.values(manifest.icons || {}),
     ...Object.values(manifest.action?.default_icon || {}),
   ].filter(Boolean);

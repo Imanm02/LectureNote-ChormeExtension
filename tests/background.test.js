@@ -1,10 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { handleDraftMessage, isAuthorizedDraftMessage } from "../src/background.js";
+import {
+  CAPTURE_CONTEXT_MENU_ID,
+  captureContextSelection,
+  ensureCaptureContextMenu,
+  handleContextMenuClick,
+  handleDraftMessage,
+  isAuthorizedDraftMessage,
+  normalizeContextSelection,
+  openCaptureSurface,
+} from "../src/background.js";
 import { MESSAGE_TYPES } from "../src/messages.js";
 import { LIMITS } from "../src/model.js";
-import { loadDraft, loadEditorDraft } from "../src/storage.js";
+import {
+  loadDraft,
+  loadEditorDraft,
+  loadPendingCaptures,
+  STORAGE_KEYS,
+} from "../src/storage.js";
 import { memoryStorage } from "./helpers.js";
 
 const RUNTIME_ID = "abcdefghijklmnopabcdefghijklmnop";
@@ -181,4 +195,452 @@ test("rejects unknown internal message types", async () => {
     await handleDraftMessage(message, { id: RUNTIME_ID }, storage, RUNTIME_ID),
     { handled: false },
   );
+});
+
+test("recreates only the selection menu and serializes registrations", async () => {
+  const calls = [];
+  let activeOperations = 0;
+  let maximumActiveOperations = 0;
+  const contextMenus = {
+    async remove(identifier) {
+      activeOperations += 1;
+      maximumActiveOperations = Math.max(maximumActiveOperations, activeOperations);
+      calls.push(["remove", identifier]);
+      await Promise.resolve();
+      activeOperations -= 1;
+    },
+    async create(options) {
+      activeOperations += 1;
+      maximumActiveOperations = Math.max(maximumActiveOperations, activeOperations);
+      calls.push(["create", options]);
+      await Promise.resolve();
+      activeOperations -= 1;
+    },
+  };
+
+  await Promise.all([
+    ensureCaptureContextMenu(contextMenus, {}),
+    ensureCaptureContextMenu(contextMenus, {}),
+  ]);
+
+  assert.deepEqual(calls, [
+    ["remove", CAPTURE_CONTEXT_MENU_ID],
+    [
+      "create",
+      {
+        id: CAPTURE_CONTEXT_MENU_ID,
+        title: "Capture selection in Lecture Notes",
+        contexts: ["selection"],
+      },
+    ],
+    ["remove", CAPTURE_CONTEXT_MENU_ID],
+    [
+      "create",
+      {
+        id: CAPTURE_CONTEXT_MENU_ID,
+        title: "Capture selection in Lecture Notes",
+        contexts: ["selection"],
+      },
+    ],
+  ]);
+  assert.equal(maximumActiveOperations, 1);
+});
+
+test("reports context-menu registration failures", async () => {
+  const runtime = {};
+  let createdAfterMissingRemoval = false;
+  await ensureCaptureContextMenu(
+    {
+      remove(_identifier, callback) {
+        runtime.lastError = { message: "Cannot find menu item with this ID" };
+        callback();
+        delete runtime.lastError;
+      },
+      create(_options, callback) {
+        createdAfterMissingRemoval = true;
+        callback();
+      },
+    },
+    runtime,
+  );
+  assert.equal(createdAfterMissingRemoval, true);
+
+  await assert.rejects(
+    () =>
+      ensureCaptureContextMenu(
+        {
+          remove(_identifier, callback) {
+            runtime.lastError = { message: "Menu removal failed" };
+            callback();
+            delete runtime.lastError;
+          },
+        },
+        runtime,
+      ),
+    /Menu removal failed/u,
+  );
+
+  await assert.rejects(
+    () =>
+      ensureCaptureContextMenu(
+        {
+          remove() {
+            return Promise.resolve();
+          },
+          create() {
+            return Promise.reject(new Error("Menu creation failed"));
+          },
+        },
+        {},
+      ),
+    /Menu creation failed/u,
+  );
+
+  await assert.rejects(
+    () =>
+      ensureCaptureContextMenu(
+        {
+          remove() {
+            throw new Error("Menu API unavailable");
+          },
+        },
+        {},
+      ),
+    /Menu API unavailable/u,
+  );
+});
+
+test("normalizes selected text without splitting Unicode", () => {
+  assert.deepEqual(normalizeContextSelection("\u202e line one\r\nline two\u{10348} ", 18), {
+    text: "line one\nline two",
+    wasTruncated: true,
+  });
+  assert.deepEqual(normalizeContextSelection("a\u{10348}", 2), {
+    text: "a",
+    wasTruncated: true,
+  });
+  assert.deepEqual(normalizeContextSelection(null), {
+    text: "",
+    wasTruncated: false,
+  });
+});
+
+test("queues a normalized context-menu capture", async () => {
+  const storage = memoryStorage();
+  const result = await captureContextSelection(
+    {
+      selectionText: "  تعریف گراف\r\nG = (V, E)  ",
+      pageUrl: "https://example.com/lecture?token=secret&week=2#section",
+    },
+    { title: "T".repeat(LIMITS.sourceTitle + 20) },
+    storage,
+    () => "context-menu-test",
+  );
+
+  assert.equal(result.saved, true);
+  assert.equal(result.reason, "queued");
+  assert.equal(result.queueLength, 1);
+  assert.equal(result.capture.id, "context-menu-test");
+  assert.equal(result.capture.text, "تعریف گراف\nG = (V, E)");
+  assert.equal(result.capture.title.length, LIMITS.title);
+  assert.equal(result.capture.url, "https://example.com/lecture?week=2");
+  assert.deepEqual(await loadPendingCaptures(storage), [result.capture]);
+});
+
+test("ignores an empty context-menu selection", async () => {
+  const storage = memoryStorage();
+  const result = await captureContextSelection(
+    { selectionText: "\u202e\u0000  " },
+    {},
+    storage,
+    () => "unused-session",
+  );
+
+  assert.deepEqual(result, {
+    saved: false,
+    reason: "empty-selection",
+    wasTruncated: false,
+  });
+  assert.equal(await loadDraft(storage), null);
+  assert.deepEqual(await loadPendingCaptures(storage), []);
+});
+
+test("keeps an existing popup draft byte-for-byte while queuing a capture", async () => {
+  const existingDraft = {
+    version: 1,
+    ownerSessionId: "newer-popup",
+    generation: 4,
+    contentGeneration: 7,
+    draft: {
+      sessionId: "newer-popup",
+      noteId: null,
+      baseRevision: 3,
+      baseUpdatedAt: "",
+      title: "Unfinished lecture",
+      body: "Keep the newer draft",
+      course: "CS 101",
+      source: { title: "Original source", url: "https://example.com/original" },
+      updatedAt: "2026-10-29T12:00:00.000Z",
+    },
+  };
+  const storage = memoryStorage({ [STORAGE_KEYS.draft]: existingDraft });
+  const before = structuredClone(storage.values[STORAGE_KEYS.draft]);
+
+  const result = await captureContextSelection(
+    { selectionText: "New selected text", pageUrl: "https://example.com" },
+    { title: "Lecture" },
+    storage,
+    () => "context-menu-new",
+  );
+
+  assert.equal(result.saved, true);
+  assert.deepEqual(storage.values[STORAGE_KEYS.draft], before);
+  assert.equal((await loadDraft(storage)).body, "Keep the newer draft");
+  assert.equal((await loadPendingCaptures(storage))[0].text, "New selected text");
+});
+
+test("keeps context-menu truncation metadata in the queue", async () => {
+  const storage = memoryStorage();
+  const result = await captureContextSelection(
+    { selectionText: "x".repeat(LIMITS.body + 10), pageUrl: "https://example.com" },
+    { title: "Large lecture" },
+    storage,
+    () => "context-menu-large",
+  );
+
+  assert.equal(result.wasTruncated, true);
+  const [capture] = await loadPendingCaptures(storage);
+  assert.equal(capture.text.length, LIMITS.body);
+  assert.equal(capture.wasTruncated, true);
+});
+
+test("opens a captured draft in a tab when a popup window fails", async () => {
+  const createdTabs = [];
+  const opened = await openCaptureSurface({
+    runtime: { getURL: (path) => `chrome-extension://test/${path}` },
+    windows: {
+      async create() {
+        throw new Error("Popups blocked");
+      },
+    },
+    tabs: {
+      async create(options) {
+        createdTabs.push(options);
+      },
+    },
+  });
+
+  assert.equal(opened, "tab");
+  assert.deepEqual(createdTabs, [{ url: "chrome-extension://test/popup.html" }]);
+});
+
+test("opens a captured draft in a popup window when allowed", async () => {
+  const createdWindows = [];
+  const opened = await openCaptureSurface({
+    runtime: { getURL: (path) => `chrome-extension://test/${path}` },
+    windows: {
+      async create(options) {
+        createdWindows.push(options);
+      },
+    },
+  });
+
+  assert.equal(opened, "popup-window");
+  assert.deepEqual(createdWindows, [
+    {
+      url: "chrome-extension://test/popup.html",
+      type: "popup",
+      width: 430,
+      height: 650,
+      focused: true,
+    },
+  ]);
+});
+
+test("reports when neither capture editor surface can open", async () => {
+  await assert.rejects(
+    () =>
+      openCaptureSurface({
+        runtime: { getURL: () => "chrome-extension://test/popup.html" },
+        windows: {
+          async create() {
+            throw new Error("Window failed");
+          },
+        },
+        tabs: {
+          async create() {
+            throw new Error("Tab failed");
+          },
+        },
+      }),
+    /Window failed\. Tab failed/u,
+  );
+
+  await assert.rejects(
+    () =>
+      openCaptureSurface({
+        runtime: { getURL: () => "chrome-extension://test/popup.html" },
+      }),
+    /editor could not open/u,
+  );
+});
+
+test("handles only the Lecture Notes capture menu item", async () => {
+  assert.deepEqual(
+    await handleContextMenuClick({ menuItemId: "another-item" }, {}, {}),
+    { handled: false },
+  );
+
+  const storage = memoryStorage();
+  const createdWindows = [];
+  const result = await handleContextMenuClick(
+    {
+      menuItemId: CAPTURE_CONTEXT_MENU_ID,
+      selectionText: "Selected theorem",
+      pageUrl: "https://example.com/week-3",
+    },
+    { title: "Week 3" },
+    {
+      storage: { local: storage },
+      runtime: { getURL: (path) => `chrome-extension://test/${path}` },
+      windows: {
+        async create(options) {
+          createdWindows.push(options);
+        },
+      },
+    },
+  );
+
+  assert.equal(result.handled, true);
+  assert.equal(result.capture.saved, true);
+  assert.equal(result.surface, "popup-window");
+  assert.equal(createdWindows[0].url, "chrome-extension://test/popup.html");
+  assert.equal(await loadDraft(storage), null);
+  assert.equal((await loadPendingCaptures(storage))[0].text, "Selected theorem");
+});
+
+test("does not open an editor for an empty context-menu selection", async () => {
+  let opened = false;
+  const result = await handleContextMenuClick(
+    {
+      menuItemId: CAPTURE_CONTEXT_MENU_ID,
+      selectionText: "   ",
+    },
+    {},
+    {
+      storage: { local: memoryStorage() },
+      runtime: { getURL: () => "chrome-extension://test/popup.html" },
+      windows: {
+        async create() {
+          opened = true;
+        },
+      },
+    },
+  );
+
+  assert.equal(result.handled, true);
+  assert.equal(result.capture.saved, false);
+  assert.equal(result.surface, null);
+  assert.equal(opened, false);
+});
+
+test("does not open an editor when a context capture cannot be queued", async () => {
+  const storage = memoryStorage();
+  storage.set = async () => {
+    throw new Error("Storage unavailable");
+  };
+  let opened = false;
+
+  await assert.rejects(
+    () =>
+      handleContextMenuClick(
+        {
+          menuItemId: CAPTURE_CONTEXT_MENU_ID,
+          selectionText: "Keep this selection",
+        },
+        {},
+        {
+          storage: { local: storage },
+          runtime: { getURL: () => "chrome-extension://test/popup.html" },
+          windows: {
+            async create() {
+              opened = true;
+            },
+          },
+        },
+      ),
+    /Storage unavailable/u,
+  );
+  assert.equal(opened, false);
+});
+
+test("removes a queued capture only after its handed-off draft is saved", async () => {
+  const storage = memoryStorage();
+  await captureContextSelection(
+    { selectionText: "Queued selection" },
+    {},
+    storage,
+    () => "capture-handoff",
+  );
+  const message = {
+    type: MESSAGE_TYPES.saveDraft,
+    sessionId: "popup-session",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 1,
+    pendingCaptureId: "capture-handoff",
+    draft: { body: "Queued selection", sessionId: "popup-session" },
+  };
+
+  const result = await handleDraftMessage(
+    message,
+    { id: RUNTIME_ID },
+    storage,
+    RUNTIME_ID,
+  );
+
+  assert.equal(result.saved, true);
+  assert.equal((await loadDraft(storage)).body, "Queued selection");
+  assert.deepEqual(await loadPendingCaptures(storage), []);
+});
+
+test("keeps a queued capture when its handed-off draft loses a conflict", async () => {
+  const storage = memoryStorage();
+  await captureContextSelection(
+    { selectionText: "Queued selection" },
+    {},
+    storage,
+    () => "capture-conflict",
+  );
+  await handleDraftMessage(
+    {
+      type: MESSAGE_TYPES.saveDraft,
+      sessionId: "other-popup",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 2,
+      draft: { body: "Newer draft", sessionId: "other-popup" },
+    },
+    { id: RUNTIME_ID },
+    storage,
+    RUNTIME_ID,
+  );
+
+  const result = await handleDraftMessage(
+    {
+      type: MESSAGE_TYPES.saveDraft,
+      sessionId: "stale-popup",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      pendingCaptureId: "capture-conflict",
+      draft: { body: "Queued selection", sessionId: "stale-popup" },
+    },
+    { id: RUNTIME_ID },
+    storage,
+    RUNTIME_ID,
+  );
+
+  assert.equal(result.saved, false);
+  assert.equal((await loadPendingCaptures(storage))[0].id, "capture-conflict");
 });
