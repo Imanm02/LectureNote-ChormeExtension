@@ -10,10 +10,12 @@ import {
   normalizeSource,
 } from "../src/model.js";
 import {
+  acknowledgeRecovery,
   assertStateFits,
   clearDraft,
   loadDraft,
   loadRecoveryInfo,
+  loadRecoveryNotice,
   loadState,
   mutateState,
   saveDraft,
@@ -161,6 +163,35 @@ test("converts old recovery records to counts without retaining raw data", async
     rejectedDrafts: 1,
   });
   assert.doesNotMatch(JSON.stringify(storage.values), /Private rejected/u);
+});
+
+test("acknowledges only the recovery notice that was reviewed", async () => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.recovery]: {
+      createdAt: NOW,
+      rejectedNotes: 1,
+      rejectedDrafts: 0,
+    },
+  });
+  const lockManager = trackingLockManager();
+  const reviewed = await loadRecoveryNotice(storage, { lockManager });
+
+  storage.values[STORAGE_KEYS.recovery] = {
+    createdAt: "2026-09-20T11:00:00.000Z",
+    rejectedNotes: 1,
+    rejectedDrafts: 0,
+  };
+  const conflicted = await acknowledgeRecovery(reviewed, storage, { lockManager });
+
+  assert.equal(conflicted.acknowledged, false);
+  assert.equal(conflicted.recovery.createdAt, "2026-09-20T11:00:00.000Z");
+  assert.deepEqual(storage.values[STORAGE_KEYS.recovery], conflicted.recovery);
+
+  const acknowledged = await acknowledgeRecovery(conflicted.recovery, storage, { lockManager });
+  assert.equal(acknowledged.acknowledged, true);
+  assert.equal(STORAGE_KEYS.recovery in storage.values, false);
+  assert.equal(new Set(lockManager.names).size, 1);
+  assert.equal(lockManager.maximumActive, 1);
 });
 
 test("rejects strict invalid URLs and redacts captured source details", () => {

@@ -5,14 +5,18 @@ import {
   clearEditorDraft,
   clearDraft,
   clearPopupDraft,
+  enqueuePendingCapture,
   loadEditorDraft,
   loadDraft,
   loadPopupDraft,
+  loadPendingCaptures,
   loadRecoveryInfo,
   loadState,
   mutateState,
   mutateStateAndClearEditorDraft,
   mutateStateAndClearPopupDraft,
+  MAX_PENDING_CAPTURES,
+  removePendingCapture,
   saveEditorDraft,
   saveDraft,
   savePopupDraft,
@@ -67,6 +71,78 @@ function editorDraft(body = "Unfinished graph note") {
     source: { title: "Course page", url: "https://" },
   };
 }
+
+test("queues rapid context captures without replacing either one", async () => {
+  const storage = memoryStorage();
+  await Promise.all([
+    enqueuePendingCapture(
+      {
+        title: "First lecture",
+        text: "First selection",
+        url: "https://example.com/first?token=secret&week=1",
+      },
+      storage,
+      { lockManager: null, idFactory: () => "capture-first", now: NOW },
+    ),
+    enqueuePendingCapture(
+      {
+        title: "Second lecture",
+        text: "Second selection",
+        url: "https://example.com/second",
+        wasTruncated: true,
+      },
+      storage,
+      { lockManager: null, idFactory: () => "capture-second", now: NOW },
+    ),
+  ]);
+
+  const captures = await loadPendingCaptures(storage, { lockManager: null, now: NOW });
+  assert.deepEqual(captures.map((capture) => capture.id), ["capture-first", "capture-second"]);
+  assert.equal(captures[0].url, "https://example.com/first?week=1");
+  assert.equal(captures[1].wasTruncated, true);
+
+  const removed = await removePendingCapture("capture-first", storage, { lockManager: null });
+  assert.equal(removed.removed, true);
+  assert.deepEqual(removed.captures.map((capture) => capture.id), ["capture-second"]);
+
+  const missing = await removePendingCapture("capture-missing", storage, { lockManager: null });
+  assert.equal(missing.removed, false);
+  assert.deepEqual(missing.captures.map((capture) => capture.id), ["capture-second"]);
+
+  await assert.rejects(
+    () =>
+      enqueuePendingCapture(
+        { id: "capture-second", text: "Duplicate capture" },
+        storage,
+        { lockManager: null, now: NOW },
+      ),
+    { code: "pending-capture-duplicate" },
+  );
+});
+
+test("rejects a full pending capture queue without dropping stored captures", async () => {
+  const storage = memoryStorage();
+  for (let index = 0; index < MAX_PENDING_CAPTURES; index += 1) {
+    await enqueuePendingCapture(
+      { id: `capture-${index}`, text: `Selection ${index}` },
+      storage,
+      { lockManager: null, now: NOW },
+    );
+  }
+
+  await assert.rejects(
+    () =>
+      enqueuePendingCapture(
+        { id: "capture-overflow", text: "Do not replace anything" },
+        storage,
+        { lockManager: null, now: NOW },
+      ),
+    { code: "pending-capture-full" },
+  );
+  const captures = await loadPendingCaptures(storage, { lockManager: null, now: NOW });
+  assert.equal(captures.length, MAX_PENDING_CAPTURES);
+  assert.equal(captures.some((capture) => capture.id === "capture-overflow"), false);
+});
 
 test("initializes an empty versioned state", async () => {
   const storage = memoryStorage();

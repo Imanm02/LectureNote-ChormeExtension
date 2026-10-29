@@ -14,7 +14,9 @@ export const STORAGE_KEYS = Object.freeze({
   state: "lectureNoteState",
   draft: "lectureNoteDraft",
   editorDraft: "lectureNoteEditorDraft",
+  pendingCaptures: "lectureNotePendingCaptures",
   recovery: "lectureNoteRecovery",
+  helpSeen: "lectureNoteHelpSeen",
   legacyResult: "result",
   legacySelection: "selectedText",
 });
@@ -22,6 +24,8 @@ export const STORAGE_KEYS = Object.freeze({
 const STATE_LOCK = "lecture-note-state";
 const POPUP_DRAFT_VERSION = 1;
 const EDITOR_DRAFT_VERSION = 1;
+const PENDING_CAPTURE_VERSION = 1;
+export const MAX_PENDING_CAPTURES = 10;
 let localMutationQueue = Promise.resolve();
 
 function getStorage(storage) {
@@ -147,6 +151,75 @@ function samePopupDraftContent(left, right) {
   void leftUpdatedAt;
   void rightUpdatedAt;
   return sameData(leftContent, rightContent);
+}
+
+function emptyPendingCaptureRecord() {
+  return {
+    version: PENDING_CAPTURE_VERSION,
+    captures: [],
+  };
+}
+
+function normalizePendingCapture(value, options = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ValidationError("A pending capture is invalid.", "pending-capture-type");
+  }
+  if (!isValidIdentifier(value.id)) {
+    throw new ValidationError("A pending capture ID is invalid.", "pending-capture-id");
+  }
+  const draft = normalizeDraft(
+    {
+      title: value.title,
+      body: value.text,
+      course: "",
+      source: { title: value.title, url: value.url },
+      updatedAt: value.createdAt,
+    },
+    options,
+  );
+  if (!draft?.body) {
+    throw new ValidationError("A pending capture has no note text.", "pending-capture-empty");
+  }
+  return {
+    id: value.id,
+    title: draft.title,
+    text: draft.body,
+    url: draft.source.url,
+    wasTruncated: value.wasTruncated === true,
+    createdAt: draft.updatedAt,
+  };
+}
+
+function normalizePendingCaptureRecord(value, options = {}) {
+  if (value === undefined || value === null) {
+    return emptyPendingCaptureRecord();
+  }
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.version !== PENDING_CAPTURE_VERSION ||
+    !Array.isArray(value.captures)
+  ) {
+    throw new ValidationError(
+      "The pending capture queue is invalid.",
+      "pending-capture-record",
+    );
+  }
+  if (value.captures.length > MAX_PENDING_CAPTURES) {
+    throw new ValidationError(
+      "The pending capture queue contains too many items.",
+      "pending-capture-limit",
+    );
+  }
+  const captures = value.captures.map((capture) => normalizePendingCapture(capture, options));
+  if (new Set(captures.map((capture) => capture.id)).size !== captures.length) {
+    throw new ValidationError(
+      "The pending capture queue contains duplicate IDs.",
+      "pending-capture-duplicate",
+    );
+  }
+  return { version: PENDING_CAPTURE_VERSION, captures };
 }
 
 function emptyEditorDraftRecord() {
@@ -452,6 +525,97 @@ export async function mutateState(
       return { ...result, state: saved };
     }
     return saved;
+  }, lockManager);
+}
+
+async function loadPendingCapturesUnlocked(area, options = {}) {
+  const stored = await area.get(STORAGE_KEYS.pendingCaptures);
+  const rawRecord = stored[STORAGE_KEYS.pendingCaptures];
+  const record = normalizePendingCaptureRecord(rawRecord, options);
+  if (rawRecord !== undefined && !sameData(rawRecord, record)) {
+    await area.set({ [STORAGE_KEYS.pendingCaptures]: record });
+  }
+  return record;
+}
+
+export async function loadPendingCaptures(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  const record = await withStateLock(
+    () => loadPendingCapturesUnlocked(area, options),
+    lockManager,
+  );
+  return record.captures;
+}
+
+export async function enqueuePendingCapture(
+  value,
+  storage = chrome.storage.local,
+  {
+    lockManager = globalThis.navigator?.locks,
+    idFactory = () => crypto.randomUUID(),
+    now = new Date().toISOString(),
+    ...options
+  } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    const current = await loadPendingCapturesUnlocked(area, { ...options, now });
+    if (current.captures.length >= MAX_PENDING_CAPTURES) {
+      throw new ValidationError(
+        `Finish or discard a captured selection before adding more than ${MAX_PENDING_CAPTURES}.`,
+        "pending-capture-full",
+      );
+    }
+    const capture = normalizePendingCapture(
+      {
+        ...value,
+        id: value?.id || idFactory(),
+        createdAt: value?.createdAt || now,
+      },
+      { ...options, now },
+    );
+    if (current.captures.some((item) => item.id === capture.id)) {
+      throw new ValidationError(
+        "A pending capture with this ID already exists.",
+        "pending-capture-duplicate",
+      );
+    }
+    const captures = [...current.captures, capture];
+    await area.set({
+      [STORAGE_KEYS.pendingCaptures]: {
+        version: PENDING_CAPTURE_VERSION,
+        captures,
+      },
+    });
+    return { capture, captures };
+  }, lockManager);
+}
+
+export async function removePendingCapture(
+  identifier,
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  if (!isValidIdentifier(identifier)) {
+    throw new ValidationError("The pending capture ID is invalid.", "pending-capture-id");
+  }
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    const current = await loadPendingCapturesUnlocked(area, options);
+    const captures = current.captures.filter((capture) => capture.id !== identifier);
+    const removed = captures.length !== current.captures.length;
+    if (removed) {
+      await area.set({
+        [STORAGE_KEYS.pendingCaptures]: {
+          version: PENDING_CAPTURE_VERSION,
+          captures,
+        },
+      });
+    }
+    return { removed, captures };
   }, lockManager);
 }
 
@@ -866,12 +1030,50 @@ export async function mutateStateAndClearEditorDraft(
   }, lockManager);
 }
 
-export async function loadRecoveryInfo(storage = chrome.storage.local) {
+function emptyRecoveryNotice() {
+  return { createdAt: "", rejectedNotes: 0, rejectedDrafts: 0 };
+}
+
+export async function loadRecoveryNotice(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks } = {},
+) {
   const area = getStorage(storage);
-  const stored = await area.get(STORAGE_KEYS.recovery);
-  const recovery = normalizeRecovery(stored[STORAGE_KEYS.recovery]);
+  return withStateLock(async () => {
+    const stored = await area.get(STORAGE_KEYS.recovery);
+    return normalizeRecovery(stored[STORAGE_KEYS.recovery]) || emptyRecoveryNotice();
+  }, lockManager);
+}
+
+export async function loadRecoveryInfo(storage = chrome.storage.local, options = {}) {
+  const recovery = await loadRecoveryNotice(storage, options);
   return {
-    rejectedNotes: recovery?.rejectedNotes || 0,
-    rejectedDrafts: recovery?.rejectedDrafts || 0,
+    rejectedNotes: recovery.rejectedNotes,
+    rejectedDrafts: recovery.rejectedDrafts,
   };
+}
+
+export async function acknowledgeRecovery(
+  expectedValue,
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    const stored = await area.get(STORAGE_KEYS.recovery);
+    const current = normalizeRecovery(stored[STORAGE_KEYS.recovery]);
+    if (!current) {
+      return { acknowledged: true, recovery: emptyRecoveryNotice() };
+    }
+
+    const expected = normalizeRecovery(expectedValue);
+    if (!expected || !sameData(current, expected)) {
+      return { acknowledged: false, recovery: current };
+    }
+    if (typeof area.remove !== "function") {
+      throw new TypeError("The storage area cannot acknowledge recovery data.");
+    }
+    await area.remove(STORAGE_KEYS.recovery);
+    return { acknowledged: true, recovery: emptyRecoveryNotice() };
+  }, lockManager);
 }
