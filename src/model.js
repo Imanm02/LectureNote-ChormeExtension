@@ -640,6 +640,71 @@ function nextRevision(state) {
   return Number.isSafeInteger(state.revision) ? state.revision + 1 : 1;
 }
 
+function operationTimestamp(options = {}) {
+  const fallback = new Date().toISOString();
+  return normalizeTimestamp(options.now, fallback);
+}
+
+function timestampNotBeforeNotes(timestamp, notes) {
+  return notes.reduce(
+    (latest, note) => (Date.parse(note.createdAt) > Date.parse(latest) ? note.createdAt : latest),
+    timestamp,
+  );
+}
+
+function normalizedCourseKey(value) {
+  return value
+    .normalize("NFKD")
+    .replace(/\p{M}+/gu, "")
+    .replace(/[\u0649\u064a]/gu, "\u06cc")
+    .replace(/\u0643/gu, "\u06a9")
+    .toLowerCase();
+}
+
+function normalizeSelectedIdentifiers(values) {
+  if (!Array.isArray(values)) {
+    throw new ValidationError("Choose notes before continuing.", "selection-type");
+  }
+  if (values.length === 0) {
+    throw new ValidationError("Choose at least one note.", "selection-empty");
+  }
+
+  const identifiers = [];
+  const seen = new Set();
+  for (const value of values) {
+    if (typeof value !== "string") {
+      throw new ValidationError("Each selected note ID must be text.", "selection-id-type");
+    }
+    const identifier = stripUnsafeControls(value).trim();
+    if (!isValidIdentifier(identifier)) {
+      throw new ValidationError("A selected note ID is invalid.", "selection-id-invalid");
+    }
+    if (seen.has(identifier)) {
+      throw new ValidationError("A note was selected more than once.", "selection-id-duplicate");
+    }
+    seen.add(identifier);
+    identifiers.push(identifier);
+  }
+  return identifiers;
+}
+
+function selectExistingRecords(records, identifiers, identifierOf, message, code) {
+  const requested = new Set(identifiers);
+  const selected = records.filter((record) => requested.has(identifierOf(record)));
+  if (selected.length !== identifiers.length) {
+    throw new ValidationError(message, code);
+  }
+  return selected;
+}
+
+function noteWithCourse(note, course, now) {
+  return {
+    ...note,
+    course,
+    updatedAt: now,
+  };
+}
+
 export function addNote(stateValue, input, options = {}) {
   const state = normalizeState(stateValue, options);
   if (state.notes.length >= LIMITS.notes) {
@@ -711,6 +776,103 @@ export function updateNote(stateValue, identifier, changes, options = {}) {
   };
 }
 
+export function renameCourse(stateValue, courseValue, replacementValue, options = {}) {
+  const now = operationTimestamp(options);
+  const state = normalizeState(stateValue, { ...options, now });
+  const course = normalizeSingleLine(courseValue, "Course", LIMITS.course, { required: true });
+  const replacement = normalizeSingleLine(replacementValue, "Course", LIMITS.course);
+  const courseKey = normalizedCourseKey(course);
+  const matchingNotes = state.notes.filter((note) => normalizedCourseKey(note.course) === courseKey);
+  const matchingEntries = state.trash.filter(
+    (entry) => normalizedCourseKey(entry.note.course) === courseKey,
+  );
+  if (matchingNotes.length + matchingEntries.length === 0) {
+    throw new ValidationError("That course no longer exists.", "course-missing");
+  }
+
+  const changedNoteIds = new Set(
+    matchingNotes.filter((note) => note.course !== replacement).map((note) => note.id),
+  );
+  const changedTrashIds = new Set(
+    matchingEntries
+      .filter((entry) => entry.note.course !== replacement)
+      .map((entry) => entry.note.id),
+  );
+  if (changedNoteIds.size + changedTrashIds.size === 0) {
+    throw new ValidationError("That course already has this name.", "course-unchanged");
+  }
+
+  const updatedAt = timestampNotBeforeNotes(now, [
+    ...matchingNotes.filter((note) => changedNoteIds.has(note.id)),
+    ...matchingEntries
+      .filter((entry) => changedTrashIds.has(entry.note.id))
+      .map((entry) => entry.note),
+  ]);
+
+  const notes = state.notes.map((note) =>
+    changedNoteIds.has(note.id) ? noteWithCourse(note, replacement, updatedAt) : note,
+  );
+  const trash = state.trash.map((entry) =>
+    changedTrashIds.has(entry.note.id)
+      ? { ...entry, note: noteWithCourse(entry.note, replacement, updatedAt) }
+      : entry,
+  );
+  const changedNotes = notes.filter((note) => changedNoteIds.has(note.id));
+  const changedEntries = trash.filter((entry) => changedTrashIds.has(entry.note.id));
+
+  return {
+    state: { ...state, revision: nextRevision(state), notes, trash },
+    course,
+    replacement,
+    changed: changedNotes.length + changedEntries.length,
+    activeChanged: changedNotes.length,
+    trashChanged: changedEntries.length,
+    notes: changedNotes,
+    entries: changedEntries,
+  };
+}
+
+export function assignCourseToNotes(stateValue, identifierValues, courseValue, options = {}) {
+  const now = operationTimestamp(options);
+  const state = normalizeState(stateValue, { ...options, now });
+  const identifiers = normalizeSelectedIdentifiers(identifierValues);
+  const selected = selectExistingRecords(
+    state.notes,
+    identifiers,
+    (note) => note.id,
+    "A selected note no longer exists.",
+    "note-missing",
+  );
+  const course = normalizeSingleLine(courseValue, "Course", LIMITS.course);
+  const changedIds = new Set(
+    selected.filter((note) => note.course !== course).map((note) => note.id),
+  );
+  if (changedIds.size === 0) {
+    throw new ValidationError("The selected notes already use that course.", "course-unchanged");
+  }
+
+  const updatedAt = timestampNotBeforeNotes(
+    now,
+    selected.filter((note) => changedIds.has(note.id)),
+  );
+
+  const notes = state.notes.map((note) =>
+    changedIds.has(note.id) ? noteWithCourse(note, course, updatedAt) : note,
+  );
+  const selectedIds = new Set(identifiers);
+  const affectedNotes = notes.filter((note) => selectedIds.has(note.id));
+  const changedNotes = affectedNotes.filter((note) => changedIds.has(note.id));
+
+  return {
+    state: { ...state, revision: nextRevision(state), notes },
+    course,
+    assigned: changedNotes.length,
+    unchanged: affectedNotes.length - changedNotes.length,
+    notes: affectedNotes,
+    changedNotes,
+  };
+}
+
 export function moveNoteToTrash(stateValue, identifier, options = {}) {
   const state = normalizeState(stateValue, options);
   const index = state.notes.findIndex((note) => note.id === identifier);
@@ -736,6 +898,47 @@ export function moveNoteToTrash(stateValue, identifier, options = {}) {
     note,
     entry,
     index,
+  };
+}
+
+export function moveNotesToTrash(stateValue, identifierValues, options = {}) {
+  const now = operationTimestamp(options);
+  const state = normalizeState(stateValue, { ...options, now });
+  const identifiers = normalizeSelectedIdentifiers(identifierValues);
+  const selected = selectExistingRecords(
+    state.notes,
+    identifiers,
+    (note) => note.id,
+    "A selected note no longer exists.",
+    "note-missing",
+  );
+  if (state.trash.length + selected.length > LIMITS.trash) {
+    throw new ValidationError(
+      "Trash does not have enough room for the selected notes.",
+      "trash-limit",
+    );
+  }
+
+  const selectedIds = new Set(identifiers);
+  const indexes = new Map(state.notes.map((note, index) => [note.id, index]));
+  const deletedAt = timestampNotBeforeNotes(now, selected);
+  const entries = selected.map((note) => ({
+    note,
+    deletedAt,
+    originalIndex: indexes.get(note.id),
+  }));
+  const notes = state.notes.filter((note) => !selectedIds.has(note.id));
+
+  return {
+    state: {
+      ...state,
+      revision: nextRevision(state),
+      notes,
+      trash: [...entries, ...state.trash],
+    },
+    moved: entries.length,
+    notes: selected,
+    entries,
   };
 }
 
@@ -767,6 +970,49 @@ export function restoreTrashedNote(stateValue, identifier, options = {}) {
   };
 }
 
+export function restoreTrashedNotes(stateValue, identifierValues, options = {}) {
+  const now = operationTimestamp(options);
+  const state = normalizeState(stateValue, { ...options, now });
+  const identifiers = normalizeSelectedIdentifiers(identifierValues);
+  const selected = selectExistingRecords(
+    state.trash,
+    identifiers,
+    (entry) => entry.note.id,
+    "A selected note is no longer in Trash.",
+    "trash-note-missing",
+  );
+  if (state.notes.length + selected.length > LIMITS.notes) {
+    throw new ValidationError("The note library does not have enough room.", "notes-limit");
+  }
+
+  const activeIdentifiers = new Set(state.notes.map((note) => note.id));
+  if (selected.some((entry) => activeIdentifiers.has(entry.note.id))) {
+    throw new ValidationError("A selected note has already been restored.", "duplicate-id");
+  }
+
+  const trashIndexes = new Map(state.trash.map((entry, index) => [entry.note.id, index]));
+  const insertionOrder = [...selected].sort(
+    (left, right) =>
+      left.originalIndex - right.originalIndex ||
+      trashIndexes.get(right.note.id) - trashIndexes.get(left.note.id),
+  );
+  const notes = [...state.notes];
+  for (const entry of insertionOrder) {
+    const targetIndex = Math.max(0, Math.min(entry.originalIndex, notes.length));
+    notes.splice(targetIndex, 0, entry.note);
+  }
+  const selectedIds = new Set(identifiers);
+  const trash = state.trash.filter((entry) => !selectedIds.has(entry.note.id));
+  const restoredNotes = notes.filter((note) => selectedIds.has(note.id));
+
+  return {
+    state: { ...state, revision: nextRevision(state), notes, trash },
+    restored: selected.length,
+    notes: restoredNotes,
+    entries: selected,
+  };
+}
+
 export function permanentlyDeleteTrashedNote(stateValue, identifier, options = {}) {
   const state = normalizeState(stateValue, options);
   const index = state.trash.findIndex((entry) => entry.note.id === identifier);
@@ -778,6 +1024,27 @@ export function permanentlyDeleteTrashedNote(stateValue, identifier, options = {
   return {
     state: { ...state, revision: nextRevision(state), trash },
     entry,
+  };
+}
+
+export function permanentlyDeleteTrashedNotes(stateValue, identifierValues, options = {}) {
+  const now = operationTimestamp(options);
+  const state = normalizeState(stateValue, { ...options, now });
+  const identifiers = normalizeSelectedIdentifiers(identifierValues);
+  const selected = selectExistingRecords(
+    state.trash,
+    identifiers,
+    (entry) => entry.note.id,
+    "A selected note is no longer in Trash.",
+    "trash-note-missing",
+  );
+  const selectedIds = new Set(identifiers);
+  const trash = state.trash.filter((entry) => !selectedIds.has(entry.note.id));
+
+  return {
+    state: { ...state, revision: nextRevision(state), trash },
+    deleted: selected.length,
+    entries: selected,
   };
 }
 

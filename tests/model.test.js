@@ -3,19 +3,24 @@ import test from "node:test";
 
 import {
   addNote,
+  assignCourseToNotes,
   createEmptyState,
   createNote,
   emptyTrash,
   LIMITS,
   measureLibraryUsage,
   moveNoteToTrash,
+  moveNotesToTrash,
   normalizeDraft,
   normalizeEditorDraft,
   normalizeNote,
   normalizeSource,
-  recoverState,
   permanentlyDeleteTrashedNote,
+  permanentlyDeleteTrashedNotes,
+  recoverState,
+  renameCourse,
   restoreTrashedNote,
+  restoreTrashedNotes,
   updateSettings,
   updateNote,
   ValidationError,
@@ -155,6 +160,321 @@ test("permanently deletes one Trash entry or empties Trash", () => {
   const emptied = emptyTrash(deleted.state);
   assert.equal(emptied.deleted, 1);
   assert.deepEqual(emptied.state.trash, []);
+});
+
+test("renames a course across active notes and Trash", () => {
+  const first = createNote(sample({ title: "First", body: "First", course: "CS 101" }), {
+    idFactory: () => "first",
+    now: START,
+  });
+  const second = createNote(sample({ title: "Second", body: "Second", course: "Math" }), {
+    idFactory: () => "second",
+    now: START,
+  });
+  const deleted = createNote(sample({ title: "Deleted", body: "Deleted", course: "cs 101" }), {
+    idFactory: () => "deleted",
+    now: START,
+  });
+  const state = {
+    ...createEmptyState(),
+    revision: 7,
+    notes: [first, second],
+    trash: [{ note: deleted, deletedAt: START, originalIndex: 1 }],
+  };
+
+  const result = renameCourse(state, "  cS   101  ", " Data   Science ", { now: LATER });
+
+  assert.equal(result.state.revision, 8);
+  assert.equal(result.course, "cS 101");
+  assert.equal(result.replacement, "Data Science");
+  assert.equal(result.changed, 2);
+  assert.equal(result.activeChanged, 1);
+  assert.equal(result.trashChanged, 1);
+  assert.deepEqual(result.state.notes.map((note) => note.id), ["first", "second"]);
+  assert.deepEqual(result.notes.map((note) => note.id), ["first"]);
+  assert.deepEqual(result.entries.map((entry) => entry.note.id), ["deleted"]);
+  assert.equal(result.state.notes[0].course, "Data Science");
+  assert.equal(result.state.notes[0].updatedAt, LATER);
+  assert.equal(result.state.notes[1].course, "Math");
+  assert.equal(result.state.notes[1].updatedAt, START);
+  assert.equal(result.state.trash[0].note.course, "Data Science");
+  assert.equal(result.state.trash[0].note.updatedAt, LATER);
+  assert.equal(result.state.trash[0].deletedAt, START);
+  assert.deepEqual(state.notes, [first, second]);
+  assert.equal(state.trash[0].note.course, "cs 101");
+});
+
+test("merges course names and can clear the merged course", () => {
+  const first = createNote(sample({ title: "First", body: "First", course: "CS 101" }), {
+    idFactory: () => "first",
+    now: START,
+  });
+  const second = createNote(sample({ title: "Second", body: "Second", course: "Math" }), {
+    idFactory: () => "second",
+    now: START,
+  });
+  const deleted = createNote(sample({ title: "Deleted", body: "Deleted", course: "cs 101" }), {
+    idFactory: () => "deleted",
+    now: START,
+  });
+  const state = {
+    ...createEmptyState(),
+    notes: [first, second],
+    trash: [{ note: deleted, deletedAt: START, originalIndex: 1 }],
+  };
+
+  const merged = renameCourse(state, "CS 101", "Math", { now: LATER });
+  const cleared = renameCourse(merged.state, "math", "", { now: LATER });
+
+  assert.deepEqual(merged.state.notes.map((note) => note.course), ["Math", "Math"]);
+  assert.equal(merged.state.trash[0].note.course, "Math");
+  assert.equal(merged.changed, 2);
+  assert.deepEqual(cleared.state.notes.map((note) => note.course), ["", ""]);
+  assert.equal(cleared.state.trash[0].note.course, "");
+  assert.equal(cleared.changed, 3);
+  assert.equal(cleared.state.revision, state.revision + 2);
+});
+
+test("assigns a normalized course to selected active notes", () => {
+  const first = createNote(sample({ title: "First", body: "First", course: "Physics" }), {
+    idFactory: () => "first",
+    now: START,
+  });
+  const second = createNote(sample({ title: "Second", body: "Second", course: "Math" }), {
+    idFactory: () => "second",
+    now: START,
+  });
+  const third = createNote(sample({ title: "Third", body: "Third", course: "CS" }), {
+    idFactory: () => "third",
+    now: START,
+  });
+  const state = { ...createEmptyState(), revision: 4, notes: [first, second, third] };
+
+  const result = assignCourseToNotes(state, [" third ", "first"], " Physics ", { now: LATER });
+
+  assert.equal(result.state.revision, 5);
+  assert.equal(result.course, "Physics");
+  assert.equal(result.assigned, 1);
+  assert.equal(result.unchanged, 1);
+  assert.deepEqual(result.notes.map((note) => note.id), ["first", "third"]);
+  assert.deepEqual(result.changedNotes.map((note) => note.id), ["third"]);
+  assert.deepEqual(result.state.notes.map((note) => note.id), ["first", "second", "third"]);
+  assert.equal(result.state.notes[0].updatedAt, START);
+  assert.equal(result.state.notes[1].course, "Math");
+  assert.equal(result.state.notes[2].course, "Physics");
+  assert.equal(result.state.notes[2].updatedAt, LATER);
+});
+
+test("uses one safe timestamp for each bulk record change", () => {
+  const earlier = createNote(sample({ title: "Earlier", body: "Earlier", course: "Old" }), {
+    idFactory: () => "earlier",
+    now: START,
+  });
+  const later = createNote(sample({ title: "Later", body: "Later", course: "Old" }), {
+    idFactory: () => "later",
+    now: LATER,
+  });
+  const state = { ...createEmptyState(), notes: [earlier, later] };
+
+  const renamed = renameCourse(state, "Old", "New", { now: START });
+  const moved = moveNotesToTrash(state, ["earlier", "later"], { now: START });
+
+  assert.deepEqual(renamed.state.notes.map((note) => note.updatedAt), [LATER, LATER]);
+  assert.deepEqual(moved.entries.map((entry) => entry.deletedAt), [LATER, LATER]);
+});
+
+test("moves and restores several notes without changing their order", () => {
+  const notes = ["a", "b", "c", "d"].map((identifier) =>
+    createNote(
+      sample({ title: identifier.toUpperCase(), body: identifier, course: "Course" }),
+      { idFactory: () => identifier, now: START },
+    ),
+  );
+  const existing = createNote(sample({ title: "Existing", body: "Existing" }), {
+    idFactory: () => "existing",
+    now: START,
+  });
+  const state = {
+    ...createEmptyState(),
+    revision: 9,
+    notes,
+    trash: [{ note: existing, deletedAt: START, originalIndex: 0 }],
+  };
+
+  const moved = moveNotesToTrash(state, ["d", "b"], { now: LATER });
+
+  assert.equal(moved.state.revision, 10);
+  assert.equal(moved.moved, 2);
+  assert.deepEqual(moved.notes.map((note) => note.id), ["b", "d"]);
+  assert.deepEqual(moved.state.notes.map((note) => note.id), ["a", "c"]);
+  assert.deepEqual(moved.state.trash.map((entry) => entry.note.id), ["b", "d", "existing"]);
+  assert.deepEqual(moved.entries.map((entry) => entry.originalIndex), [1, 3]);
+  assert.deepEqual(moved.entries.map((entry) => entry.deletedAt), [LATER, LATER]);
+
+  const restored = restoreTrashedNotes(moved.state, ["d", "b"], { now: LATER });
+
+  assert.equal(restored.state.revision, 11);
+  assert.equal(restored.restored, 2);
+  assert.deepEqual(restored.state.notes.map((note) => note.id), ["a", "b", "c", "d"]);
+  assert.deepEqual(restored.notes.map((note) => note.id), ["b", "d"]);
+  assert.deepEqual(restored.entries.map((entry) => entry.note.id), ["b", "d"]);
+  assert.deepEqual(restored.state.trash.map((entry) => entry.note.id), ["existing"]);
+});
+
+test("restores equal-index Trash entries in stable Trash order", () => {
+  const first = createNote(sample({ title: "First", body: "First" }), {
+    idFactory: () => "first",
+    now: START,
+  });
+  const second = createNote(sample({ title: "Second", body: "Second" }), {
+    idFactory: () => "second",
+    now: START,
+  });
+  const active = createNote(sample({ title: "Active", body: "Active" }), {
+    idFactory: () => "active",
+    now: START,
+  });
+  const state = {
+    ...createEmptyState(),
+    notes: [active],
+    trash: [
+      { note: first, deletedAt: START, originalIndex: 0 },
+      { note: second, deletedAt: START, originalIndex: 0 },
+    ],
+  };
+
+  const result = restoreTrashedNotes(state, ["second", "first"], { now: LATER });
+
+  assert.deepEqual(result.state.notes.map((note) => note.id), ["first", "second", "active"]);
+  assert.deepEqual(result.notes.map((note) => note.id), ["first", "second"]);
+});
+
+test("permanently deletes selected Trash entries in one revision", () => {
+  const entries = ["a", "b", "c"].map((identifier, index) => ({
+    note: createNote(sample({ title: identifier, body: identifier }), {
+      idFactory: () => identifier,
+      now: START,
+    }),
+    deletedAt: START,
+    originalIndex: index,
+  }));
+  const state = { ...createEmptyState(), revision: 12, trash: entries };
+
+  const result = permanentlyDeleteTrashedNotes(state, ["c", "a"], { now: LATER });
+
+  assert.equal(result.state.revision, 13);
+  assert.equal(result.deleted, 2);
+  assert.deepEqual(result.entries.map((entry) => entry.note.id), ["a", "c"]);
+  assert.deepEqual(result.state.trash.map((entry) => entry.note.id), ["b"]);
+  assert.deepEqual(state.trash, entries);
+});
+
+test("rejects duplicate or missing bulk selections without mutation", () => {
+  const active = createNote(sample({ title: "Active", body: "Active" }), {
+    idFactory: () => "active",
+    now: START,
+  });
+  const deleted = createNote(sample({ title: "Deleted", body: "Deleted" }), {
+    idFactory: () => "deleted",
+    now: START,
+  });
+  const state = {
+    ...createEmptyState(),
+    revision: 3,
+    notes: [active],
+    trash: [{ note: deleted, deletedAt: START, originalIndex: 0 }],
+  };
+  const snapshot = structuredClone(state);
+
+  const cases = [
+    () => assignCourseToNotes(state, ["active", "active"], "New"),
+    () => moveNotesToTrash(state, ["active", "active"]),
+    () => restoreTrashedNotes(state, ["deleted", "deleted"]),
+    () => permanentlyDeleteTrashedNotes(state, ["deleted", "deleted"]),
+  ];
+  for (const run of cases) {
+    assert.throws(run, { code: "selection-id-duplicate" });
+  }
+
+  assert.throws(() => assignCourseToNotes(state, ["missing"], "New"), {
+    code: "note-missing",
+  });
+  assert.throws(() => moveNotesToTrash(state, ["missing"]), { code: "note-missing" });
+  assert.throws(() => restoreTrashedNotes(state, ["missing"]), {
+    code: "trash-note-missing",
+  });
+  assert.throws(() => permanentlyDeleteTrashedNotes(state, ["missing"]), {
+    code: "trash-note-missing",
+  });
+  assert.deepEqual(state, snapshot);
+});
+
+test("rejects empty and invalid bulk selections", () => {
+  const state = createEmptyState();
+
+  assert.throws(() => moveNotesToTrash(state, []), { code: "selection-empty" });
+  assert.throws(() => moveNotesToTrash(state, null), { code: "selection-type" });
+  assert.throws(() => moveNotesToTrash(state, [12]), { code: "selection-id-type" });
+  assert.throws(() => moveNotesToTrash(state, ["not valid"]), {
+    code: "selection-id-invalid",
+  });
+});
+
+test("checks bulk Trash and active-note capacity before changing state", () => {
+  const base = createNote(sample({ title: "Base", body: "Base" }), {
+    idFactory: () => "base",
+    now: START,
+  });
+  const active = { ...base, id: "active" };
+  const fullTrash = Array.from({ length: LIMITS.trash }, (_, index) => ({
+    note: { ...base, id: `deleted-${index}` },
+    deletedAt: START,
+    originalIndex: 0,
+  }));
+  const moveState = { ...createEmptyState(), revision: 2, notes: [active], trash: fullTrash };
+
+  assert.throws(() => moveNotesToTrash(moveState, ["active"], { now: LATER }), {
+    code: "trash-limit",
+  });
+  assert.equal(moveState.revision, 2);
+  assert.equal(moveState.notes.length, 1);
+  assert.equal(moveState.trash.length, LIMITS.trash);
+
+  const fullNotes = Array.from({ length: LIMITS.notes }, (_, index) => ({
+    ...base,
+    id: `active-${index}`,
+  }));
+  const restoreState = {
+    ...createEmptyState(),
+    revision: 5,
+    notes: fullNotes,
+    trash: [{ note: { ...base, id: "deleted" }, deletedAt: START, originalIndex: 0 }],
+  };
+
+  assert.throws(() => restoreTrashedNotes(restoreState, ["deleted"], { now: LATER }), {
+    code: "notes-limit",
+  });
+  assert.equal(restoreState.revision, 5);
+  assert.equal(restoreState.notes.length, LIMITS.notes);
+  assert.equal(restoreState.trash.length, 1);
+});
+
+test("rejects missing or unchanged course operations", () => {
+  const note = createNote(sample({ course: "CS 101" }), {
+    idFactory: () => "note",
+    now: START,
+  });
+  const state = { ...createEmptyState(), notes: [note] };
+
+  assert.throws(() => renameCourse(state, "Math", "Physics"), { code: "course-missing" });
+  assert.throws(() => renameCourse(state, "CS 101", "CS 101"), {
+    code: "course-unchanged",
+  });
+  assert.throws(() => assignCourseToNotes(state, ["note"], "CS 101"), {
+    code: "course-unchanged",
+  });
+  assert.equal(state.revision, 0);
+  assert.equal(state.notes[0].updatedAt, START);
 });
 
 test("keeps active limits and identifiers separate from persistent Trash", () => {
