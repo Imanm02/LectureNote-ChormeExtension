@@ -17,11 +17,16 @@ import {
   enqueuePendingCapture,
   loadDataEpoch,
   loadDraft,
+  loadEditorDraft,
+  loadHelpSeen,
+  loadPendingCaptures,
+  loadPopupDraft,
   loadRecoveryInfo,
   loadRecoveryNotice,
   loadState,
   mutateState,
   resetAllData,
+  saveHelpSeen,
   saveDraft,
   saveEditorDraft,
   savePopupDraft,
@@ -110,6 +115,38 @@ function trackingLockManager() {
           release();
         }
       });
+    },
+  };
+}
+
+function storageThatResetsDuringRead(initial, triggerKey) {
+  const storage = memoryStorage(initial);
+  const get = storage.get.bind(storage);
+  const set = storage.set.bind(storage);
+  let resetObserved = false;
+  let writes = 0;
+
+  storage.get = async (keys) => {
+    const result = await get(keys);
+    const names = Array.isArray(keys) ? keys : [keys];
+    if (!resetObserved && names.includes(triggerKey)) {
+      storage.values[STORAGE_KEYS.dataEpoch] = "epoch-after";
+      resetObserved = true;
+    }
+    return result;
+  };
+  storage.set = async (update) => {
+    writes += 1;
+    await set(update);
+  };
+
+  return {
+    storage,
+    get resetObserved() {
+      return resetObserved;
+    },
+    get writes() {
+      return writes;
     },
   };
 }
@@ -387,6 +424,40 @@ test("creates one persistent data reset token", async () => {
   assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "epoch-first");
 });
 
+test("binds the onboarding preference to the current data epoch", async () => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "help-epoch",
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+
+  assert.equal(
+    await loadHelpSeen(storage, { expectedEpoch: "help-epoch", lockManager: null }),
+    true,
+  );
+  assert.deepEqual(storage.values[STORAGE_KEYS.helpSeen], {
+    version: 1,
+    epoch: "help-epoch",
+    seen: true,
+  });
+
+  storage.values[STORAGE_KEYS.dataEpoch] = "reset-epoch";
+  assert.equal(
+    await loadHelpSeen(storage, { expectedEpoch: "reset-epoch", lockManager: null }),
+    false,
+  );
+  await assert.rejects(
+    () => saveHelpSeen(storage, { expectedEpoch: "help-epoch", lockManager: null }),
+    { code: "data-reset" },
+  );
+  assert.equal(storage.values[STORAGE_KEYS.helpSeen].epoch, "help-epoch");
+
+  await saveHelpSeen(storage, { expectedEpoch: "reset-epoch", lockManager: null });
+  assert.equal(
+    await loadHelpSeen(storage, { expectedEpoch: "reset-epoch", lockManager: null }),
+    true,
+  );
+});
+
 test("resets all stored data and advances draft tombstones", async () => {
   const note = createNote(noteInput(), { idFactory: () => "saved-note", now: NOW });
   const trashed = createNote(noteInput("Deleted note"), {
@@ -539,6 +610,128 @@ test("rejects stale library and draft writers after a reset", async () => {
 
   assert.equal(mutationCalled, false);
   assert.deepEqual(storage.values, resetValues);
+});
+
+test("rejects stale guarded reads without normalizing reset data", async () => {
+  const staleRecords = {
+    [STORAGE_KEYS.state]: { ...createEmptyState(), extra: "remove" },
+    [STORAGE_KEYS.pendingCaptures]: { version: 1, captures: [], extra: "remove" },
+    [STORAGE_KEYS.draft]: {
+      version: 1,
+      ownerSessionId: "",
+      generation: 0,
+      contentGeneration: 0,
+      draft: null,
+      extra: "remove",
+    },
+    [STORAGE_KEYS.editorDraft]: {
+      version: 1,
+      ownerSessionId: "",
+      generation: 0,
+      contentGeneration: 0,
+      draft: null,
+      extra: "remove",
+    },
+    [STORAGE_KEYS.recovery]: {
+      createdAt: NOW,
+      rejectedNotes: 1,
+      rejectedDrafts: 0,
+    },
+    [STORAGE_KEYS.dataEpoch]: "epoch-after",
+  };
+  const storage = memoryStorage(staleRecords);
+  const guardedReads = [
+    () => loadState(storage, { expectedEpoch: "epoch-before", lockManager: null, now: NOW }),
+    () => loadPendingCaptures(storage, { expectedEpoch: "epoch-before", lockManager: null }),
+    () => loadPopupDraft(storage, { expectedEpoch: "epoch-before", lockManager: null, now: NOW }),
+    () => loadEditorDraft(storage, { expectedEpoch: "epoch-before", lockManager: null, now: NOW }),
+    () => loadRecoveryNotice(storage, { expectedEpoch: "epoch-before", lockManager: null }),
+  ];
+
+  for (const read of guardedReads) {
+    await assert.rejects(read, { code: "data-reset" });
+  }
+
+  assert.deepEqual(storage.values, staleRecords);
+});
+
+test("stops guarded read repairs when reset happens during the read", async () => {
+  const scenarios = [
+    {
+      key: STORAGE_KEYS.state,
+      value: { ...createEmptyState(), extra: "remove" },
+      read: (storage) => loadState(storage, {
+        expectedEpoch: "epoch-before",
+        lockManager: null,
+        now: NOW,
+      }),
+    },
+    {
+      key: STORAGE_KEYS.pendingCaptures,
+      value: { version: 1, captures: [], extra: "remove" },
+      read: (storage) => loadPendingCaptures(storage, {
+        expectedEpoch: "epoch-before",
+        lockManager: null,
+      }),
+    },
+    {
+      key: STORAGE_KEYS.draft,
+      value: {
+        version: 1,
+        ownerSessionId: "",
+        generation: 0,
+        contentGeneration: 0,
+        draft: null,
+        extra: "remove",
+      },
+      read: (storage) => loadPopupDraft(storage, {
+        expectedEpoch: "epoch-before",
+        lockManager: null,
+        now: NOW,
+      }),
+    },
+    {
+      key: STORAGE_KEYS.editorDraft,
+      value: {
+        version: 1,
+        ownerSessionId: "",
+        generation: 0,
+        contentGeneration: 0,
+        draft: null,
+        extra: "remove",
+      },
+      read: (storage) => loadEditorDraft(storage, {
+        expectedEpoch: "epoch-before",
+        lockManager: null,
+        now: NOW,
+      }),
+    },
+    {
+      key: STORAGE_KEYS.recovery,
+      value: { createdAt: NOW, rejectedNotes: 1, rejectedDrafts: 0 },
+      read: (storage) => loadRecoveryNotice(storage, {
+        expectedEpoch: "epoch-before",
+        lockManager: null,
+      }),
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const initial = {
+      [scenario.key]: scenario.value,
+      [STORAGE_KEYS.dataEpoch]: "epoch-before",
+    };
+    const tracked = storageThatResetsDuringRead(initial, scenario.key);
+
+    await assert.rejects(() => scenario.read(tracked.storage), { code: "data-reset" });
+
+    assert.equal(tracked.resetObserved, true);
+    assert.equal(tracked.writes, 0);
+    assert.deepEqual(tracked.storage.values, {
+      ...initial,
+      [STORAGE_KEYS.dataEpoch]: "epoch-after",
+    });
+  }
 });
 
 test("finishes reset cleanup after an interrupted removal", async () => {

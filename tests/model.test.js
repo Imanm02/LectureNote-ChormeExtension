@@ -321,32 +321,51 @@ test("moves and restores several notes without changing their order", () => {
   assert.deepEqual(restored.state.trash.map((entry) => entry.note.id), ["existing"]);
 });
 
-test("restores equal-index Trash entries in stable Trash order", () => {
-  const first = createNote(sample({ title: "First", body: "First" }), {
-    idFactory: () => "first",
-    now: START,
-  });
-  const second = createNote(sample({ title: "Second", body: "Second" }), {
-    idFactory: () => "second",
-    now: START,
-  });
-  const active = createNote(sample({ title: "Active", body: "Active" }), {
-    idFactory: () => "active",
-    now: START,
-  });
-  const state = {
-    ...createEmptyState(),
-    notes: [active],
-    trash: [
-      { note: first, deletedAt: START, originalIndex: 0 },
-      { note: second, deletedAt: START, originalIndex: 0 },
-    ],
-  };
+test("restores sequential deletions with equal indexes in their original order", () => {
+  const notes = ["a", "b", "c", "d"].map((identifier) =>
+    createNote(sample({ title: identifier.toUpperCase(), body: identifier }), {
+      idFactory: () => identifier,
+      now: START,
+    }),
+  );
+  const state = { ...createEmptyState(), revision: 7, notes };
+  const withoutB = moveNoteToTrash(state, "b", { now: LATER }).state;
+  const withoutBOrC = moveNoteToTrash(withoutB, "c", { now: LATER }).state;
 
-  const result = restoreTrashedNotes(state, ["second", "first"], { now: LATER });
+  assert.deepEqual(withoutBOrC.trash.map((entry) => entry.note.id), ["c", "b"]);
+  assert.deepEqual(withoutBOrC.trash.map((entry) => entry.originalIndex), [1, 1]);
 
-  assert.deepEqual(result.state.notes.map((note) => note.id), ["first", "second", "active"]);
-  assert.deepEqual(result.notes.map((note) => note.id), ["first", "second"]);
+  const result = restoreTrashedNotes(withoutBOrC, ["b", "c"], { now: LATER });
+
+  assert.equal(result.state.revision, withoutBOrC.revision + 1);
+  assert.deepEqual(result.state.notes.map((note) => note.id), ["a", "b", "c", "d"]);
+  assert.deepEqual(result.state.notes.map((note) => note.updatedAt), [START, START, START, START]);
+  assert.deepEqual(result.notes.map((note) => note.id), ["b", "c"]);
+  assert.deepEqual(result.entries.map((entry) => entry.note.id), ["c", "b"]);
+});
+
+test("restores a subset in order when missing entries clamp its indexes", () => {
+  const notes = ["a", "b", "c", "d"].map((identifier) =>
+    createNote(sample({ title: identifier.toUpperCase(), body: identifier }), {
+      idFactory: () => identifier,
+      now: START,
+    }),
+  );
+  let state = { ...createEmptyState(), revision: 3, notes };
+  for (const identifier of ["c", "d", "a", "b"]) {
+    state = moveNoteToTrash(state, identifier, { now: LATER }).state;
+  }
+  const revision = state.revision;
+
+  assert.deepEqual(state.trash.map((entry) => entry.note.id), ["b", "a", "d", "c"]);
+  assert.deepEqual(state.trash.map((entry) => entry.originalIndex), [0, 0, 2, 2]);
+
+  const result = restoreTrashedNotes(state, ["d", "c"], { now: LATER });
+
+  assert.equal(result.state.revision, revision + 1);
+  assert.deepEqual(result.state.notes.map((note) => note.id), ["c", "d"]);
+  assert.deepEqual(result.state.notes.map((note) => note.updatedAt), [START, START]);
+  assert.deepEqual(result.state.trash.map((entry) => entry.note.id), ["b", "a"]);
 });
 
 test("permanently deletes selected Trash entries in one revision", () => {

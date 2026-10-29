@@ -4,6 +4,7 @@ import test from "node:test";
 import { initPopup, openLibraryBesidePage } from "../src/popup.js";
 import { createEmptyState } from "../src/model.js";
 import {
+  loadHelpSeen,
   enqueuePendingCapture,
   loadDraft,
   loadPendingCaptures,
@@ -614,7 +615,7 @@ test("shows first-use help once and keeps Help available", async () => {
 
   assert.equal(panel.hidden, false);
   assert.equal(helpButton.getAttribute("aria-expanded"), "true");
-  assert.equal(storage.values[STORAGE_KEYS.helpSeen], true);
+  assert.equal(await loadHelpSeen(storage), true);
 
   dom.window.document.getElementById("closeHelpButton").click();
   assert.equal(panel.hidden, true);

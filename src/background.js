@@ -1,7 +1,8 @@
-import { LIMITS, normalizeSource } from "./model.js";
+import { isValidIdentifier, LIMITS, normalizeSource } from "./model.js";
 import { MESSAGE_TYPES } from "./messages.js";
 import {
   enqueuePendingCapture,
+  loadDataEpoch,
   removePendingCapture,
   saveEditorDraft,
   savePopupDraft,
@@ -13,6 +14,7 @@ let contextMenuRegistrationQueue = Promise.resolve();
 export function isAuthorizedDraftMessage(message, sender, runtimeId) {
   return (
     [MESSAGE_TYPES.saveDraft, MESSAGE_TYPES.saveEditorDraft].includes(message?.type) &&
+    isValidIdentifier(message?.expectedEpoch) &&
     typeof runtimeId === "string" &&
     sender?.id === runtimeId
   );
@@ -28,6 +30,7 @@ export async function handleDraftMessage(message, sender, storage, runtimeId) {
       expectedOwnerSessionId: message.expectedOwnerSessionId,
       expectedGeneration: message.expectedGeneration,
       contentGeneration: message.contentGeneration,
+      expectedEpoch: message.expectedEpoch,
     });
     return {
       handled: true,
@@ -45,9 +48,12 @@ export async function handleDraftMessage(message, sender, storage, runtimeId) {
     expectedOwnerSessionId: message.expectedOwnerSessionId,
     expectedGeneration: message.expectedGeneration,
     contentGeneration: message.contentGeneration,
+    expectedEpoch: message.expectedEpoch,
   });
   if (result.saved && message.pendingCaptureId) {
-    await removePendingCapture(message.pendingCaptureId, storage);
+    await removePendingCapture(message.pendingCaptureId, storage, {
+      expectedEpoch: message.expectedEpoch,
+    });
   }
   return {
     handled: true,
@@ -181,6 +187,7 @@ export async function captureContextSelection(
     (value) => typeof value === "string" && value.length <= LIMITS.captureUrl,
   );
   const source = normalizeSource({ title, url: rawUrl || "" });
+  const expectedEpoch = await loadDataEpoch(storage);
   const result = await enqueuePendingCapture(
     {
       id: captureIdFactory(),
@@ -190,6 +197,7 @@ export async function captureContextSelection(
       wasTruncated: selection.wasTruncated,
     },
     storage,
+    { expectedEpoch },
   );
 
   return {
@@ -272,7 +280,11 @@ if (typeof chrome !== "undefined") {
     }
     void handleDraftMessage(message, sender, chrome.storage.local, chrome.runtime.id).then(
       (result) => sendResponse({ ok: true, saved: result.saved, cursor: result.cursor }),
-      (error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : "Draft not saved" }),
+      (error) => sendResponse({
+        ok: false,
+        error: error instanceof Error ? error.message : "Draft not saved",
+        code: typeof error?.code === "string" ? error.code : undefined,
+      }),
     );
     return true;
   });

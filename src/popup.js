@@ -3,6 +3,8 @@ import { addNote, LIMITS, normalizeSource, ValidationError } from "./model.js";
 import { MESSAGE_TYPES } from "./messages.js";
 import {
   clearPopupDraft,
+  loadDataEpoch,
+  loadHelpSeen,
   loadPendingCaptures,
   loadPopupDraft,
   loadRecoveryInfo,
@@ -10,6 +12,7 @@ import {
   mutateStateAndClearPopupDraft,
   removePendingCapture,
   savePopupDraft,
+  saveHelpSeen,
   STORAGE_KEYS,
 } from "./storage.js";
 import { listCourses, selectNotes } from "./selectors.js";
@@ -57,6 +60,9 @@ function errorMessage(error) {
   }
   return "The action could not be completed.";
 }
+
+const DATA_RESET_MESSAGE =
+  "Note data was reset in another window. This popup cannot save. Your text is still here so you can copy it, then reopen Lecture Notes.";
 
 export async function openLibraryBesidePage(chromeApi = chrome) {
   const libraryUrl = typeof chromeApi.runtime?.getURL === "function"
@@ -122,6 +128,8 @@ export async function initPopup({
   let ready = false;
   let destroyed = false;
   let helpSeen = false;
+  let dataEpoch = "";
+  let dataResetConflict = false;
 
   async function showHelp({ persist = true } = {}) {
     elements.helpPanel.hidden = false;
@@ -130,10 +138,12 @@ export async function initPopup({
       return;
     }
     try {
-      await storage.set({ [STORAGE_KEYS.helpSeen]: true });
+      await saveHelpSeen(storage, { expectedEpoch: dataEpoch });
       helpSeen = true;
     } catch (error) {
-      setStatus(elements.status, `Help preference not saved: ${errorMessage(error)}`, "warning");
+      if (!handleDataResetError(error)) {
+        setStatus(elements.status, `Help preference not saved: ${errorMessage(error)}`, "warning");
+      }
     }
   }
 
@@ -150,17 +160,36 @@ export async function initPopup({
   function setBusy(busy) {
     elements.form.setAttribute("aria-busy", String(busy));
     elements.form.inert = busy;
-    elements.save.disabled = busy;
-    elements.discard.disabled = busy || !hasDiscardableDraft;
-    elements.sourcePrivacy.disabled = busy;
-    elements.useSelection.disabled = busy;
-    elements.discardSelection.disabled = busy;
-    elements.saveCopy.disabled = busy;
+    elements.save.disabled = busy || dataResetConflict;
+    elements.discard.disabled = busy || dataResetConflict || !hasDiscardableDraft;
+    elements.sourcePrivacy.disabled = busy || dataResetConflict;
+    elements.useSelection.disabled = busy || dataResetConflict;
+    elements.discardSelection.disabled = busy || dataResetConflict;
+    elements.saveCopy.disabled = busy || dataResetConflict;
   }
 
   function updateDiscardControl() {
     elements.discard.textContent = pageCapture ? "Reset draft" : "Discard draft";
-    elements.discard.disabled = elements.form.inert || !hasDiscardableDraft;
+    elements.discard.disabled =
+      elements.form.inert || dataResetConflict || !hasDiscardableDraft;
+  }
+
+  function markDataResetConflict() {
+    if (!dataResetConflict) {
+      dataResetConflict = true;
+      cancelDraftTimer();
+      setBusy(false);
+      updateDiscardControl();
+    }
+    setStatus(elements.status, DATA_RESET_MESSAGE, "error");
+  }
+
+  function handleDataResetError(error) {
+    if (error instanceof ValidationError && error.code === "data-reset") {
+      markDataResetConflict();
+      return true;
+    }
+    return false;
   }
 
   function hasSource(source) {
@@ -279,7 +308,7 @@ export async function initPopup({
   }
 
   async function persistDraft() {
-    if (destroyed || !ready || !draftDirty) {
+    if (destroyed || dataResetConflict || !ready || !draftDirty) {
       return false;
     }
     const generation = draftGeneration;
@@ -296,6 +325,7 @@ export async function initPopup({
           expectedOwnerSessionId: draftCursor.ownerSessionId,
           expectedGeneration: draftCursor.generation,
           contentGeneration: generation,
+          expectedEpoch: dataEpoch,
         });
         if (!result.saved) {
           throw new ValidationError(
@@ -310,7 +340,7 @@ export async function initPopup({
         saved = true;
       });
     } catch (error) {
-      if (draftDirty && generation === draftGeneration) {
+      if (!handleDataResetError(error) && draftDirty && generation === draftGeneration) {
         setStatus(elements.status, `Draft not saved: ${errorMessage(error)}`, "error");
       }
       return false;
@@ -319,11 +349,13 @@ export async function initPopup({
       try {
         await consumePendingCapture(pendingCaptureId);
       } catch (error) {
-        setStatus(
-          elements.status,
-          `Draft saved, but the captured selection remains queued: ${errorMessage(error)}`,
-          "warning",
-        );
+        if (!handleDataResetError(error)) {
+          setStatus(
+            elements.status,
+            `Draft saved, but the captured selection remains queued: ${errorMessage(error)}`,
+            "warning",
+          );
+        }
       }
     }
     return saved;
@@ -331,6 +363,9 @@ export async function initPopup({
 
   function scheduleDraftSave() {
     cancelDraftTimer();
+    if (dataResetConflict) {
+      return;
+    }
     draftTimer = timerApi.setTimeout(() => {
       draftTimer = null;
       void persistDraft();
@@ -363,7 +398,9 @@ export async function initPopup({
   }
 
   async function consumePendingCapture(identifier, { offerSelection = true } = {}) {
-    const result = await removePendingCapture(identifier, storage);
+    const result = await removePendingCapture(identifier, storage, {
+      expectedEpoch: dataEpoch,
+    });
     if (appliedPendingCaptureId === identifier) {
       appliedPendingCaptureId = "";
     }
@@ -464,6 +501,11 @@ export async function initPopup({
   }
 
   async function saveNote(allowDuplicate = false) {
+    if (dataResetConflict) {
+      markDataResetConflict();
+      elements.body.focus();
+      return;
+    }
     let focusTarget = null;
     const savedCourse = elements.course.value;
     const savedWithSource = hasSource(currentSource);
@@ -495,6 +537,7 @@ export async function initPopup({
               draftGeneration + 1,
               draftCursor.contentGeneration + 1,
             ),
+            expectedEpoch: dataEpoch,
           },
         ),
       );
@@ -510,6 +553,9 @@ export async function initPopup({
         try {
           await consumePendingCapture(pendingCaptureId);
         } catch (error) {
+          if (handleDataResetError(error)) {
+            throw error;
+          }
           pendingWarning =
             `Note saved, but the captured selection remains queued: ${errorMessage(error)}`;
         }
@@ -525,10 +571,13 @@ export async function initPopup({
       setStatus(elements.status, warning || successMessage, warning ? "warning" : "success");
       focusTarget = elements.body;
     } catch (error) {
-      if (draftDirty) {
+      const resetConflict = handleDataResetError(error);
+      if (draftDirty && !resetConflict) {
         scheduleDraftSave();
       }
-      if (error instanceof ValidationError && error.code === "duplicate") {
+      if (resetConflict) {
+        focusTarget = elements.body;
+      } else if (error instanceof ValidationError && error.code === "duplicate") {
         elements.duplicate.hidden = false;
         setStatus(elements.status, "Review the duplicate warning before saving.", "warning");
         timerApi.setTimeout(() => elements.saveCopy.focus(), 0);
@@ -666,7 +715,9 @@ export async function initPopup({
     try {
       await consumePendingCapture(captureId, { offerSelection: !wasApplied });
       if (wasApplied) {
-        const currentDraftRecord = await loadPopupDraft(storage);
+        const currentDraftRecord = await loadPopupDraft(storage, {
+          expectedEpoch: dataEpoch,
+        });
         updateDraftCursor(currentDraftRecord);
         draftGeneration = Math.max(draftGeneration, currentDraftRecord.contentGeneration);
         draftDirty = false;
@@ -698,7 +749,9 @@ export async function initPopup({
         : "Captured selection discarded.";
       setStatus(elements.status, message, "success");
     } catch (error) {
-      setStatus(elements.status, `Captured selection not discarded: ${errorMessage(error)}`, "error");
+      if (!handleDataResetError(error)) {
+        setStatus(elements.status, `Captured selection not discarded: ${errorMessage(error)}`, "error");
+      }
     } finally {
       setBusy(false);
     }
@@ -732,6 +785,7 @@ export async function initPopup({
             draftGeneration,
             draftCursor.contentGeneration + 1,
           ),
+          expectedEpoch: dataEpoch,
         }),
       );
       updateDraftCursor(result.record);
@@ -753,7 +807,9 @@ export async function initPopup({
       }
       shouldFocusBody = true;
     } catch (error) {
-      setStatus(elements.status, errorMessage(error), "error");
+      if (!handleDataResetError(error)) {
+        setStatus(elements.status, errorMessage(error), "error");
+      }
     } finally {
       setBusy(false);
       updateDiscardControl();
@@ -767,18 +823,30 @@ export async function initPopup({
     if (
       areaName !== "local" ||
       destroyed ||
-      (!changes[STORAGE_KEYS.state] && !changes[STORAGE_KEYS.pendingCaptures])
+      (!changes[STORAGE_KEYS.state] &&
+        !changes[STORAGE_KEYS.pendingCaptures] &&
+        !changes[STORAGE_KEYS.dataEpoch])
     ) {
+      return;
+    }
+    if (
+      changes[STORAGE_KEYS.dataEpoch] &&
+      dataEpoch &&
+      changes[STORAGE_KEYS.dataEpoch].newValue !== dataEpoch
+    ) {
+      markDataResetConflict();
       return;
     }
     try {
       if (changes[STORAGE_KEYS.state]) {
-        state = await loadState(storage);
+        state = await loadState(storage, { expectedEpoch: dataEpoch });
         applyTheme(state.settings.theme, documentValue);
         renderRecentNotes();
       }
       if (changes[STORAGE_KEYS.pendingCaptures]) {
-        const captures = await loadPendingCaptures(storage);
+        const captures = await loadPendingCaptures(storage, {
+          expectedEpoch: dataEpoch,
+        });
         const offerSelection = Boolean(
           captures[0] && captures[0].id !== appliedPendingCaptureId,
         );
@@ -788,7 +856,9 @@ export async function initPopup({
         }
       }
     } catch (error) {
-      setStatus(elements.status, errorMessage(error), "error");
+      if (!handleDataResetError(error)) {
+        setStatus(elements.status, errorMessage(error), "error");
+      }
     }
   };
   chromeApi.storage.onChanged?.addListener(storageChangeHandler);
@@ -797,14 +867,15 @@ export async function initPopup({
   let loadSucceeded = false;
   try {
     const capturePromise = captureActivePage(chromeApi).catch((error) => error);
-    state = await loadState(storage);
+    dataEpoch = await loadDataEpoch(storage);
+    state = await loadState(storage, { expectedEpoch: dataEpoch });
     applyTheme(state.settings.theme, documentValue);
-    const [draftRecord, capture, recovery, helpPreference, queuedCaptures] = await Promise.all([
-      loadPopupDraft(storage),
+    const [draftRecord, capture, recovery, savedHelpSeen, queuedCaptures] = await Promise.all([
+      loadPopupDraft(storage, { expectedEpoch: dataEpoch }),
       capturePromise,
-      loadRecoveryInfo(storage),
-      storage.get(STORAGE_KEYS.helpSeen),
-      loadPendingCaptures(storage),
+      loadRecoveryInfo(storage, { expectedEpoch: dataEpoch }),
+      loadHelpSeen(storage, { expectedEpoch: dataEpoch }),
+      loadPendingCaptures(storage, { expectedEpoch: dataEpoch }),
     ]);
     const draft = draftRecord.draft;
     updateDraftCursor(draftRecord);
@@ -849,13 +920,15 @@ export async function initPopup({
     ready = true;
     loadSucceeded = true;
 
-    helpSeen = helpPreference[STORAGE_KEYS.helpSeen] === true;
+    helpSeen = savedHelpSeen;
     if (!helpSeen) {
       await showHelp();
     }
 
   } catch (error) {
-    setStatus(elements.status, `Notes could not be loaded: ${errorMessage(error)}`, "error");
+    if (!handleDataResetError(error)) {
+      setStatus(elements.status, `Notes could not be loaded: ${errorMessage(error)}`, "error");
+    }
   } finally {
     setBusy(!loadSucceeded);
     updateDiscardControl();
@@ -867,7 +940,7 @@ export async function initPopup({
 
   function handoffDraft() {
     cancelDraftTimer();
-    if (!ready || !draftDirty) {
+    if (dataResetConflict || !ready || !draftDirty) {
       return;
     }
     const draft = formDraft();
@@ -882,6 +955,7 @@ export async function initPopup({
         expectedOwnerSessionId,
         expectedGeneration,
         contentGeneration,
+        expectedEpoch: dataEpoch,
       });
       if (
         result.saved &&
@@ -889,7 +963,9 @@ export async function initPopup({
       ) {
         updateDraftCursor(result.record);
         if (pendingCaptureId) {
-          await removePendingCapture(pendingCaptureId, storage);
+          await removePendingCapture(pendingCaptureId, storage, {
+            expectedEpoch: dataEpoch,
+          });
         }
       }
     };
@@ -904,10 +980,14 @@ export async function initPopup({
           expectedGeneration,
           contentGeneration,
           pendingCaptureId,
+          expectedEpoch: dataEpoch,
         })
         .then((response) => {
           if (!response?.ok) {
-            throw new Error(response?.error || "The background page did not save the draft.");
+            const message = response?.error || "The background page did not save the draft.";
+            throw response?.code
+              ? new ValidationError(message, response.code)
+              : new Error(message);
           }
           if (
             response.saved &&
@@ -916,12 +996,17 @@ export async function initPopup({
             updateDraftCursor(response.cursor);
           }
         })
-        .catch(saveDirectly);
+        .catch((error) => {
+          if (error instanceof ValidationError && error.code === "data-reset") {
+            throw error;
+          }
+          return saveDirectly();
+        });
     } else {
       operation = saveDirectly();
     }
     const guardedOperation = operation.catch((error) => {
-      if (!destroyed) {
+      if (!destroyed && !handleDataResetError(error)) {
         setStatus(elements.status, `Draft not saved: ${errorMessage(error)}`, "error");
       }
     });

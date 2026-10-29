@@ -302,7 +302,11 @@ test("quarantines a malformed stored note while keeping valid notes", async () =
 });
 
 test("migrates state and draft in one retryable storage write", async () => {
-  const storage = memoryStorage({ result: "Generated", selectedText: "Selected" });
+  const storage = memoryStorage({
+    result: "Generated",
+    selectedText: "Selected",
+    [STORAGE_KEYS.dataEpoch]: "migration-epoch",
+  });
   const originalSet = storage.set;
   let fail = true;
   storage.set = async (update) => {
@@ -583,6 +587,7 @@ test("preserves popup drafts from a newer storage version", async () => {
   const storage = memoryStorage({
     [STORAGE_KEYS.state]: createEmptyState(),
     [STORAGE_KEYS.draft]: futureRecord,
+    [STORAGE_KEYS.dataEpoch]: "future-popup-epoch",
   });
   const before = structuredClone(storage.values);
 
@@ -882,6 +887,7 @@ test("preserves editor drafts from a newer storage version", async () => {
   const storage = memoryStorage({
     [STORAGE_KEYS.state]: createEmptyState(),
     [STORAGE_KEYS.editorDraft]: futureRecord,
+    [STORAGE_KEYS.dataEpoch]: "future-editor-epoch",
   });
   const before = structuredClone(storage.values);
 
@@ -920,7 +926,10 @@ test("does not quarantine a draft when canonicalization storage fails", async ()
     generation: 1,
     draft: { ...editorDraft(), ignored: "drop this" },
   };
-  const storage = memoryStorage({ [STORAGE_KEYS.editorDraft]: rawRecord });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.editorDraft]: rawRecord,
+    [STORAGE_KEYS.dataEpoch]: "canonicalization-epoch",
+  });
   const before = structuredClone(storage.values);
   const storedSet = storage.set.bind(storage);
   let setCalls = 0;

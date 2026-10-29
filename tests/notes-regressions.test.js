@@ -55,6 +55,9 @@ async function setupLibrary(t, notes, storage = null, options = {}) {
     [STORAGE_KEYS.state]: { ...createEmptyState(), notes },
   });
   const chromeApi = chromeMock(storageValue);
+  if (options.runtime) {
+    chromeApi.runtime = options.runtime;
+  }
   const controller = await initLibrary({
     documentValue: dom.window.document,
     chromeApi,
@@ -132,6 +135,41 @@ test("keeps state actions disabled after load failure and supports retry", async
   assert.equal(documentValue.getElementById("notesList").inert, false);
   assert.equal(documentValue.getElementById("newNoteButton").disabled, false);
   assert.equal(documentValue.querySelectorAll(".note-card").length, 1);
+});
+
+test("rejects a library read when data resets without a storage event", async (t) => {
+  const stored = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "epoch-before-reset",
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      notes: [note("stale", "This old note must not load")],
+    },
+  });
+  let resetDuringStateRead = false;
+  const storage = {
+    values: stored.values,
+    async get(keys) {
+      const result = await stored.get(keys);
+      const names = Array.isArray(keys) ? keys : [keys];
+      if (!resetDuringStateRead && names.includes(STORAGE_KEYS.state)) {
+        resetDuringStateRead = true;
+        stored.values[STORAGE_KEYS.dataEpoch] = "epoch-after-reset";
+        stored.values[STORAGE_KEYS.state] = createEmptyState();
+      }
+      return result;
+    },
+    set: stored.set.bind(stored),
+    remove: stored.remove.bind(stored),
+  };
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+
+  assert.equal(controller.getState(), undefined);
+  assert.equal(documentValue.querySelectorAll(".note-card").length, 0);
+  assert.equal(documentValue.getElementById("resultSummary").textContent, "Reload required");
+  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+  assert.deepEqual(storage.values[STORAGE_KEYS.state], createEmptyState());
 });
 
 test("keeps the library readable when a newer version owns the editor draft", async (t) => {
@@ -760,6 +798,368 @@ test("renders 101 notes in two batches", async (t) => {
   );
 });
 
+test("selects every filtered note without rendering every card", async (t) => {
+  const notes = Array.from({ length: 102 }, (_, index) =>
+    note(`note-${index}`, `Body ${index}`, {
+      course: index === 101 ? "History" : "Physics",
+    }),
+  );
+  const setup = await setupLibrary(t, notes);
+  const { documentValue } = setup;
+  const course = documentValue.getElementById("courseFilter");
+  course.value = "Physics";
+  course.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+
+  documentValue.getElementById("selectionModeButton").click();
+  assert.equal(documentValue.getElementById("selectionToolbar").hidden, false);
+  assert.equal(documentValue.querySelectorAll(".note-select-checkbox").length, 100);
+  assert.match(
+    documentValue.querySelector(".note-select-checkbox").getAttribute("aria-label"),
+    /^Select Note /u,
+  );
+  assert.equal(documentValue.activeElement.classList.contains("note-select-checkbox"), true);
+
+  documentValue.getElementById("selectAllFilteredButton").click();
+
+  assert.equal(documentValue.getElementById("selectionCount").textContent, "101 notes selected");
+  assert.equal(documentValue.querySelectorAll(".note-select-checkbox:checked").length, 100);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("clearSelectionButton"));
+
+  documentValue.getElementById("showMoreButton").click();
+  assert.equal(documentValue.querySelectorAll(".note-select-checkbox").length, 101);
+  assert.equal(documentValue.activeElement.classList.contains("note-select-checkbox"), true);
+  assert.equal(
+    documentValue.activeElement.closest("[data-note-id]"),
+    documentValue.querySelectorAll("[data-note-id]")[100],
+  );
+
+  documentValue.getElementById("cancelSelectionButton").click();
+  assert.equal(documentValue.getElementById("selectionToolbar").hidden, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("selectionModeButton"));
+  assert.equal(documentValue.querySelector(".note-selection").hidden, true);
+});
+
+test("sets and clears one course for selected notes in one revision", async (t) => {
+  const setup = await setupLibrary(t, [
+    note("first", "First body", { course: "Physics" }),
+    note("second", "Second body", { course: "Math" }),
+    note("third", "Third body", { course: "History" }),
+  ]);
+  const { controller, documentValue } = setup;
+  documentValue.getElementById("selectionModeButton").click();
+  for (const identifier of ["first", "second"]) {
+    const checkbox = documentValue.querySelector(`[data-note-id='${identifier}'] .note-select-checkbox`);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  }
+
+  const initialRevision = controller.getState().revision;
+  documentValue.getElementById("bulkCourseButton").click();
+  assert.equal(documentValue.getElementById("bulkCourseDialog").open, true);
+  documentValue.getElementById("bulkCourseInput").value = "Data Science";
+  submit(documentValue, "bulkCourseForm");
+  await waitFor(() => controller.getState().revision === initialRevision + 1);
+
+  assert.deepEqual(
+    controller.getState().notes.map((entry) => [entry.id, entry.course]),
+    [
+      ["first", "Data Science"],
+      ["second", "Data Science"],
+      ["third", "History"],
+    ],
+  );
+  assert.equal(documentValue.getElementById("selectionCount").textContent, "2 notes selected");
+
+  documentValue.getElementById("bulkCourseButton").click();
+  documentValue.getElementById("clearBulkCourseButton").click();
+  await waitFor(() => controller.getState().revision === initialRevision + 2);
+
+  assert.deepEqual(
+    controller.getState().notes.map((entry) => [entry.id, entry.course]),
+    [
+      ["first", ""],
+      ["second", ""],
+      ["third", "History"],
+    ],
+  );
+});
+
+test("keeps selection focus stable when a bulk course change prunes results", async (t) => {
+  const setup = await setupLibrary(t, [
+    note("physics", "First body", { title: "First", course: "Quantum Mechanics" }),
+    note("math", "Second body", { title: "Second", course: "Math" }),
+  ]);
+  const { controller, documentValue } = setup;
+  const search = documentValue.getElementById("searchInput");
+  search.value = "Quantum";
+  search.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  await waitFor(() => documentValue.querySelectorAll(".note-card").length === 1);
+
+  documentValue.getElementById("selectionModeButton").click();
+  const checkbox = documentValue.querySelector(".note-select-checkbox");
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  const initialRevision = controller.getState().revision;
+  documentValue.getElementById("bulkCourseButton").click();
+  documentValue.getElementById("bulkCourseInput").value = "Math";
+  submit(documentValue, "bulkCourseForm");
+  await waitFor(() => controller.getState().revision === initialRevision + 1);
+
+  assert.equal(documentValue.getElementById("selectionCount").textContent, "0 notes selected");
+  assert.equal(documentValue.getElementById("bulkCourseButton").disabled, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("cancelSelectionButton"));
+});
+
+test("moves focus when a pending search clears a bulk selection", async (t) => {
+  const setup = await setupLibrary(t, [
+    note("first", "First body"),
+    note("second", "Second body"),
+  ]);
+  const { documentValue } = setup;
+  documentValue.getElementById("selectionModeButton").click();
+  const checkbox = documentValue.querySelector("[data-note-id='first'] .note-select-checkbox");
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+
+  const search = documentValue.getElementById("searchInput");
+  search.value = "No matching lecture";
+  search.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  const bulkCourse = documentValue.getElementById("bulkCourseButton");
+  bulkCourse.focus();
+  bulkCourse.click();
+
+  assert.equal(documentValue.getElementById("selectionCount").textContent, "0 notes selected");
+  assert.equal(bulkCourse.disabled, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("cancelSelectionButton"));
+  await waitFor(() => documentValue.getElementById("noResultsState").hidden === false);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("cancelSelectionButton"));
+});
+
+test("moves selected notes to Trash with one confirmed mutation", async (t) => {
+  const setup = await setupLibrary(t, [
+    note("first", "First body"),
+    note("second", "Second body"),
+    note("third", "Third body"),
+  ]);
+  const { controller, documentValue } = setup;
+  documentValue.getElementById("selectionModeButton").click();
+  for (const identifier of ["first", "second"]) {
+    const checkbox = documentValue.querySelector(`[data-note-id='${identifier}'] .note-select-checkbox`);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  }
+  const initialRevision = controller.getState().revision;
+
+  documentValue.getElementById("bulkTrashButton").click();
+  assert.equal(documentValue.getElementById("bulkConfirmDialog").open, true);
+  submit(documentValue, "bulkConfirmForm");
+  await waitFor(() => controller.getState().trash.length === 2);
+
+  assert.equal(controller.getState().revision, initialRevision + 1);
+  assert.deepEqual(controller.getState().notes.map((entry) => entry.id), ["third"]);
+  assert.deepEqual(controller.getState().trash.map((entry) => entry.note.id), ["first", "second"]);
+  assert.equal(documentValue.getElementById("selectionToolbar").hidden, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("selectionModeButton"));
+});
+
+test("stops a bulk Trash action when a selected note changed", async (t) => {
+  const original = note("first", "Original body");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original, note("second", "Second body")] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+  documentValue.getElementById("selectionModeButton").click();
+  const checkbox = documentValue.querySelector("[data-note-id='first'] .note-select-checkbox");
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  documentValue.getElementById("bulkTrashButton").click();
+
+  storage.values[STORAGE_KEYS.state] = {
+    ...structuredClone(controller.getState()),
+    revision: controller.getState().revision + 1,
+    notes: [
+      { ...structuredClone(original), body: "Changed elsewhere" },
+      structuredClone(controller.getState().notes.find((entry) => entry.id === "second")),
+    ],
+  };
+  submit(documentValue, "bulkConfirmForm");
+  await waitFor(() => documentValue.getElementById("bulkConfirmStatus").textContent.includes("changed in another window"));
+
+  assert.equal(documentValue.getElementById("bulkConfirmDialog").open, true);
+  assert.equal(storage.values[STORAGE_KEYS.state].trash.length, 0);
+  assert.equal(storage.values[STORAGE_KEYS.state].notes[0].body, "Changed elsewhere");
+});
+
+test("restores and permanently deletes selected Trash entries", async (t) => {
+  let state = {
+    ...createEmptyState(),
+    notes: [
+      note("first", "First body"),
+      note("second", "Second body"),
+      note("third", "Third body"),
+    ],
+  };
+  state = moveNoteToTrash(state, "first", { now: START }).state;
+  state = moveNoteToTrash(state, "second", { now: START }).state;
+  state = moveNoteToTrash(state, "third", { now: START }).state;
+  const setup = await setupLibrary(
+    t,
+    [],
+    memoryStorage({ [STORAGE_KEYS.state]: state }),
+  );
+  const { controller, documentValue } = setup;
+  documentValue.getElementById("trashViewButton").click();
+  documentValue.getElementById("selectionModeButton").click();
+  for (const identifier of ["first", "second"]) {
+    const checkbox = documentValue.querySelector(`[data-note-id='${identifier}'] .note-select-checkbox`);
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  }
+  const initialRevision = controller.getState().revision;
+  documentValue.getElementById("bulkRestoreButton").click();
+  await waitFor(() => controller.getState().notes.length === 2);
+
+  assert.equal(controller.getState().revision, initialRevision + 1);
+  assert.deepEqual(controller.getState().notes.map((entry) => entry.id), ["first", "second"]);
+  assert.deepEqual(controller.getState().trash.map((entry) => entry.note.id), ["third"]);
+
+  documentValue.getElementById("selectionModeButton").click();
+  const remaining = documentValue.querySelector("[data-note-id='third'] .note-select-checkbox");
+  remaining.checked = true;
+  remaining.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  documentValue.getElementById("bulkPermanentDeleteButton").click();
+  assert.match(documentValue.getElementById("bulkConfirmWarning").textContent, /cannot be undone/u);
+  submit(documentValue, "bulkConfirmForm");
+  await waitFor(() => controller.getState().trash.length === 0);
+
+  assert.equal(controller.getState().revision, initialRevision + 2);
+  assert.equal(documentValue.getElementById("resultSummary").textContent, "Trash is empty");
+});
+
+test("exports only notes chosen in selection mode", async (t) => {
+  const blobs = [];
+  const setup = await setupLibrary(
+    t,
+    [
+      note("first", "First body", { title: "First lecture" }),
+      note("second", "Second body", { title: "Second lecture" }),
+    ],
+    null,
+    {
+      urlApi: {
+        createObjectURL(blob) {
+          blobs.push(blob);
+          return "blob:test";
+        },
+        revokeObjectURL() {},
+      },
+    },
+  );
+  const { documentValue } = setup;
+  documentValue.defaultView.HTMLAnchorElement.prototype.click = function click() {};
+  documentValue.getElementById("selectionModeButton").click();
+  const checkbox = documentValue.querySelector("[data-note-id='second'] .note-select-checkbox");
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  documentValue.getElementById("bulkExportButton").click();
+  await waitFor(() => blobs.length === 1);
+
+  const markdown = await blobs[0].text();
+  assert.match(markdown, /Second lecture/u);
+  assert.doesNotMatch(markdown, /First lecture/u);
+  assert.equal(
+    documentValue.getElementById("libraryStatus").textContent,
+    "Exported 1 selected note as Markdown.",
+  );
+});
+
+test("keeps editor text visible and blocks writes after a data reset", async (t) => {
+  const original = note("first", "Original body");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, controller, documentValue } = setup;
+  documentValue.querySelector("[data-action='edit']").click();
+  const body = documentValue.getElementById("editorBody");
+  body.value = "Text kept in the old page";
+  body.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+
+  const priorEpoch = storage.values[STORAGE_KEYS.dataEpoch];
+  const resetState = createEmptyState();
+  storage.values[STORAGE_KEYS.dataEpoch] = "epoch-after-reset";
+  storage.values[STORAGE_KEYS.state] = resetState;
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.dataEpoch]: {
+      oldValue: priorEpoch,
+      newValue: "epoch-after-reset",
+    },
+    [STORAGE_KEYS.state]: {
+      oldValue: controller.getState(),
+      newValue: resetState,
+    },
+  });
+
+  assert.equal(body.value, "Text kept in the old page");
+  assert.equal(documentValue.getElementById("editorDialog").open, true);
+  assert.equal(documentValue.getElementById("newNoteButton").disabled, true);
+  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
+  assert.match(documentValue.getElementById("editorStatus").textContent, /still here/u);
+
+  submit(documentValue, "editorForm");
+  await waitFor(() => documentValue.getElementById("libraryStatus").textContent.includes("reset in another window"));
+
+  assert.equal(body.value, "Text kept in the old page");
+  assert.equal(documentValue.getElementById("editorDialog").open, true);
+  assert.deepEqual(storage.values[STORAGE_KEYS.state], resetState);
+});
+
+test("blocks a clean editor after reset, keeps text, and closes on cancel", async (t) => {
+  const original = note("first", "Original body");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const setup = await setupLibrary(t, [], storage, { confirmDiscardDraft: () => true });
+  const { chromeApi, controller, documentValue } = setup;
+  documentValue.querySelector("[data-action='edit']").click();
+
+  const priorEpoch = storage.values[STORAGE_KEYS.dataEpoch];
+  const resetState = createEmptyState();
+  storage.values[STORAGE_KEYS.dataEpoch] = "epoch-after-clean-editor";
+  storage.values[STORAGE_KEYS.state] = resetState;
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.dataEpoch]: {
+      oldValue: priorEpoch,
+      newValue: "epoch-after-clean-editor",
+    },
+    [STORAGE_KEYS.state]: {
+      oldValue: controller.getState(),
+      newValue: resetState,
+    },
+  });
+
+  const body = documentValue.getElementById("editorBody");
+  assert.match(documentValue.getElementById("editorStatus").textContent, /can no longer save/u);
+  assert.equal(documentValue.getElementById("saveEditorButton").disabled, true);
+  assert.equal(documentValue.getElementById("editorSaveDuplicateButton").disabled, true);
+  assert.equal(documentValue.getElementById("saveEditorAsNewButton").disabled, true);
+  assert.equal(body.disabled, false);
+
+  body.value = "Text entered after the reset";
+  body.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "editorForm");
+
+  assert.equal(body.value, "Text entered after the reset");
+  assert.match(documentValue.getElementById("editorStatus").textContent, /can no longer save/u);
+  assert.deepEqual(storage.values[STORAGE_KEYS.state], resetState);
+
+  documentValue.getElementById("editorDialog").dispatchEvent(
+    new documentValue.defaultView.Event("cancel", { cancelable: true }),
+  );
+  await waitFor(() => documentValue.getElementById("editorDialog").open === false);
+});
+
 test("suggests saved courses and labels the active date sort", async (t) => {
   const first = note("first", "First body", { course: "Physics" });
   const second = {
@@ -1250,6 +1650,48 @@ test("pagehide keeps input newer than an in-flight draft clear", async (t) => {
   dom.window.dispatchEvent(new dom.window.Event("pagehide"));
 
   await waitFor(() => storage.values[STORAGE_KEYS.editorDraft]?.draft?.body === "Latest version");
+});
+
+test("does not retry an editor handoff rejected after a data reset", async (t) => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const messages = [];
+  let nextTimer = 0;
+  const scheduled = new Set();
+  const setup = await setupLibrary(t, [], storage, {
+    runtime: {
+      async sendMessage(message) {
+        messages.push(message);
+        return {
+          ok: false,
+          error: "The note data was reset in another window.",
+          code: "data-reset",
+        };
+      },
+    },
+    timerApi: {
+      clearTimeout(identifier) {
+        scheduled.delete(identifier);
+      },
+      setTimeout() {
+        nextTimer += 1;
+        scheduled.add(nextTimer);
+        return nextTimer;
+      },
+    },
+  });
+  const { documentValue, dom } = setup;
+  documentValue.getElementById("newNoteButton").click();
+  const body = documentValue.getElementById("editorBody");
+  body.value = "Keep this editor text";
+  body.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+  dom.window.dispatchEvent(new dom.window.Event("pagehide"));
+  await waitFor(() => messages.length === 1);
+  await waitFor(() => documentValue.getElementById("libraryStatus").textContent.includes("reset in another window"));
+
+  assert.equal(messages[0].expectedEpoch, storage.values[STORAGE_KEYS.dataEpoch]);
+  assert.equal(STORAGE_KEYS.editorDraft in storage.values, false);
+  assert.equal(body.value, "Keep this editor text");
+  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
 });
 
 test("keeps an autosaved draft when the editor closes", async (t) => {

@@ -990,18 +990,15 @@ export function restoreTrashedNotes(stateValue, identifierValues, options = {}) 
     throw new ValidationError("A selected note has already been restored.", "duplicate-id");
   }
 
-  const trashIndexes = new Map(state.trash.map((entry, index) => [entry.note.id, index]));
-  const insertionOrder = [...selected].sort(
-    (left, right) =>
-      left.originalIndex - right.originalIndex ||
-      trashIndexes.get(right.note.id) - trashIndexes.get(left.note.id),
-  );
-  const notes = [...state.notes];
-  for (const entry of insertionOrder) {
-    const targetIndex = Math.max(0, Math.min(entry.originalIndex, notes.length));
-    notes.splice(targetIndex, 0, entry.note);
-  }
   const selectedIds = new Set(identifiers);
+  const reconstructed = [...state.notes];
+  for (const entry of state.trash) {
+    const targetIndex = Math.max(0, Math.min(entry.originalIndex, reconstructed.length));
+    reconstructed.splice(targetIndex, 0, entry.note);
+  }
+  const notes = reconstructed.filter(
+    (note) => activeIdentifiers.has(note.id) || selectedIds.has(note.id),
+  );
   const trash = state.trash.filter((entry) => !selectedIds.has(entry.note.id));
   const restoredNotes = notes.filter((note) => selectedIds.has(note.id));
 

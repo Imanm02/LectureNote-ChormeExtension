@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { LIMITS, createEmptyState, createNote } from "../src/model.js";
 import { initPopup } from "../src/popup.js";
-import { loadDraft, STORAGE_KEYS } from "../src/storage.js";
+import { loadDraft, resetAllData, STORAGE_KEYS } from "../src/storage.js";
 import { chromeMock, loadPage, memoryStorage, waitFor } from "./helpers.js";
 
 function input(windowValue, element) {
@@ -186,8 +186,10 @@ test("falls back to direct storage when background handoff reports an error", as
   const dom = loadPage("popup.html");
   const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
   const chromeApi = chromeMock(storage);
+  let sentMessage;
   chromeApi.runtime = {
-    async sendMessage() {
+    async sendMessage(message) {
+      sentMessage = message;
       return { ok: false, error: "Background storage failed" };
     },
   };
@@ -203,6 +205,44 @@ test("falls back to direct storage when background handoff reports an error", as
   await controller.flushDraft();
 
   assert.equal((await loadDraft(storage)).body, "Keep this closing popup draft");
+  assert.equal(sentMessage.expectedEpoch, storage.values[STORAGE_KEYS.dataEpoch]);
+  controller.destroy();
+  dom.window.close();
+});
+
+test("does not retry a background data reset conflict", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const chromeApi = chromeMock(storage);
+  chromeApi.runtime = {
+    async sendMessage() {
+      return {
+        ok: false,
+        error: "The note data was reset in another window.",
+        code: "data-reset",
+      };
+    },
+  };
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi,
+  });
+  const body = dom.window.document.getElementById("bodyInput");
+  body.value = "Keep the rejected handoff visible";
+  input(dom.window, body);
+
+  dom.window.dispatchEvent(new dom.window.Event("pagehide"));
+  await controller.flushDraft();
+
+  assert.equal(await loadDraft(storage), null);
+  assert.equal(body.value, "Keep the rejected handoff visible");
+  assert.match(
+    dom.window.document.getElementById("status").textContent,
+    /copy it, then reopen Lecture Notes/iu,
+  );
   controller.destroy();
   dom.window.close();
 });
@@ -226,6 +266,128 @@ test("hands off a dirty draft when the popup becomes hidden", async () => {
   await controller.flushDraft();
 
   assert.equal((await loadDraft(storage)).body, "Save before the popup closes");
+  controller.destroy();
+  dom.window.close();
+});
+
+test("stops autosave and handoff after observing a data reset", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const chromeApi = chromeMock(storage);
+  const sentMessages = [];
+  chromeApi.runtime = {
+    async sendMessage(message) {
+      sentMessages.push(message);
+      return { ok: true, saved: true };
+    },
+  };
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi,
+  });
+  const body = dom.window.document.getElementById("bodyInput");
+  body.value = "Keep this visible for manual copy";
+  input(dom.window, body);
+  const oldEpoch = storage.values[STORAGE_KEYS.dataEpoch];
+  const oldState = structuredClone(storage.values[STORAGE_KEYS.state]);
+  const reset = await resetAllData(storage, {
+    lockManager: null,
+    epochFactory: () => "popup-observed-reset",
+  });
+  const resetDraft = structuredClone(storage.values[STORAGE_KEYS.draft]);
+
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.state]: { oldValue: oldState, newValue: reset.state },
+    [STORAGE_KEYS.dataEpoch]: { oldValue: oldEpoch, newValue: reset.epoch },
+  });
+  dom.window.dispatchEvent(new dom.window.Event("pagehide"));
+  await controller.flushDraft();
+
+  assert.equal(body.value, "Keep this visible for manual copy");
+  assert.match(
+    dom.window.document.getElementById("status").textContent,
+    /copy it, then reopen Lecture Notes/iu,
+  );
+  assert.equal(dom.window.document.getElementById("saveButton").disabled, true);
+  assert.equal(sentMessages.length, 0);
+  assert.deepEqual(storage.values[STORAGE_KEYS.draft], resetDraft);
+  assert.equal(storage.values[STORAGE_KEYS.state].notes.length, 0);
+  controller.destroy();
+  dom.window.close();
+});
+
+test("rejects a stale popup save and lets a new popup save", async () => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const staleDom = loadPage("popup.html");
+  const staleController = await initPopup({
+    documentValue: staleDom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+  const staleBody = staleDom.window.document.getElementById("bodyInput");
+  staleBody.value = "Copy this stale text before reopening";
+  input(staleDom.window, staleBody);
+  await resetAllData(storage, {
+    lockManager: null,
+    epochFactory: () => "popup-silent-reset",
+  });
+
+  submit(staleDom.window, staleDom.window.document.getElementById("noteForm"));
+  await waitFor(() =>
+    staleDom.window.document.getElementById("status").textContent.includes("reopen Lecture Notes"),
+  );
+
+  assert.equal(staleBody.value, "Copy this stale text before reopening");
+  assert.equal(storage.values[STORAGE_KEYS.state].notes.length, 0);
+  assert.equal(await loadDraft(storage), null);
+  staleController.destroy();
+  staleDom.window.close();
+
+  const freshDom = loadPage("popup.html");
+  const freshController = await initPopup({
+    documentValue: freshDom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+  const freshBody = freshDom.window.document.getElementById("bodyInput");
+  freshBody.value = "Fresh note after reset";
+  input(freshDom.window, freshBody);
+  submit(freshDom.window, freshDom.window.document.getElementById("noteForm"));
+  await waitFor(() => storage.values[STORAGE_KEYS.state].notes.length === 1);
+
+  assert.equal(storage.values[STORAGE_KEYS.state].notes[0].body, "Fresh note after reset");
+  freshController.destroy();
+  freshDom.window.close();
+});
+
+test("blocks a first-use popup when reset races with its help preference", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const originalSet = storage.set.bind(storage);
+  let resetDuringHelp = false;
+  storage.set = async (update) => {
+    await originalSet(update);
+    if (!resetDuringHelp && update[STORAGE_KEYS.helpSeen]) {
+      resetDuringHelp = true;
+      storage.values[STORAGE_KEYS.dataEpoch] = "help-race-reset-epoch";
+    }
+  };
+
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+
+  assert.equal(resetDuringHelp, true);
+  assert.equal(dom.window.document.getElementById("saveButton").disabled, true);
+  assert.match(
+    dom.window.document.getElementById("status").textContent,
+    /copy it, then reopen Lecture Notes/iu,
+  );
   controller.destroy();
   dom.window.close();
 });

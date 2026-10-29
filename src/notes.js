@@ -8,12 +8,16 @@ import {
 } from "./backup.js";
 import {
   addNote,
+  assignCourseToNotes,
   emptyTrash,
   LIMITS,
   measureLibraryUsage,
   moveNoteToTrash,
+  moveNotesToTrash,
   permanentlyDeleteTrashedNote,
+  permanentlyDeleteTrashedNotes,
   restoreTrashedNote,
+  restoreTrashedNotes,
   updateNote,
   updateSettings,
   ValidationError,
@@ -24,6 +28,7 @@ import {
   acknowledgeRecovery,
   assertStateFits,
   clearEditorDraft,
+  loadDataEpoch,
   loadEditorDraft,
   loadRecoveryNotice,
   loadState,
@@ -64,6 +69,19 @@ function libraryElements(documentValue) {
     activeNoteCount: requiredElement(documentValue, "activeNoteCount"),
     trashNoteCount: requiredElement(documentValue, "trashNoteCount"),
     emptyTrash: requiredElement(documentValue, "emptyTrashButton"),
+    selectionMode: requiredElement(documentValue, "selectionModeButton"),
+    selectionToolbar: requiredElement(documentValue, "selectionToolbar"),
+    selectionCount: requiredElement(documentValue, "selectionCount"),
+    selectAllFiltered: requiredElement(documentValue, "selectAllFilteredButton"),
+    clearSelection: requiredElement(documentValue, "clearSelectionButton"),
+    cancelSelection: requiredElement(documentValue, "cancelSelectionButton"),
+    activeSelectionActions: requiredElement(documentValue, "activeSelectionActions"),
+    trashSelectionActions: requiredElement(documentValue, "trashSelectionActions"),
+    bulkCourse: requiredElement(documentValue, "bulkCourseButton"),
+    bulkExport: requiredElement(documentValue, "bulkExportButton"),
+    bulkTrash: requiredElement(documentValue, "bulkTrashButton"),
+    bulkRestore: requiredElement(documentValue, "bulkRestoreButton"),
+    bulkPermanentDelete: requiredElement(documentValue, "bulkPermanentDeleteButton"),
     exportJson: requiredElement(documentValue, "exportJsonButton"),
     exportMarkdown: requiredElement(documentValue, "exportMarkdownButton"),
     importButton: requiredElement(documentValue, "importButton"),
@@ -150,6 +168,23 @@ function libraryElements(documentValue) {
     emptyTrashStatus: requiredElement(documentValue, "emptyTrashStatus"),
     cancelEmptyTrash: requiredElement(documentValue, "cancelEmptyTrashButton"),
     confirmEmptyTrash: requiredElement(documentValue, "confirmEmptyTrashButton"),
+    bulkCourseDialog: requiredElement(documentValue, "bulkCourseDialog"),
+    bulkCourseForm: requiredElement(documentValue, "bulkCourseForm"),
+    bulkCourseMessage: requiredElement(documentValue, "bulkCourseMessage"),
+    bulkCourseInput: requiredElement(documentValue, "bulkCourseInput"),
+    bulkCourseStatus: requiredElement(documentValue, "bulkCourseStatus"),
+    cancelBulkCourse: requiredElement(documentValue, "cancelBulkCourseButton"),
+    clearBulkCourse: requiredElement(documentValue, "clearBulkCourseButton"),
+    applyBulkCourse: requiredElement(documentValue, "applyBulkCourseButton"),
+    bulkConfirmDialog: requiredElement(documentValue, "bulkConfirmDialog"),
+    bulkConfirmForm: requiredElement(documentValue, "bulkConfirmForm"),
+    bulkConfirmEyebrow: requiredElement(documentValue, "bulkConfirmEyebrow"),
+    bulkConfirmHeading: requiredElement(documentValue, "bulkConfirmHeading"),
+    bulkConfirmMessage: requiredElement(documentValue, "bulkConfirmMessage"),
+    bulkConfirmWarning: requiredElement(documentValue, "bulkConfirmWarning"),
+    bulkConfirmStatus: requiredElement(documentValue, "bulkConfirmStatus"),
+    cancelBulkConfirm: requiredElement(documentValue, "cancelBulkConfirmButton"),
+    confirmBulkAction: requiredElement(documentValue, "confirmBulkActionButton"),
     importDialog: requiredElement(documentValue, "importDialog"),
     importMessage: requiredElement(documentValue, "importMessage"),
     importExportedAt: requiredElement(documentValue, "importExportedAt"),
@@ -218,6 +253,8 @@ export async function initLibrary({
   const storage = chromeApi.storage.local;
   const numberFormatter = new Intl.NumberFormat(documentValue.documentElement.lang || undefined);
   let state;
+  let dataEpoch = "";
+  let dataResetConflict = false;
   let editingId = null;
   let editingSnapshot = null;
   let editingBaseNote = null;
@@ -260,6 +297,11 @@ export async function initLibrary({
   let searchTimer = null;
   let visibleLimit = DISPLAY_BATCH;
   let viewMode = "notes";
+  let selectionMode = false;
+  let selectedIds = new Set();
+  let selectionReturnFocus = null;
+  let pendingBulkCourse = null;
+  let pendingBulkAction = null;
   let courseSignature = "";
   let ready = false;
   let hashHandled = false;
@@ -271,6 +313,87 @@ export async function initLibrary({
 
   function trashWord(count) {
     return count === 1 ? "Trash entry" : "Trash entries";
+  }
+
+  function expectedEpochOptions(options = {}) {
+    return { ...options, expectedEpoch: dataEpoch };
+  }
+
+  function isDataResetError(error) {
+    return error instanceof ValidationError && error.code === "data-reset";
+  }
+
+  async function assertCurrentDataEpoch() {
+    const currentEpoch = await loadDataEpoch(storage);
+    if (dataEpoch && currentEpoch !== dataEpoch) {
+      throw new ValidationError(
+        "The note data was reset in another window. This older page cannot read or save changes.",
+        "data-reset",
+      );
+    }
+  }
+
+  async function readStateForPage() {
+    await assertCurrentDataEpoch();
+    const value = await loadState(storage, expectedEpochOptions());
+    await assertCurrentDataEpoch();
+    return value;
+  }
+
+  async function readEditorDraftForPage() {
+    await assertCurrentDataEpoch();
+    const value = await loadEditorDraft(storage, expectedEpochOptions());
+    await assertCurrentDataEpoch();
+    return value;
+  }
+
+  async function readRecoveryForPage() {
+    await assertCurrentDataEpoch();
+    const value = await loadRecoveryNotice(storage, expectedEpochOptions());
+    await assertCurrentDataEpoch();
+    return value;
+  }
+
+  function markDataResetConflict(statusElement = elements.status) {
+    dataResetConflict = true;
+    editorDraftBlocked = elements.editorDialog.open;
+    if (elements.editorDialog.open) {
+      if (editorDirty) {
+        editorDraftSynced = false;
+      }
+      setStatus(
+        elements.editorStatus,
+        editorDirty
+          ? "Saved data was reset in another window. This editor text is still here, but this older page cannot save it. Copy the text, then reload the library."
+          : "Saved data was reset in another window. This editor can no longer save from this older page. Reload the library before editing.",
+        "error",
+      );
+      setEditorBusy(false);
+    }
+    setLibraryAvailable(false);
+    elements.retryLoad.textContent = "Reload page";
+    elements.retryLoad.hidden = false;
+    elements.summary.textContent = "Reload required";
+    setStatus(
+      elements.status,
+      "Saved data was reset in another window. Reload this page before making more changes.",
+      "error",
+    );
+    if (statusElement !== elements.status && statusElement !== elements.editorStatus) {
+      setStatus(
+        statusElement,
+        "Saved data was reset in another window. Reload this page before trying again.",
+        "error",
+      );
+    }
+  }
+
+  function reportActionError(error, statusElement = elements.status) {
+    if (isDataResetError(error)) {
+      markDataResetConflict(statusElement);
+      return;
+    }
+    setStatus(statusElement, errorMessage(error), "error");
   }
 
   function formatStorageSize(bytes) {
@@ -351,6 +474,15 @@ export async function initLibrary({
       elements.theme,
       elements.notesView,
       elements.trashView,
+      elements.selectionMode,
+      elements.selectAllFiltered,
+      elements.clearSelection,
+      elements.cancelSelection,
+      elements.bulkCourse,
+      elements.bulkExport,
+      elements.bulkTrash,
+      elements.bulkRestore,
+      elements.bulkPermanentDelete,
       elements.exportJson,
       elements.exportMarkdown,
       elements.importButton,
@@ -362,7 +494,12 @@ export async function initLibrary({
       control.disabled = !available;
     }
     elements.emptyTrash.disabled = !available || !state || state.trash.length === 0;
+    const viewTotal = !state ? 0 : viewMode === "trash" ? state.trash.length : state.notes.length;
+    elements.selectionMode.disabled = !available || viewTotal === 0;
     elements.list.inert = !available;
+    if (state) {
+      updateSelectionControls();
+    }
   }
 
   function selectedNotes() {
@@ -374,6 +511,109 @@ export async function initLibrary({
       course: elements.course.value,
       sort: elements.sort.value,
     });
+  }
+
+  function currentViewRecord(identifier, stateValue = state, mode = viewMode) {
+    if (mode === "trash") {
+      return stateValue?.trash.find((entry) => entry.note.id === identifier) || null;
+    }
+    return stateValue?.notes.find((note) => note.id === identifier) || null;
+  }
+
+  function selectedRecordSnapshot() {
+    updateSelectionControls(selectedNotes());
+    const identifiers = [...selectedIds];
+    if (identifiers.length === 0) {
+      throw new ValidationError("Choose at least one note.", "selection-empty");
+    }
+    const records = identifiers.map((identifier) => currentViewRecord(identifier));
+    if (records.some((record) => !record)) {
+      throw new ValidationError("A selected note changed in another window.", "selection-conflict");
+    }
+    return {
+      view: viewMode,
+      identifiers,
+      records: structuredClone(records),
+    };
+  }
+
+  function assertSelectedRecords(current, snapshot) {
+    const currentRecords = snapshot.identifiers.map((identifier) =>
+      currentViewRecord(identifier, current, snapshot.view),
+    );
+    if (
+      currentRecords.some((record) => !record) ||
+      JSON.stringify(currentRecords) !== JSON.stringify(snapshot.records)
+    ) {
+      throw new ValidationError(
+        "A selected note changed in another window. Close this dialog and review the selection before trying again.",
+        "selection-conflict",
+      );
+    }
+  }
+
+  function selectedCountLabel(count) {
+    return `${numberFormatter.format(count)} ${noteWord(count)} selected`;
+  }
+
+  function updateSelectionControls(notes = selectedNotes()) {
+    const eligible = new Set(notes.map((note) => note.id));
+    for (const identifier of selectedIds) {
+      if (!eligible.has(identifier)) {
+        selectedIds.delete(identifier);
+      }
+    }
+    const selectedCount = selectedIds.size;
+    elements.selectionToolbar.hidden = !selectionMode;
+    elements.selectionMode.setAttribute("aria-pressed", String(selectionMode));
+    elements.selectionMode.textContent = selectionMode ? "Selecting notes" : "Select notes";
+    elements.selectionCount.textContent = selectedCountLabel(selectedCount);
+    elements.selectAllFiltered.disabled = !ready || notes.length === 0 || selectedCount === notes.length;
+    elements.clearSelection.disabled = !ready || selectedCount === 0;
+    elements.activeSelectionActions.hidden = viewMode !== "notes";
+    elements.trashSelectionActions.hidden = viewMode !== "trash";
+    const bulkControls = [
+      elements.bulkCourse,
+      elements.bulkExport,
+      elements.bulkTrash,
+      elements.bulkRestore,
+      elements.bulkPermanentDelete,
+    ];
+    const activeBulkControl = bulkControls.includes(documentValue.activeElement);
+    for (const control of bulkControls) {
+      control.disabled = !ready || selectedCount === 0;
+    }
+    for (const card of elements.list.querySelectorAll("[data-note-id]")) {
+      const selected = selectedIds.has(card.dataset.noteId);
+      card.dataset.selected = String(selected);
+      const checkbox = card.querySelector(".note-select-checkbox");
+      const selection = card.querySelector(".note-selection");
+      if (checkbox) {
+        checkbox.checked = selected;
+      }
+      if (selection) {
+        selection.hidden = !selectionMode;
+      }
+      const actions = card.querySelector(".note-actions");
+      if (actions) {
+        actions.hidden = selectionMode;
+      }
+    }
+    if (ready && selectionMode && activeBulkControl && selectedCount === 0) {
+      (!elements.selectAllFiltered.disabled
+        ? elements.selectAllFiltered
+        : elements.cancelSelection).focus();
+    }
+  }
+
+  function finishSelection(focusTarget = elements.selectionMode) {
+    selectionMode = false;
+    selectedIds.clear();
+    pendingBulkCourse = null;
+    pendingBulkAction = null;
+    render();
+    focusTarget?.focus?.();
+    selectionReturnFocus = null;
   }
 
   function renderCourseOptions() {
@@ -409,6 +649,14 @@ export async function initLibrary({
     const fragment = elements.template.content.cloneNode(true);
     const card = fragment.querySelector(".note-card");
     card.dataset.noteId = note.id;
+    card.dataset.selected = String(selectedIds.has(note.id));
+
+    const selection = fragment.querySelector(".note-selection");
+    selection.hidden = !selectionMode;
+    const checkbox = fragment.querySelector(".note-select-checkbox");
+    checkbox.value = note.id;
+    checkbox.checked = selectedIds.has(note.id);
+    checkbox.setAttribute("aria-label", `Select ${note.title}`);
 
     const course = fragment.querySelector(".note-course");
     course.textContent = note.course;
@@ -442,6 +690,7 @@ export async function initLibrary({
 
     fragment.querySelector(".active-note-actions").hidden = Boolean(trashEntry);
     fragment.querySelector(".trash-note-actions").hidden = !trashEntry;
+    fragment.querySelector(".note-actions").hidden = selectionMode;
     for (const button of fragment.querySelectorAll("button[data-action]")) {
       const action = button.dataset.action;
       const labels = {
@@ -556,6 +805,12 @@ export async function initLibrary({
     if (!state) {
       return;
     }
+    const viewTotal = viewMode === "trash" ? state.trash.length : state.notes.length;
+    if (selectionMode && viewTotal === 0) {
+      selectionMode = false;
+      selectedIds.clear();
+      selectionReturnFocus = null;
+    }
     renderCourseOptions();
     elements.sort.value = state.settings.sort;
     elements.sort.options[0].textContent = viewMode === "trash" ? "Recently deleted" : "Recently updated";
@@ -563,6 +818,7 @@ export async function initLibrary({
     const notes = selectedNotes();
     const shownNotes = notes.slice(0, visibleLimit);
     elements.list.replaceChildren(...shownNotes.map(createNoteCard));
+    updateSelectionControls(notes);
     editorReturnFocus = refreshReturnFocus(editorReturnFocus);
     detailReturnFocus = refreshReturnFocus(detailReturnFocus);
     deleteReturnFocus = refreshReturnFocus(deleteReturnFocus);
@@ -583,6 +839,7 @@ export async function initLibrary({
     elements.trashView.setAttribute("aria-label", `Trash, ${numberFormatter.format(state.trash.length)}`);
     elements.emptyTrash.hidden = viewMode !== "trash";
     elements.emptyTrash.disabled = !ready || state.trash.length === 0;
+    elements.selectionMode.disabled = !ready || total === 0;
     elements.emptyNewNote.hidden = viewMode === "trash";
     elements.emptyHeading.textContent = viewMode === "trash" ? "Trash is empty" : "No saved notes yet";
     elements.emptyMessage.textContent = viewMode === "trash"
@@ -699,6 +956,7 @@ export async function initLibrary({
           return false;
         }
         let result = await saveEditorDraft(draft, storage, {
+          expectedEpoch: dataEpoch,
           sessionId: editorSessionId,
           expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
           expectedGeneration: editorDraftRecord.generation,
@@ -709,6 +967,7 @@ export async function initLibrary({
           externalEditorDraftRecord = null;
           editorDraftBlocked = false;
           result = await saveEditorDraft(draft, storage, {
+            expectedEpoch: dataEpoch,
             sessionId: editorSessionId,
             expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
             expectedGeneration: editorDraftRecord.generation,
@@ -740,11 +999,15 @@ export async function initLibrary({
       });
     } catch (error) {
       editorDraftSynced = false;
-      setStatus(
-        elements.editorStatus,
-        `Draft could not be saved: ${errorMessage(error)} Keep this editor open and copy your work before closing.`,
-        "error",
-      );
+      if (isDataResetError(error)) {
+        markDataResetConflict(elements.editorStatus);
+      } else {
+        setStatus(
+          elements.editorStatus,
+          `Draft could not be saved: ${errorMessage(error)} Keep this editor open and copy your work before closing.`,
+          "error",
+        );
+      }
       return false;
     }
   }
@@ -764,6 +1027,7 @@ export async function initLibrary({
           return cleanCurrentInput;
         }
         const result = await clearEditorDraft(storage, {
+          expectedEpoch: dataEpoch,
           sessionId: editorSessionId,
           expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
           expectedGeneration: editorDraftRecord.generation,
@@ -793,7 +1057,11 @@ export async function initLibrary({
       });
     } catch (error) {
       editorDraftSynced = false;
-      setStatus(elements.editorStatus, `The saved draft could not be cleared: ${errorMessage(error)}`, "error");
+      if (isDataResetError(error)) {
+        markDataResetConflict(elements.editorStatus);
+      } else {
+        setStatus(elements.editorStatus, `The saved draft could not be cleared: ${errorMessage(error)}`, "error");
+      }
       return false;
     }
   }
@@ -848,13 +1116,14 @@ export async function initLibrary({
   }
 
   function setEditorBusy(busy) {
+    const actionsBlocked = dataResetConflict && elements.editorDialog.open;
     elements.editorForm.setAttribute("aria-busy", String(busy));
     elements.editorForm.inert = busy;
-    elements.saveEditor.disabled = busy;
+    elements.saveEditor.disabled = busy || actionsBlocked;
     elements.cancelEditor.disabled = busy;
     elements.closeEditor.disabled = busy;
-    elements.editorSaveDuplicate.disabled = busy;
-    elements.saveEditorAsNew.disabled = busy;
+    elements.editorSaveDuplicate.disabled = busy || actionsBlocked;
+    elements.saveEditorAsNew.disabled = busy || actionsBlocked;
   }
 
   function openEditorValues({
@@ -982,8 +1251,8 @@ export async function initLibrary({
     elements.discardEditorDraft.disabled = true;
     setStatus(elements.editorDraftStatus, "", "info");
     try {
-      const nextState = await loadState(storage);
-      const record = await loadEditorDraft(storage);
+      const nextState = await readStateForPage();
+      const record = await readEditorDraftForPage();
       if (!record.draft) {
         state = nextState;
         editorDraftRecord = record;
@@ -1007,6 +1276,7 @@ export async function initLibrary({
         : draft;
       const sessionId = crypto.randomUUID();
       const claimed = await saveEditorDraft(claimedDraft, storage, {
+        expectedEpoch: dataEpoch,
         sessionId,
         expectedOwnerSessionId: record.ownerSessionId,
         expectedGeneration: record.generation,
@@ -1053,7 +1323,11 @@ export async function initLibrary({
         recoveryCopy ? "warning" : "success",
       );
     } catch (error) {
-      setStatus(elements.editorDraftStatus, `Draft could not be opened: ${errorMessage(error)}`, "error");
+      if (isDataResetError(error)) {
+        markDataResetConflict(elements.editorDraftStatus);
+      } else {
+        setStatus(elements.editorDraftStatus, `Draft could not be opened: ${errorMessage(error)}`, "error");
+      }
       focusAfter = elements.resumeEditorDraft;
     } finally {
       elements.resumeEditorDraft.disabled = false;
@@ -1080,6 +1354,7 @@ export async function initLibrary({
     let focusAfter = null;
     try {
       const result = await clearEditorDraft(storage, {
+        expectedEpoch: dataEpoch,
         sessionId: crypto.randomUUID(),
         expectedOwnerSessionId: record.ownerSessionId,
         expectedGeneration: record.generation,
@@ -1098,7 +1373,11 @@ export async function initLibrary({
       setStatus(elements.status, "Draft discarded.", "success");
       focusAfter = elements.newNote;
     } catch (error) {
-      setStatus(elements.editorDraftStatus, `Draft could not be discarded: ${errorMessage(error)}`, "error");
+      if (isDataResetError(error)) {
+        markDataResetConflict(elements.editorDraftStatus);
+      } else {
+        setStatus(elements.editorDraftStatus, `Draft could not be discarded: ${errorMessage(error)}`, "error");
+      }
       focusAfter = elements.discardEditorDraft;
     } finally {
       elements.resumeEditorDraft.disabled = false;
@@ -1166,6 +1445,7 @@ export async function initLibrary({
         },
         storage,
         {
+          expectedEpoch: dataEpoch,
           sessionId: editorSessionId,
           expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
           expectedGeneration: editorDraftRecord.generation,
@@ -1194,7 +1474,9 @@ export async function initLibrary({
         ?.querySelector("[data-action='edit']")
         ?.focus();
     } catch (error) {
-      if (error instanceof ValidationError && error.code === "duplicate") {
+      if (isDataResetError(error)) {
+        markDataResetConflict(elements.editorStatus);
+      } else if (error instanceof ValidationError && error.code === "duplicate") {
         elements.editorDuplicate.hidden = false;
         setStatus(elements.editorStatus, "Review the duplicate warning before saving.", "warning");
         timerApi.setTimeout(() => elements.editorSaveDuplicate.focus(), 0);
@@ -1230,7 +1512,11 @@ export async function initLibrary({
     const title = documentValue.createElement("bdi");
     title.dir = "auto";
     title.textContent = note.title;
-    elements.deleteMessage.replaceChildren("“", title, "” will move to Trash and remain in backups until permanently deleted.");
+    elements.deleteMessage.replaceChildren(
+      "“",
+      title,
+      "” will move to Trash. New JSON backups include this note as a Trash entry until it is permanently deleted. Backups you already exported do not change.",
+    );
     setStatus(elements.deleteStatus, "", "info");
     showDialog(elements.deleteDialog);
     elements.cancelDelete.focus();
@@ -1267,7 +1553,7 @@ export async function initLibrary({
           );
         }
         return moveNoteToTrash(current, noteToDelete.id);
-      }, storage);
+      }, storage, expectedEpochOptions());
       state = result.state;
       pendingDelete = null;
       deleteReturnFocus = null;
@@ -1278,7 +1564,7 @@ export async function initLibrary({
       const nextFocus = elements.list.querySelector("[data-action='view']") || elements.newNote;
       nextFocus.focus();
     } catch (error) {
-      setStatus(elements.deleteStatus, errorMessage(error), "error");
+      reportActionError(error, elements.deleteStatus);
       timerApi.setTimeout(() => elements.confirmDelete.focus(), 0);
     } finally {
       elements.confirmDelete.disabled = false;
@@ -1296,6 +1582,7 @@ export async function initLibrary({
       const result = await mutateState(
         (current) => restoreTrashedNote(current, record.note.id),
         storage,
+        expectedEpochOptions(),
       );
       state = result.state;
       hideUndo();
@@ -1306,7 +1593,7 @@ export async function initLibrary({
         ?.querySelector("[data-action='view']")
         ?.focus();
     } catch (error) {
-      setStatus(elements.status, errorMessage(error), "error");
+      reportActionError(error);
     } finally {
       elements.undo.disabled = false;
     }
@@ -1324,14 +1611,14 @@ export async function initLibrary({
           throw new ValidationError("This Trash entry changed in another window. Review it before restoring.", "trash-conflict");
         }
         return restoreTrashedNote(current, entry.note.id);
-      }, storage);
+      }, storage, expectedEpochOptions());
       state = result.state;
       hideUndo();
       render();
       setStatusWithValue(elements.status, "Restored “", result.note.title, "”.", "success");
       (elements.list.querySelector("[data-action='view']") || elements.trashView).focus();
     } catch (error) {
-      setStatus(elements.status, errorMessage(error), "error");
+      reportActionError(error);
       refreshReturnFocus(button)?.focus?.();
     } finally {
       button.disabled = false;
@@ -1367,7 +1654,7 @@ export async function initLibrary({
           throw new ValidationError("This Trash entry changed in another window. Close this confirmation and review it.", "trash-conflict");
         }
         return permanentlyDeleteTrashedNote(current, entry.note.id);
-      }, storage);
+      }, storage, expectedEpochOptions());
       state = result.state;
       pendingPermanentDelete = null;
       permanentDeleteReturnFocus = null;
@@ -1376,7 +1663,7 @@ export async function initLibrary({
       setStatus(elements.status, "Note permanently deleted.", "success");
       (elements.list.querySelector("[data-action='restore']") || elements.trashView).focus();
     } catch (error) {
-      setStatus(elements.permanentDeleteStatus, errorMessage(error), "error");
+      reportActionError(error, elements.permanentDeleteStatus);
       timerApi.setTimeout(() => elements.confirmPermanentDelete.focus(), 0);
     } finally {
       elements.confirmPermanentDelete.disabled = false;
@@ -1412,7 +1699,7 @@ export async function initLibrary({
           );
         }
         return emptyTrash(current);
-      }, storage);
+      }, storage, expectedEpochOptions());
       state = result.state;
       emptyTrashSnapshot = null;
       closeDialog(elements.emptyTrashDialog);
@@ -1420,7 +1707,7 @@ export async function initLibrary({
       setStatus(elements.status, `${numberFormatter.format(result.deleted)} ${noteWord(result.deleted)} permanently deleted.`, "success");
       elements.trashView.focus();
     } catch (error) {
-      setStatus(elements.emptyTrashStatus, errorMessage(error), "error");
+      reportActionError(error, elements.emptyTrashStatus);
       timerApi.setTimeout(() => elements.confirmEmptyTrash.focus(), 0);
     } finally {
       elements.confirmEmptyTrash.disabled = false;
@@ -1485,6 +1772,197 @@ export async function initLibrary({
       );
     } catch (error) {
       setStatus(elements.status, errorMessage(error), "error");
+    }
+  }
+
+  function openBulkCourseDialog() {
+    try {
+      const snapshot = selectedRecordSnapshot();
+      if (snapshot.view !== "notes") {
+        return;
+      }
+      pendingBulkCourse = snapshot;
+      const courses = new Set(snapshot.records.map((note) => note.course));
+      elements.bulkCourseInput.value = courses.size === 1 ? snapshot.records[0].course : "";
+      elements.bulkCourseMessage.textContent = `${selectedCountLabel(snapshot.identifiers.length)}. Enter one course for all of them, or clear their course.`;
+      setStatus(elements.bulkCourseStatus, "", "info");
+      showDialog(elements.bulkCourseDialog);
+      elements.bulkCourseInput.focus();
+      elements.bulkCourseInput.select();
+    } catch (error) {
+      reportActionError(error);
+    }
+  }
+
+  function setBulkCourseBusy(busy) {
+    elements.bulkCourseForm.setAttribute("aria-busy", String(busy));
+    elements.bulkCourseInput.disabled = busy;
+    elements.cancelBulkCourse.disabled = busy;
+    elements.clearBulkCourse.disabled = busy;
+    elements.applyBulkCourse.disabled = busy;
+  }
+
+  async function applyBulkCourse(course) {
+    if (!pendingBulkCourse) {
+      return;
+    }
+    if (!course.trim() && course !== "") {
+      return;
+    }
+    const snapshot = pendingBulkCourse;
+    setBulkCourseBusy(true);
+    setStatus(elements.bulkCourseStatus, "", "info");
+    try {
+      const result = await mutateState(
+        (current) => {
+          assertSelectedRecords(current, snapshot);
+          return assignCourseToNotes(current, snapshot.identifiers, course);
+        },
+        storage,
+        expectedEpochOptions(),
+      );
+      state = result.state;
+      pendingBulkCourse = null;
+      closeDialog(elements.bulkCourseDialog);
+      render();
+      const courseMessage = result.course
+        ? `Set the course to “${result.course}” for ${numberFormatter.format(result.assigned)} ${noteWord(result.assigned)}.`
+        : `Cleared the course from ${numberFormatter.format(result.assigned)} ${noteWord(result.assigned)}.`;
+      setStatus(elements.status, courseMessage, "success");
+      const focusTarget = !elements.bulkCourse.disabled
+        ? elements.bulkCourse
+        : !elements.selectAllFiltered.disabled
+          ? elements.selectAllFiltered
+          : selectionMode
+            ? elements.cancelSelection
+            : elements.selectionMode;
+      focusTarget.focus();
+    } catch (error) {
+      reportActionError(error, elements.bulkCourseStatus);
+      timerApi.setTimeout(() => elements.bulkCourseInput.focus(), 0);
+    } finally {
+      setBulkCourseBusy(false);
+    }
+  }
+
+  function openBulkConfirmation(kind) {
+    try {
+      const snapshot = selectedRecordSnapshot();
+      if (
+        (kind === "move" && snapshot.view !== "notes") ||
+        (kind === "permanent-delete" && snapshot.view !== "trash")
+      ) {
+        return;
+      }
+      pendingBulkAction = { kind, snapshot };
+      const count = snapshot.identifiers.length;
+      elements.bulkConfirmEyebrow.textContent = kind === "move" ? "Move selected notes" : "Permanent deletion";
+      elements.bulkConfirmHeading.textContent = kind === "move"
+        ? "Move selected notes to Trash?"
+        : "Delete selected notes permanently?";
+      elements.bulkConfirmMessage.textContent = kind === "move"
+        ? `${numberFormatter.format(count)} ${noteWord(count)} will move to Trash.`
+        : `${numberFormatter.format(count)} ${noteWord(count)} will be removed from this Chrome profile.`;
+      elements.bulkConfirmWarning.textContent = kind === "move"
+        ? "Backups you already exported do not change. New JSON backups include these notes as Trash entries until they are permanently deleted."
+        : "This cannot be undone. These notes will also be absent from future backups.";
+      elements.confirmBulkAction.textContent = kind === "move" ? "Move to Trash" : "Delete permanently";
+      setStatus(elements.bulkConfirmStatus, "", "info");
+      showDialog(elements.bulkConfirmDialog);
+      elements.cancelBulkConfirm.focus();
+    } catch (error) {
+      reportActionError(error);
+    }
+  }
+
+  async function confirmBulkAction() {
+    if (!pendingBulkAction) {
+      return;
+    }
+    const pending = pendingBulkAction;
+    elements.cancelBulkConfirm.disabled = true;
+    elements.confirmBulkAction.disabled = true;
+    try {
+      const result = await mutateState(
+        (current) => {
+          assertSelectedRecords(current, pending.snapshot);
+          return pending.kind === "move"
+            ? moveNotesToTrash(current, pending.snapshot.identifiers)
+            : permanentlyDeleteTrashedNotes(current, pending.snapshot.identifiers);
+        },
+        storage,
+        expectedEpochOptions(),
+      );
+      state = result.state;
+      hideUndo();
+      pendingBulkAction = null;
+      closeDialog(elements.bulkConfirmDialog);
+      const count = pending.snapshot.identifiers.length;
+      const message = pending.kind === "move"
+        ? `${numberFormatter.format(count)} ${noteWord(count)} moved to Trash.`
+        : `${numberFormatter.format(count)} ${noteWord(count)} permanently deleted.`;
+      const focusTarget = pending.kind === "move" && state.notes.length > 0
+        ? elements.selectionMode
+        : pending.kind === "move"
+          ? elements.notesView
+          : elements.trashView;
+      finishSelection(focusTarget);
+      setStatus(elements.status, message, "success");
+    } catch (error) {
+      reportActionError(error, elements.bulkConfirmStatus);
+      timerApi.setTimeout(() => elements.confirmBulkAction.focus(), 0);
+    } finally {
+      elements.cancelBulkConfirm.disabled = false;
+      elements.confirmBulkAction.disabled = false;
+    }
+  }
+
+  async function restoreBulkSelection() {
+    let snapshot;
+    try {
+      snapshot = selectedRecordSnapshot();
+      if (snapshot.view !== "trash") {
+        return;
+      }
+      elements.bulkRestore.disabled = true;
+      const result = await mutateState(
+        (current) => {
+          assertSelectedRecords(current, snapshot);
+          return restoreTrashedNotes(current, snapshot.identifiers);
+        },
+        storage,
+        expectedEpochOptions(),
+      );
+      state = result.state;
+      hideUndo();
+      finishSelection(elements.trashView);
+      setStatus(
+        elements.status,
+        `${numberFormatter.format(result.restored)} ${noteWord(result.restored)} restored.`,
+        "success",
+      );
+    } catch (error) {
+      reportActionError(error);
+    } finally {
+      elements.bulkRestore.disabled = false;
+    }
+  }
+
+  function exportBulkSelection() {
+    try {
+      const snapshot = selectedRecordSnapshot();
+      if (snapshot.view !== "notes") {
+        return;
+      }
+      const text = notesToMarkdown(snapshot.records);
+      downloadText(text, backupFilename("md"), "text/markdown", documentValue, urlApi);
+      setStatus(
+        elements.status,
+        `Exported ${numberFormatter.format(snapshot.identifiers.length)} selected ${noteWord(snapshot.identifiers.length)} as Markdown.`,
+        "success",
+      );
+    } catch (error) {
+      reportActionError(error);
     }
   }
 
@@ -1594,6 +2072,7 @@ export async function initLibrary({
       const result = await mutateState(
         (current) => mergeImportedBackup(current, importValue),
         storage,
+        expectedEpochOptions(),
       );
       state = result.state;
       pendingImport = null;
@@ -1607,7 +2086,7 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
-      setStatus(elements.importStatus, errorMessage(error), "error");
+      reportActionError(error, elements.importStatus);
       timerApi.setTimeout(() => elements.mergeImport.focus(), 0);
     } finally {
       elements.cancelImport.disabled = false;
@@ -1641,6 +2120,7 @@ export async function initLibrary({
           return replaceImportedNotes(current, importValue);
         },
         storage,
+        expectedEpochOptions(),
       );
       hideUndo();
       pendingImport = null;
@@ -1655,14 +2135,20 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
-      if (error instanceof ValidationError && error.code === "replace-conflict") {
-        state = await loadState(storage);
-        applyTheme(state.settings.theme, documentValue);
-        render();
-        replaceInFlight = false;
-        reopenImportPreview(
-          "The library changed in another window. Review the updated restore preview before replacing it.",
-        );
+      if (isDataResetError(error)) {
+        markDataResetConflict(elements.replaceStatus);
+      } else if (error instanceof ValidationError && error.code === "replace-conflict") {
+        try {
+          state = await readStateForPage();
+          applyTheme(state.settings.theme, documentValue);
+          render();
+          replaceInFlight = false;
+          reopenImportPreview(
+            "The library changed in another window. Review the updated restore preview before replacing it.",
+          );
+        } catch (readError) {
+          reportActionError(readError, elements.replaceStatus);
+        }
       } else {
         setStatus(elements.replaceStatus, errorMessage(error), "error");
         timerApi.setTimeout(() => elements.confirmReplace.focus(), 0);
@@ -1679,11 +2165,15 @@ export async function initLibrary({
       return;
     }
     try {
-      state = await mutateState((current) => updateSettings(current, changes), storage);
+      state = await mutateState(
+        (current) => updateSettings(current, changes),
+        storage,
+        expectedEpochOptions(),
+      );
       applyTheme(state.settings.theme, documentValue);
       render();
     } catch (error) {
-      setStatus(elements.status, errorMessage(error), "error");
+      reportActionError(error);
       if (state) {
         elements.sort.value = state.settings.sort;
         elements.theme.value = state.settings.theme;
@@ -1698,7 +2188,11 @@ export async function initLibrary({
     elements.acknowledgeRecovery.disabled = true;
     setStatus(elements.recoveryStatus, "", "info");
     try {
-      const result = await acknowledgeRecovery(recoveryInfo, storage);
+      const result = await acknowledgeRecovery(
+        recoveryInfo,
+        storage,
+        expectedEpochOptions(),
+      );
       recoveryInfo = result.recovery;
       renderRecoveryNotice();
       if (result.acknowledged) {
@@ -1712,7 +2206,7 @@ export async function initLibrary({
         elements.acknowledgeRecovery.focus();
       }
     } catch (error) {
-      setStatus(elements.recoveryStatus, errorMessage(error), "error");
+      reportActionError(error, elements.recoveryStatus);
       elements.acknowledgeRecovery.disabled = false;
     }
   }
@@ -1724,6 +2218,40 @@ export async function initLibrary({
   elements.newNote.addEventListener("click", (event) => openEditor(null, event.currentTarget));
   elements.emptyNewNote.addEventListener("click", (event) =>
     openEditor(null, event.currentTarget),
+  );
+  elements.selectionMode.addEventListener("click", (event) => {
+    if (selectionMode) {
+      finishSelection(selectionReturnFocus || event.currentTarget);
+      return;
+    }
+    selectionMode = true;
+    selectionReturnFocus = event.currentTarget;
+    selectedIds.clear();
+    render();
+    const firstCheckbox = elements.list.querySelector(".note-select-checkbox");
+    (firstCheckbox || elements.selectAllFiltered).focus();
+  });
+  elements.selectAllFiltered.addEventListener("click", () => {
+    for (const note of selectedNotes()) {
+      selectedIds.add(note.id);
+    }
+    updateSelectionControls();
+    elements.clearSelection.focus();
+  });
+  elements.clearSelection.addEventListener("click", () => {
+    selectedIds.clear();
+    updateSelectionControls();
+    elements.selectAllFiltered.focus();
+  });
+  elements.cancelSelection.addEventListener("click", () =>
+    finishSelection(selectionReturnFocus || elements.selectionMode),
+  );
+  elements.bulkCourse.addEventListener("click", openBulkCourseDialog);
+  elements.bulkExport.addEventListener("click", exportBulkSelection);
+  elements.bulkTrash.addEventListener("click", () => openBulkConfirmation("move"));
+  elements.bulkRestore.addEventListener("click", () => void restoreBulkSelection());
+  elements.bulkPermanentDelete.addEventListener("click", () =>
+    openBulkConfirmation("permanent-delete"),
   );
   elements.search.addEventListener("input", () => {
     if (searchTimer !== null) {
@@ -1743,6 +2271,9 @@ export async function initLibrary({
     if (viewMode === nextView) {
       return;
     }
+    selectionMode = false;
+    selectedIds.clear();
+    selectionReturnFocus = null;
     viewMode = nextView;
     elements.search.value = "";
     elements.course.value = "";
@@ -1771,7 +2302,8 @@ export async function initLibrary({
     visibleLimit += DISPLAY_BATCH;
     render();
     const firstNewCard = elements.list.querySelectorAll("[data-note-id]")[firstNewIndex];
-    firstNewCard?.querySelector("[data-action='view']")?.focus();
+    const focusTarget = selectionMode ? ".note-select-checkbox" : "[data-action='view']";
+    firstNewCard?.querySelector(focusTarget)?.focus();
   });
   elements.list.addEventListener("click", (event) => {
     const button = event.target.closest?.("button[data-action]");
@@ -1779,7 +2311,11 @@ export async function initLibrary({
     const note = viewMode === "trash"
       ? state?.trash.find((entry) => entry.note.id === card?.dataset.noteId)?.note
       : state?.notes.find((candidate) => candidate.id === card?.dataset.noteId);
-    if (!note || (!button && event.target.closest?.("a"))) {
+    if (
+      !note ||
+      event.target.closest?.(".note-selection") ||
+      (!button && event.target.closest?.("a"))
+    ) {
       return;
     }
     if (!button || button.dataset.action === "view") {
@@ -1801,6 +2337,19 @@ export async function initLibrary({
         openPermanentDelete(entry, button);
       }
     }
+  });
+  elements.list.addEventListener("change", (event) => {
+    const checkbox = event.target.closest?.(".note-select-checkbox");
+    const card = checkbox?.closest?.("[data-note-id]");
+    if (!selectionMode || !checkbox || !card) {
+      return;
+    }
+    if (checkbox.checked) {
+      selectedIds.add(card.dataset.noteId);
+    } else {
+      selectedIds.delete(card.dataset.noteId);
+    }
+    updateSelectionControls();
   });
 
   elements.closeDetail.addEventListener("click", () => closeDialog(elements.detailDialog));
@@ -1890,7 +2439,7 @@ export async function initLibrary({
   elements.closeEditor.addEventListener("click", () => void requestCloseEditor());
   elements.editorDialog.addEventListener("cancel", (event) => {
     event.preventDefault();
-    if (elements.saveEditor.disabled) {
+    if (elements.editorForm.inert || elements.editorForm.getAttribute("aria-busy") === "true") {
       return;
     }
     void requestCloseEditor();
@@ -1951,6 +2500,52 @@ export async function initLibrary({
   });
   elements.emptyTrashDialog.addEventListener("cancel", (event) => {
     if (elements.confirmEmptyTrash.disabled) {
+      event.preventDefault();
+    }
+  });
+
+  elements.bulkCourseForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const course = elements.bulkCourseInput.value.trim();
+    if (!course) {
+      setStatus(
+        elements.bulkCourseStatus,
+        "Enter a course, or choose Clear course.",
+        "warning",
+      );
+      elements.bulkCourseInput.focus();
+      return;
+    }
+    void applyBulkCourse(course);
+  });
+  elements.clearBulkCourse.addEventListener("click", () => void applyBulkCourse(""));
+  elements.cancelBulkCourse.addEventListener("click", () => closeDialog(elements.bulkCourseDialog));
+  elements.bulkCourseDialog.addEventListener("close", () => {
+    pendingBulkCourse = null;
+    if (selectionMode) {
+      elements.bulkCourse.focus();
+    }
+  });
+  elements.bulkCourseDialog.addEventListener("cancel", (event) => {
+    if (elements.applyBulkCourse.disabled) {
+      event.preventDefault();
+    }
+  });
+
+  elements.bulkConfirmForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void confirmBulkAction();
+  });
+  elements.cancelBulkConfirm.addEventListener("click", () => closeDialog(elements.bulkConfirmDialog));
+  elements.bulkConfirmDialog.addEventListener("close", () => {
+    const action = pendingBulkAction?.kind;
+    pendingBulkAction = null;
+    if (selectionMode) {
+      (action === "permanent-delete" ? elements.bulkPermanentDelete : elements.bulkTrash).focus();
+    }
+  });
+  elements.bulkConfirmDialog.addEventListener("cancel", (event) => {
+    if (elements.confirmBulkAction.disabled) {
       event.preventDefault();
     }
   });
@@ -2054,6 +2649,7 @@ export async function initLibrary({
     }
     const draft = formEditorDraft();
     const options = {
+      expectedEpoch: dataEpoch,
       sessionId: editorSessionId,
       expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
       expectedGeneration: editorDraftRecord.generation,
@@ -2076,6 +2672,9 @@ export async function initLibrary({
         .sendMessage({ type: MESSAGE_TYPES.saveEditorDraft, draft, ...options })
         .then((response) => {
           if (response?.ok !== true) {
+            if (typeof response?.code === "string") {
+              throw new ValidationError(response?.error || "Draft handoff failed.", response.code);
+            }
             throw new Error(response?.error || "Draft handoff failed.");
           }
           if (response.saved !== true) {
@@ -2090,8 +2689,18 @@ export async function initLibrary({
           }
           return undefined;
         })
-        .catch(() => saveDirectly())
-        .catch(() => undefined);
+        .catch((error) => {
+          if (isDataResetError(error)) {
+            markDataResetConflict();
+            return undefined;
+          }
+          return saveDirectly();
+        })
+        .catch((error) => {
+          if (isDataResetError(error)) {
+            markDataResetConflict();
+          }
+        });
     } else {
       void saveDirectly().catch(() => undefined);
     }
@@ -2106,6 +2715,11 @@ export async function initLibrary({
   documentValue.addEventListener("visibilitychange", visibilityHandler);
 
   function focusedCardAction() {
+    const checkbox = documentValue.activeElement?.closest?.(".note-select-checkbox");
+    const selectionCard = checkbox?.closest?.("[data-note-id]");
+    if (checkbox && selectionCard) {
+      return { noteId: selectionCard.dataset.noteId, action: "select" };
+    }
     const button = documentValue.activeElement?.closest?.("button[data-action]");
     const card = button?.closest("[data-note-id]");
     if (!button || !card) {
@@ -2121,24 +2735,39 @@ export async function initLibrary({
     const card = [...elements.list.querySelectorAll("[data-note-id]")].find(
       (candidate) => candidate.dataset.noteId === target.noteId,
     );
-    card?.querySelector(`[data-action='${target.action}']`)?.focus();
+    const selector = target.action === "select"
+      ? ".note-select-checkbox"
+      : `[data-action='${target.action}']`;
+    card?.querySelector(selector)?.focus();
   }
 
   const storageChangeHandler = async (changes, areaName) => {
     const stateChanged = Boolean(changes[STORAGE_KEYS.state]);
     const editorDraftChanged = Boolean(changes[STORAGE_KEYS.editorDraft]);
     const recoveryChanged = Boolean(changes[STORAGE_KEYS.recovery]);
+    const dataEpochChanged = Boolean(changes[STORAGE_KEYS.dataEpoch]);
     if (
       destroyed ||
       areaName !== "local" ||
-      (!stateChanged && !editorDraftChanged && !recoveryChanged)
+      (!stateChanged && !editorDraftChanged && !recoveryChanged && !dataEpochChanged)
     ) {
+      return;
+    }
+    if (
+      dataEpochChanged &&
+      dataEpoch &&
+      changes[STORAGE_KEYS.dataEpoch].newValue !== dataEpoch
+    ) {
+      markDataResetConflict();
+      return;
+    }
+    if (dataResetConflict) {
       return;
     }
     try {
       if (stateChanged) {
         const focusTarget = focusedCardAction();
-        const nextState = await loadState(storage);
+        const nextState = await readStateForPage();
         if (undoRecord && JSON.stringify(nextState) !== undoRecord.stateSnapshot) {
           hideUndo();
         }
@@ -2178,7 +2807,7 @@ export async function initLibrary({
       }
 
       if (editorDraftChanged) {
-        const record = await loadEditorDraft(storage);
+        const record = await readEditorDraftForPage();
         editorDraftUnavailable = false;
         if (elements.editorDialog.open) {
           if (record.ownerSessionId === editorSessionId) {
@@ -2212,7 +2841,7 @@ export async function initLibrary({
       }
 
       if (recoveryChanged) {
-        recoveryInfo = await loadRecoveryNotice(storage);
+        recoveryInfo = await readRecoveryForPage();
         renderRecoveryNotice();
       }
     } catch (error) {
@@ -2225,6 +2854,8 @@ export async function initLibrary({
           "An unfinished draft was saved by a newer extension version. Update the extension before editing notes.",
           "warning",
         );
+      } else if (isDataResetError(error)) {
+        markDataResetConflict();
       } else {
         setStatus(elements.status, errorMessage(error), "error");
       }
@@ -2235,12 +2866,20 @@ export async function initLibrary({
   async function loadLibrary() {
     setLibraryAvailable(false);
     elements.retryLoad.hidden = true;
+    elements.retryLoad.textContent = "Retry";
     elements.summary.textContent = "Loading notes...";
     setStatus(elements.status, "", "info");
     try {
-      state = await loadState(storage);
+      if (!dataEpoch) {
+        dataEpoch = await loadDataEpoch(storage);
+      }
+      state = await readStateForPage();
+      if (dataResetConflict) {
+        markDataResetConflict();
+        return;
+      }
       try {
-        editorDraftRecord = await loadEditorDraft(storage);
+        editorDraftRecord = await readEditorDraftForPage();
         editorDraftUnavailable = false;
       } catch (error) {
         if (!(error instanceof ValidationError) || error.code !== "editor-draft-version") {
@@ -2254,6 +2893,10 @@ export async function initLibrary({
         };
         editorDraftUnavailable = true;
       }
+      if (dataResetConflict) {
+        markDataResetConflict();
+        return;
+      }
       externalEditorDraftRecord = null;
       applyTheme(state.settings.theme, documentValue);
       elements.sort.value = state.settings.sort;
@@ -2262,7 +2905,7 @@ export async function initLibrary({
       render();
       renderEditorDraftRecovery();
       setLibraryAvailable(true);
-      recoveryInfo = await loadRecoveryNotice(storage);
+      recoveryInfo = await readRecoveryForPage();
       renderRecoveryNotice();
       if (editorDraftUnavailable) {
         setStatus(
@@ -2282,14 +2925,24 @@ export async function initLibrary({
         }
       }
     } catch (error) {
-      state = undefined;
-      setLibraryAvailable(false);
-      setStatus(elements.status, `Notes could not be loaded: ${errorMessage(error)}`, "error");
-      elements.summary.textContent = "Library unavailable";
-      elements.retryLoad.hidden = false;
+      if (isDataResetError(error)) {
+        markDataResetConflict();
+      } else {
+        state = undefined;
+        setLibraryAvailable(false);
+        setStatus(elements.status, `Notes could not be loaded: ${errorMessage(error)}`, "error");
+        elements.summary.textContent = "Library unavailable";
+        elements.retryLoad.hidden = false;
+      }
     }
   }
-  elements.retryLoad.addEventListener("click", () => void loadLibrary());
+  elements.retryLoad.addEventListener("click", () => {
+    if (dataResetConflict) {
+      documentValue.defaultView?.location.reload();
+      return;
+    }
+    void loadLibrary();
+  });
   await loadLibrary();
 
   return {

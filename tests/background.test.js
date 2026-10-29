@@ -15,22 +15,26 @@ import { MESSAGE_TYPES } from "../src/messages.js";
 import { LIMITS } from "../src/model.js";
 import {
   loadDraft,
+  loadDataEpoch,
   loadEditorDraft,
   loadPendingCaptures,
+  resetAllData,
   STORAGE_KEYS,
 } from "../src/storage.js";
 import { memoryStorage } from "./helpers.js";
 
 const RUNTIME_ID = "abcdefghijklmnopabcdefghijklmnop";
+const DATA_EPOCH = "background-test-epoch";
 
 test("stores a draft handed off by an extension page", async () => {
-  const storage = memoryStorage();
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
   const message = {
     type: MESSAGE_TYPES.saveDraft,
     sessionId: "popup-session",
     expectedOwnerSessionId: "",
     expectedGeneration: 0,
     contentGeneration: 1,
+    expectedEpoch: DATA_EPOCH,
     draft: { body: "Keep this popup draft", sessionId: "popup-session" },
   };
 
@@ -64,8 +68,38 @@ test("ignores messages from outside the extension", async () => {
   assert.equal(await loadDraft(storage), null);
 });
 
+test("rejects internal draft messages without a valid data epoch", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
+  const baseMessage = {
+    type: MESSAGE_TYPES.saveDraft,
+    sessionId: "popup-session",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 1,
+    draft: { body: "Do not save", sessionId: "popup-session" },
+  };
+
+  assert.equal(
+    isAuthorizedDraftMessage(baseMessage, { id: RUNTIME_ID }, RUNTIME_ID),
+    false,
+  );
+  assert.equal(
+    isAuthorizedDraftMessage(
+      { ...baseMessage, expectedEpoch: "invalid epoch" },
+      { id: RUNTIME_ID },
+      RUNTIME_ID,
+    ),
+    false,
+  );
+  assert.deepEqual(
+    await handleDraftMessage(baseMessage, { id: RUNTIME_ID }, storage, RUNTIME_ID),
+    { handled: false },
+  );
+  assert.equal(await loadDraft(storage), null);
+});
+
 test("rejects an oversized handed-off draft", async () => {
-  const storage = memoryStorage();
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
 
   await assert.rejects(
     () =>
@@ -76,6 +110,7 @@ test("rejects an oversized handed-off draft", async () => {
           expectedOwnerSessionId: "",
           expectedGeneration: 0,
           contentGeneration: 1,
+          expectedEpoch: DATA_EPOCH,
           draft: { body: "x".repeat(LIMITS.body + 1), sessionId: "popup-session" },
         },
         { id: RUNTIME_ID },
@@ -88,7 +123,7 @@ test("rejects an oversized handed-off draft", async () => {
 });
 
 test("does not let a stale popup handoff replace another popup's draft", async () => {
-  const storage = memoryStorage();
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
   const first = await handleDraftMessage(
     {
       type: MESSAGE_TYPES.saveDraft,
@@ -96,6 +131,7 @@ test("does not let a stale popup handoff replace another popup's draft", async (
       expectedOwnerSessionId: "",
       expectedGeneration: 0,
       contentGeneration: 1,
+      expectedEpoch: DATA_EPOCH,
       draft: { body: "Keep this draft", sessionId: "popup-one" },
     },
     { id: RUNTIME_ID },
@@ -109,6 +145,7 @@ test("does not let a stale popup handoff replace another popup's draft", async (
       expectedOwnerSessionId: "",
       expectedGeneration: 0,
       contentGeneration: 1,
+      expectedEpoch: DATA_EPOCH,
       draft: { body: "Do not overwrite", sessionId: "popup-two" },
     },
     { id: RUNTIME_ID },
@@ -128,7 +165,7 @@ test("does not let a stale popup handoff replace another popup's draft", async (
 });
 
 test("stores editor drafts without replacing popup drafts", async () => {
-  const storage = memoryStorage();
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
   await handleDraftMessage(
     {
       type: MESSAGE_TYPES.saveDraft,
@@ -136,6 +173,7 @@ test("stores editor drafts without replacing popup drafts", async () => {
       expectedOwnerSessionId: "",
       expectedGeneration: 0,
       contentGeneration: 1,
+      expectedEpoch: DATA_EPOCH,
       draft: { body: "Popup draft", sessionId: "popup-session" },
     },
     { id: RUNTIME_ID },
@@ -148,6 +186,7 @@ test("stores editor drafts without replacing popup drafts", async () => {
     expectedOwnerSessionId: "",
     expectedGeneration: 0,
     contentGeneration: 1,
+    expectedEpoch: DATA_EPOCH,
     draft: { title: "Editor", body: "Editor draft", source: { url: "https://" } },
   };
 
@@ -184,6 +223,31 @@ test("stores editor drafts without replacing popup drafts", async () => {
     },
   });
   assert.equal((await loadEditorDraft(storage)).draft.body, "Editor draft");
+});
+
+test("rejects a draft handoff from before a data reset", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
+  const expectedEpoch = await loadDataEpoch(storage, { lockManager: null });
+  await resetAllData(storage, {
+    lockManager: null,
+    epochFactory: () => "background-new-epoch",
+  });
+  const message = {
+    type: MESSAGE_TYPES.saveDraft,
+    sessionId: "stale-popup",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 1,
+    expectedEpoch,
+    draft: { body: "Do not restore this draft", sessionId: "stale-popup" },
+  };
+
+  assert.equal(isAuthorizedDraftMessage(message, { id: RUNTIME_ID }, RUNTIME_ID), true);
+  await assert.rejects(
+    () => handleDraftMessage(message, { id: RUNTIME_ID }, storage, RUNTIME_ID),
+    { code: "data-reset" },
+  );
+  assert.equal(await loadDraft(storage), null);
 });
 
 test("rejects unknown internal message types", async () => {
@@ -345,6 +409,36 @@ test("queues a normalized context-menu capture", async () => {
   assert.equal(result.capture.title.length, LIMITS.title);
   assert.equal(result.capture.url, "https://example.com/lecture?week=2");
   assert.deepEqual(await loadPendingCaptures(storage), [result.capture]);
+});
+
+test("does not queue a context capture across a data reset", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
+  const originalGet = storage.get.bind(storage);
+  let changedEpoch = false;
+  storage.get = async (keys) => {
+    const result = await originalGet(keys);
+    if (
+      !changedEpoch &&
+      Array.isArray(keys) &&
+      keys.includes(STORAGE_KEYS.dataEpoch)
+    ) {
+      changedEpoch = true;
+      storage.values[STORAGE_KEYS.dataEpoch] = "context-menu-new-epoch";
+    }
+    return result;
+  };
+
+  await assert.rejects(
+    () =>
+      captureContextSelection(
+        { selectionText: "Do not restore after reset" },
+        { title: "Old lecture" },
+        storage,
+        () => "context-menu-stale",
+      ),
+    { code: "data-reset" },
+  );
+  assert.deepEqual(await loadPendingCaptures(storage), []);
 });
 
 test("ignores an empty context-menu selection", async () => {
@@ -575,7 +669,7 @@ test("does not open an editor when a context capture cannot be queued", async ()
 });
 
 test("removes a queued capture only after its handed-off draft is saved", async () => {
-  const storage = memoryStorage();
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
   await captureContextSelection(
     { selectionText: "Queued selection" },
     {},
@@ -588,6 +682,7 @@ test("removes a queued capture only after its handed-off draft is saved", async 
     expectedOwnerSessionId: "",
     expectedGeneration: 0,
     contentGeneration: 1,
+    expectedEpoch: DATA_EPOCH,
     pendingCaptureId: "capture-handoff",
     draft: { body: "Queued selection", sessionId: "popup-session" },
   };
@@ -605,7 +700,7 @@ test("removes a queued capture only after its handed-off draft is saved", async 
 });
 
 test("keeps a queued capture when its handed-off draft loses a conflict", async () => {
-  const storage = memoryStorage();
+  const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
   await captureContextSelection(
     { selectionText: "Queued selection" },
     {},
@@ -619,6 +714,7 @@ test("keeps a queued capture when its handed-off draft loses a conflict", async 
       expectedOwnerSessionId: "",
       expectedGeneration: 0,
       contentGeneration: 2,
+      expectedEpoch: DATA_EPOCH,
       draft: { body: "Newer draft", sessionId: "other-popup" },
     },
     { id: RUNTIME_ID },
@@ -633,6 +729,7 @@ test("keeps a queued capture when its handed-off draft loses a conflict", async 
       expectedOwnerSessionId: "",
       expectedGeneration: 0,
       contentGeneration: 1,
+      expectedEpoch: DATA_EPOCH,
       pendingCaptureId: "capture-conflict",
       draft: { body: "Queued selection", sessionId: "stale-popup" },
     },

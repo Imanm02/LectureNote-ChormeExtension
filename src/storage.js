@@ -384,6 +384,46 @@ export async function loadDataEpoch(
   return withStateLock(() => loadDataEpochUnlocked(area, options), lockManager);
 }
 
+export async function loadHelpSeen(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    const epoch = await assertExpectedDataEpochUnlocked(area, options);
+    const stored = await area.get(STORAGE_KEYS.helpSeen);
+    const rawValue = stored[STORAGE_KEYS.helpSeen];
+    const seen = rawValue === true || (
+      rawValue?.version === 1 &&
+      rawValue.epoch === epoch &&
+      rawValue.seen === true
+    );
+    if (rawValue === true) {
+      await assertExpectedDataEpochUnlocked(area, options);
+      await area.set({
+        [STORAGE_KEYS.helpSeen]: { version: 1, epoch, seen: true },
+      });
+    }
+    await assertExpectedDataEpochUnlocked(area, options);
+    return seen;
+  }, lockManager);
+}
+
+export async function saveHelpSeen(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    const epoch = await assertExpectedDataEpochUnlocked(area, options);
+    await area.set({
+      [STORAGE_KEYS.helpSeen]: { version: 1, epoch, seen: true },
+    });
+    await assertExpectedDataEpochUnlocked(area, options);
+    return true;
+  }, lockManager);
+}
+
 function nextDraftTombstoneGeneration(value) {
   if (Number.isSafeInteger(value) && value >= 0 && value < Number.MAX_SAFE_INTEGER) {
     return value + 1;
@@ -613,6 +653,7 @@ async function loadStateUnlocked(area, options) {
     if (updates[STORAGE_KEYS.state]) {
       assertStateFits(updates[STORAGE_KEYS.state]);
     }
+    await assertExpectedDataEpochUnlocked(area, options);
     await area.set(updates);
   }
 
@@ -625,6 +666,7 @@ async function loadStateUnlocked(area, options) {
     if (typeof area.remove !== "function") {
       throw new TypeError("The storage area cannot finish data migration.");
     }
+    await assertExpectedDataEpochUnlocked(area, options);
     await area.remove(legacyKeys);
   }
 
@@ -636,7 +678,12 @@ export async function loadState(
   { lockManager = globalThis.navigator?.locks, ...options } = {},
 ) {
   const area = getStorage(storage);
-  return withStateLock(() => loadStateUnlocked(area, options), lockManager);
+  return withStateLock(async () => {
+    await assertExpectedDataEpochUnlocked(area, options);
+    const state = await loadStateUnlocked(area, options);
+    await assertExpectedDataEpochUnlocked(area, options);
+    return state;
+  }, lockManager);
 }
 
 async function saveStateUnlocked(value, area, options, epochChecked = false) {
@@ -711,6 +758,7 @@ async function loadPendingCapturesUnlocked(area, options = {}) {
   const rawRecord = stored[STORAGE_KEYS.pendingCaptures];
   const record = normalizePendingCaptureRecord(rawRecord, options);
   if (rawRecord !== undefined && !sameData(rawRecord, record)) {
+    await assertExpectedDataEpochUnlocked(area, options);
     await area.set({ [STORAGE_KEYS.pendingCaptures]: record });
   }
   return record;
@@ -722,8 +770,10 @@ export async function loadPendingCaptures(
 ) {
   const area = getStorage(storage);
   const record = await withStateLock(async () => {
-    await loadDataEpochUnlocked(area, options);
-    return loadPendingCapturesUnlocked(area, options);
+    await assertExpectedDataEpochUnlocked(area, options);
+    const current = await loadPendingCapturesUnlocked(area, options);
+    await assertExpectedDataEpochUnlocked(area, options);
+    return current;
   }, lockManager);
   return record.captures;
 }
@@ -804,6 +854,7 @@ async function loadPopupDraftUnlocked(area, options = {}) {
   const rawRecord = stored[STORAGE_KEYS.draft];
   const record = normalizePopupDraftRecord(rawRecord, options);
   if (rawRecord !== undefined && !sameData(rawRecord, record)) {
+    await assertExpectedDataEpochUnlocked(area, options);
     await area.set({ [STORAGE_KEYS.draft]: record });
   }
   return record;
@@ -814,7 +865,12 @@ export async function loadPopupDraft(
   { lockManager = globalThis.navigator?.locks, ...options } = {},
 ) {
   const area = getStorage(storage);
-  return withStateLock(() => loadPopupDraftUnlocked(area, options), lockManager);
+  return withStateLock(async () => {
+    await assertExpectedDataEpochUnlocked(area, options);
+    const record = await loadPopupDraftUnlocked(area, options);
+    await assertExpectedDataEpochUnlocked(area, options);
+    return record;
+  }, lockManager);
 }
 
 export async function loadDraft(
@@ -1046,6 +1102,7 @@ async function loadEditorDraftUnlocked(area, options = {}) {
       createdAt: options.now || new Date().toISOString(),
       rejectedDrafts: 1,
     });
+    await assertExpectedDataEpochUnlocked(area, options);
     await area.set({
       [STORAGE_KEYS.editorDraft]: record,
       [STORAGE_KEYS.recovery]: recovery,
@@ -1054,6 +1111,7 @@ async function loadEditorDraftUnlocked(area, options = {}) {
   }
   if (rawRecord !== undefined && !sameData(rawRecord, record)) {
     assertEditorDraftFits(record);
+    await assertExpectedDataEpochUnlocked(area, options);
     await area.set({ [STORAGE_KEYS.editorDraft]: record });
   }
   return record;
@@ -1064,7 +1122,12 @@ export async function loadEditorDraft(
   { lockManager = globalThis.navigator?.locks, ...options } = {},
 ) {
   const area = getStorage(storage);
-  return withStateLock(() => loadEditorDraftUnlocked(area, options), lockManager);
+  return withStateLock(async () => {
+    await assertExpectedDataEpochUnlocked(area, options);
+    const record = await loadEditorDraftUnlocked(area, options);
+    await assertExpectedDataEpochUnlocked(area, options);
+    return record;
+  }, lockManager);
 }
 
 async function writeEditorDraftUnlocked(value, area, options) {
@@ -1232,9 +1295,11 @@ export async function loadRecoveryNotice(
 ) {
   const area = getStorage(storage);
   return withStateLock(async () => {
-    await loadDataEpochUnlocked(area, options);
+    await assertExpectedDataEpochUnlocked(area, options);
     const stored = await area.get(STORAGE_KEYS.recovery);
-    return normalizeRecovery(stored[STORAGE_KEYS.recovery]) || emptyRecoveryNotice();
+    const recovery = normalizeRecovery(stored[STORAGE_KEYS.recovery]) || emptyRecoveryNotice();
+    await assertExpectedDataEpochUnlocked(area, options);
+    return recovery;
   }, lockManager);
 }
 

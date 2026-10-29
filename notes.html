@@ -62,8 +62,29 @@
         <button id="trashViewButton" class="button button-quiet" type="button" aria-pressed="false" disabled>
           Trash <span id="trashNoteCount" class="count-badge" aria-hidden="true">0</span>
         </button>
-        <button id="emptyTrashButton" class="button button-quiet danger-text view-end-action" type="button" hidden disabled>Empty Trash</button>
+        <button id="selectionModeButton" class="button button-secondary view-end-action" type="button" aria-pressed="false" disabled>Select notes</button>
+        <button id="emptyTrashButton" class="button button-quiet danger-text" type="button" hidden disabled>Empty Trash</button>
       </nav>
+
+      <section id="selectionToolbar" class="selection-toolbar" aria-labelledby="selectionCount" hidden>
+        <div class="selection-summary">
+          <p id="selectionCount" role="status" aria-live="polite" aria-atomic="true">0 notes selected</p>
+          <button id="selectAllFilteredButton" class="button button-secondary compact" type="button">Select all results</button>
+          <button id="clearSelectionButton" class="button button-quiet compact" type="button">Clear selection</button>
+        </div>
+        <div class="selection-actions">
+          <div id="activeSelectionActions" class="selection-action-group">
+            <button id="bulkCourseButton" class="button button-secondary compact" type="button">Set course</button>
+            <button id="bulkExportButton" class="button button-secondary compact" type="button">Export selected</button>
+            <button id="bulkTrashButton" class="button button-quiet compact danger-text" type="button">Move to Trash</button>
+          </div>
+          <div id="trashSelectionActions" class="selection-action-group" hidden>
+            <button id="bulkRestoreButton" class="button button-primary compact" type="button">Restore selected</button>
+            <button id="bulkPermanentDeleteButton" class="button button-quiet compact danger-text" type="button">Delete permanently</button>
+          </div>
+          <button id="cancelSelectionButton" class="button button-quiet compact" type="button">Done selecting</button>
+        </div>
+      </section>
 
       <section class="library-actions" aria-label="Backup and restore notes">
         <button id="exportJsonButton" class="button button-secondary" type="button" disabled>Export backup</button>
@@ -130,6 +151,10 @@
 
     <template id="noteCardTemplate">
       <article class="note-card">
+        <label class="note-selection" hidden>
+          <input class="note-select-checkbox" type="checkbox">
+          <span>Select</span>
+        </label>
         <header class="note-card-header">
           <div class="note-heading">
             <p class="note-course" dir="auto" hidden></p>
@@ -315,6 +340,44 @@
         <footer class="dialog-actions">
           <button id="cancelEmptyTrashButton" class="button button-secondary" type="button">Cancel</button>
           <button id="confirmEmptyTrashButton" class="button button-danger" type="submit">Empty Trash</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="bulkCourseDialog" class="dialog compact-dialog" aria-labelledby="bulkCourseHeading" aria-describedby="bulkCourseMessage bulkCourseStatus">
+      <form id="bulkCourseForm" class="dialog-form">
+        <div class="dialog-content editor-fields">
+          <div>
+            <p class="eyebrow">Selected notes</p>
+            <h2 id="bulkCourseHeading">Set course</h2>
+            <p id="bulkCourseMessage"></p>
+          </div>
+          <div class="field">
+            <label for="bulkCourseInput">Course</label>
+            <input id="bulkCourseInput" type="text" maxlength="80" autocomplete="off" list="editorCourseSuggestions" dir="auto">
+          </div>
+          <p id="bulkCourseStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions stacked-actions">
+          <button id="cancelBulkCourseButton" class="button button-quiet" type="button">Cancel</button>
+          <button id="clearBulkCourseButton" class="button button-secondary" type="button">Clear course</button>
+          <button id="applyBulkCourseButton" class="button button-primary" type="submit">Apply course</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="bulkConfirmDialog" class="dialog compact-dialog" aria-labelledby="bulkConfirmHeading" aria-describedby="bulkConfirmMessage bulkConfirmWarning bulkConfirmStatus">
+      <form id="bulkConfirmForm" class="dialog-form">
+        <div class="dialog-content">
+          <p id="bulkConfirmEyebrow" class="eyebrow">Selected notes</p>
+          <h2 id="bulkConfirmHeading">Confirm action</h2>
+          <p id="bulkConfirmMessage"></p>
+          <p id="bulkConfirmWarning"></p>
+          <p id="bulkConfirmStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions">
+          <button id="cancelBulkConfirmButton" class="button button-secondary" type="button">Cancel</button>
+          <button id="confirmBulkActionButton" class="button button-danger" type="submit">Continue</button>
         </footer>
       </form>
     </dialog>
