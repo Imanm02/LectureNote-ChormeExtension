@@ -165,11 +165,26 @@ export function crc32(data) {
   return (value ^ 0xffffffff) >>> 0;
 }
 
-function assertSafeArchiveName(name) {
+export function assertSafeArchiveName(name) {
+  assert.equal(typeof name, "string", "ZIP path must be a string");
   assert.equal(name, name.replaceAll("\\", "/"), `ZIP path uses a backslash: ${name}`);
   assert.ok(!name.startsWith("/"), `ZIP path is absolute: ${name}`);
   const parts = name.split("/");
   assert.ok(parts.every((part) => part && part !== "." && part !== ".."), `Unsafe ZIP path: ${name}`);
+  for (const part of parts) {
+    assert.ok(
+      ![...part].some(
+        (character) => character.codePointAt(0) <= 0x1f || '<>:"|?*'.includes(character),
+      ),
+      `Unsafe ZIP path: ${name}`,
+    );
+    assert.ok(!/[. ]$/u.test(part), `Unsafe ZIP path: ${name}`);
+    assert.doesNotMatch(
+      part,
+      /^(?:aux|com[1-9]|con|lpt[1-9]|nul|prn)(?:\..*)?$/iu,
+      `Unsafe ZIP path: ${name}`,
+    );
+  }
 }
 
 export function buildStoredZip(entries) {

@@ -9,12 +9,18 @@ import { chromium } from "playwright";
 
 import { readPageSelection } from "../src/capture.js";
 
-const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+assert.ok(process.argv.length <= 3, "Browser smoke accepts at most one extension root");
+const extensionRoot = process.argv[2] ? resolve(process.argv[2]) : projectRoot;
+const extensionManifest = JSON.parse(
+  await readFile(join(extensionRoot, "manifest.json"), "utf8"),
+);
+assert.equal(extensionManifest.manifest_version, 3, "The extension root must contain an MV3 manifest");
 const screenshotDirectory = process.env.LECTURE_NOTES_SCREENSHOTS
-  ? resolve(root, process.env.LECTURE_NOTES_SCREENSHOTS)
+  ? resolve(projectRoot, process.env.LECTURE_NOTES_SCREENSHOTS)
   : null;
 if (screenshotDirectory) {
-  const allowedScreenshotRoot = resolve(root, "test-results");
+  const allowedScreenshotRoot = resolve(projectRoot, "test-results");
   assert.ok(
     screenshotDirectory === allowedScreenshotRoot ||
       screenshotDirectory.startsWith(`${allowedScreenshotRoot}${sep}`),
@@ -87,7 +93,10 @@ async function launch() {
     channel: "chromium",
     headless: true,
     viewport: { width: 1280, height: 900 },
-    args: [`--disable-extensions-except=${root}`, `--load-extension=${root}`],
+    args: [
+      `--disable-extensions-except=${extensionRoot}`,
+      `--load-extension=${extensionRoot}`,
+    ],
   });
   context.on("page", trackPage);
   for (const page of context.pages()) {
@@ -121,7 +130,7 @@ async function createPersianNote(page) {
   await page.locator("#editorCourse").fill("ریاضی");
   await page.locator("#editorBody").fill("مقادیر ویژه و بردارهای ویژه");
   await page.locator("#editorForm").getByRole("button", { name: "Save note" }).click();
-  await page.locator("#libraryStatus").filter({ hasText: "Note saved." }).waitFor();
+  await page.locator("#libraryStatus").filter({ hasText: "Note saved" }).waitFor();
 }
 
 let context;
@@ -189,7 +198,7 @@ try {
   }
   await popup.getByRole("button", { name: "Save note", exact: true }).click();
   try {
-    await popup.locator("#status").filter({ hasText: "Note saved." }).waitFor();
+    await popup.locator("#status").filter({ hasText: "Note saved" }).waitFor();
   } catch (error) {
     console.error("Popup status:", await popup.locator("#status").textContent());
     console.error("Browser errors:", browserErrors);

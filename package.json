@@ -10,9 +10,10 @@
     "lint": "eslint src tests scripts/*.mjs eslint.config.js",
     "package:extension": "node scripts/package-extension.mjs",
     "preflight": "npm audit --audit-level=moderate && npm run lint && npm run test:coverage && npm run check:extension",
-    "release:check": "npm run preflight && npm run test:browser && npm run package:extension && npm run check:package",
+    "release:check": "npm run preflight && npm run test:browser && npm run package:extension && npm run check:package && npm run test:browser:package",
     "test": "node --test",
     "test:browser": "node scripts/browser-smoke.mjs",
+    "test:browser:package": "node scripts/package-browser-smoke.mjs",
     "test:coverage": "node --experimental-test-coverage --test --test-coverage-lines=87 --test-coverage-branches=80 --test-coverage-functions=83",
     "validate": "npm run lint && npm test && npm run check:extension"
   },
