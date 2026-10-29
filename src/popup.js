@@ -33,6 +33,7 @@ function popupElements(documentValue) {
     bodyCount: requiredElement(documentValue, "bodyCount"),
     sourceTitle: requiredElement(documentValue, "sourceTitle"),
     sourceLink: requiredElement(documentValue, "sourceLink"),
+    sourcePrivacy: requiredElement(documentValue, "sourcePrivacyButton"),
     useSelection: requiredElement(documentValue, "useSelectionButton"),
     discardSelection: requiredElement(documentValue, "discardSelectionButton"),
     save: requiredElement(documentValue, "saveButton"),
@@ -101,6 +102,7 @@ export async function initPopup({
   const draftSessionId = crypto.randomUUID();
   let state;
   let currentSource = { title: "", url: "" };
+  let restorableSource = { title: "", url: "" };
   let livePageCapture = null;
   let pendingCaptures = [];
   let pendingCapture = null;
@@ -150,6 +152,7 @@ export async function initPopup({
     elements.form.inert = busy;
     elements.save.disabled = busy;
     elements.discard.disabled = busy || !hasDiscardableDraft;
+    elements.sourcePrivacy.disabled = busy;
     elements.useSelection.disabled = busy;
     elements.discardSelection.disabled = busy;
     elements.saveCopy.disabled = busy;
@@ -160,8 +163,26 @@ export async function initPopup({
     elements.discard.disabled = elements.form.inert || !hasDiscardableDraft;
   }
 
-  function showSource(source) {
+  function hasSource(source) {
+    return Boolean(source.title || source.url);
+  }
+
+  function updateSourcePrivacyControl() {
+    const sourceIsIncluded = hasSource(currentSource);
+    const sourceCanBeRestored = hasSource(restorableSource);
+    elements.sourcePrivacy.hidden = !sourceIsIncluded && !sourceCanBeRestored;
+    elements.sourcePrivacy.textContent = sourceIsIncluded ? "Remove source" : "Restore source";
+    elements.sourcePrivacy.setAttribute(
+      "aria-label",
+      sourceIsIncluded
+        ? "Remove the source title and URL from this note"
+        : "Restore the source title and URL to this note",
+    );
+  }
+
+  function showSource(source, { restore = source } = {}) {
     currentSource = normalizeSource(source);
+    restorableSource = normalizeSource(restore);
     elements.sourceTitle.textContent = currentSource.title || "Manual note";
     elements.sourceTitle.dir = "auto";
     if (currentSource.url) {
@@ -171,6 +192,16 @@ export async function initPopup({
       elements.sourceLink.removeAttribute("href");
       elements.sourceLink.hidden = true;
     }
+    updateSourcePrivacyControl();
+  }
+
+  function sourceFromCapture(capture) {
+    const capturedTitle = typeof capture?.title === "string" ? capture.title : "";
+    const capturedUrl = typeof capture?.url === "string" ? capture.url : "";
+    return normalizeSource({
+      title: capturedTitle.slice(0, LIMITS.sourceTitle),
+      url: capturedUrl.length <= LIMITS.captureUrl ? capturedUrl : "",
+    });
   }
 
   function renderRecentNotes() {
@@ -253,7 +284,7 @@ export async function initPopup({
     }
     const generation = draftGeneration;
     const draft = formDraft();
-    const pendingCaptureId = appliedPendingCaptureId;
+    const pendingCaptureId = hasSource(draft.source) ? appliedPendingCaptureId : "";
     let saved = false;
     try {
       await enqueueDraftOperation(async () => {
@@ -341,12 +372,7 @@ export async function initPopup({
   }
 
   function fillFromCapture(capture) {
-    const capturedTitle = typeof capture.title === "string" ? capture.title : "";
-    const capturedUrl = typeof capture.url === "string" ? capture.url : "";
-    const source = normalizeSource({
-      title: capturedTitle.slice(0, LIMITS.sourceTitle),
-      url: capturedUrl.length <= LIMITS.captureUrl ? capturedUrl : "",
-    });
+    const source = sourceFromCapture(capture);
     elements.title.value = source.title.slice(0, LIMITS.title);
     elements.body.value = capture.text;
     showSource(source);
@@ -402,18 +428,28 @@ export async function initPopup({
     elements.title.value = draft.title;
     elements.body.value = draft.body;
     elements.course.value = draft.course;
-    showSource(draft.source);
+    const draftSource = normalizeSource(draft.source);
+    const restoreCapture = appliedPendingCaptureId ? pendingCapture : livePageCapture;
+    const restore = hasSource(draftSource) || !restoreCapture
+      ? draftSource
+      : sourceFromCapture(restoreCapture);
+    showSource(draftSource, { restore });
     updateBodyCount();
+  }
+
+  function draftMatchesPendingCapture(draft, capture) {
+    if (!capture?.id || hasSource(draft.source)) {
+      return false;
+    }
+    const source = sourceFromCapture(capture);
+    return draft.title === source.title.slice(0, LIMITS.title) && draft.body === capture.text;
   }
 
   function prepareNextNote(course) {
     elements.form.reset();
     elements.course.value = course;
     if (pageCapture) {
-      const source = normalizeSource({
-        title: pageCapture.title.slice(0, LIMITS.sourceTitle),
-        url: pageCapture.url.length <= LIMITS.captureUrl ? pageCapture.url : "",
-      });
+      const source = sourceFromCapture(pageCapture);
       elements.title.value = source.title.slice(0, LIMITS.title);
       showSource(source);
       elements.useSelection.hidden = !pageCapture.text;
@@ -430,6 +466,7 @@ export async function initPopup({
   async function saveNote(allowDuplicate = false) {
     let focusTarget = null;
     const savedCourse = elements.course.value;
+    const savedWithSource = hasSource(currentSource);
     const pendingCaptureId = appliedPendingCaptureId;
     elements.duplicate.hidden = true;
     elements.body.removeAttribute("aria-invalid");
@@ -479,9 +516,11 @@ export async function initPopup({
       }
       prepareNextNote(savedCourse);
       renderRecentNotes();
-      const successMessage = currentSource.url || currentSource.title
+      const successMessage = savedWithSource
         ? "Note saved. Source kept for the next note."
-        : "Note saved.";
+        : pageCapture
+          ? "Note saved without a source. Page source restored for the next note."
+          : "Note saved without a source.";
       const warning = draftWarning || pendingWarning;
       setStatus(elements.status, warning || successMessage, warning ? "warning" : "success");
       focusTarget = elements.body;
@@ -565,6 +604,31 @@ export async function initPopup({
     }
   });
   elements.saveCopy.addEventListener("click", () => void saveNote(true));
+  elements.sourcePrivacy.addEventListener("click", () => {
+    if (hasSource(currentSource)) {
+      const source = currentSource;
+      showSource({}, { restore: source });
+      setStatus(
+        elements.status,
+        "Source removed from this note. You can restore it before saving.",
+        "info",
+      );
+    } else if (hasSource(restorableSource)) {
+      showSource(restorableSource);
+      setStatus(elements.status, "Source restored.", "success");
+    } else {
+      return;
+    }
+    if (!ready) {
+      return;
+    }
+    draftDirty = true;
+    hasDiscardableDraft = true;
+    draftGeneration += 1;
+    elements.duplicate.hidden = true;
+    updateDiscardControl();
+    scheduleDraftSave();
+  });
   elements.useSelection.addEventListener("click", async () => {
     if (!pageCapture) {
       return;
@@ -752,6 +816,9 @@ export async function initPopup({
     }
     setPendingCaptureList(queuedCaptures);
     if (draft) {
+      if (draftMatchesPendingCapture(draft, pendingCapture)) {
+        appliedPendingCaptureId = pendingCapture.id;
+      }
       fillFromDraft(draft);
       hasDiscardableDraft = true;
       elements.useSelection.hidden = !pageCapture?.text;
@@ -807,7 +874,7 @@ export async function initPopup({
     const contentGeneration = draftGeneration;
     const expectedOwnerSessionId = draftCursor.ownerSessionId;
     const expectedGeneration = draftCursor.generation;
-    const pendingCaptureId = appliedPendingCaptureId;
+    const pendingCaptureId = hasSource(draft.source) ? appliedPendingCaptureId : "";
     draftDirty = false;
     const saveDirectly = async () => {
       const result = await savePopupDraft(draft, storage, {

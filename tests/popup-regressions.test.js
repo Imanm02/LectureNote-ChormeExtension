@@ -319,7 +319,11 @@ test("clears a recovered owned draft when it is saved immediately", async () => 
 
   submit(dom.window, dom.window.document.getElementById("noteForm"));
   await waitFor(() => controller.getState().notes.length === 1);
-  await waitFor(() => dom.window.document.getElementById("status").textContent.startsWith("Note saved."));
+  await waitFor(
+    () =>
+      dom.window.document.getElementById("status").textContent ===
+      "Note saved without a source. Page source restored for the next note.",
+  );
 
   assert.equal(await loadDraft(storage), null);
   controller.destroy();

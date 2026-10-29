@@ -70,6 +70,224 @@ test("prefills the popup from the current selection", async () => {
   dom.window.close();
 });
 
+test("saves a captured note without source details", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage, {
+      title: "Private lecture",
+      text: "Keep the note, not its location",
+      url: "https://example.com/private?token=secret",
+    }),
+  });
+  const sourcePrivacy = dom.window.document.getElementById("sourcePrivacyButton");
+
+  sourcePrivacy.click();
+  assert.equal(sourcePrivacy.textContent.trim(), "Restore source");
+  assert.equal(dom.window.document.getElementById("sourceTitle").textContent, "Manual note");
+  assert.equal(dom.window.document.getElementById("sourceLink").hidden, true);
+
+  dom.window.document.getElementById("noteForm").requestSubmit();
+  await waitFor(() => controller.getState().notes.length === 1);
+
+  assert.deepEqual(controller.getState().notes[0].source, { title: "", url: "" });
+  assert.match(dom.window.document.getElementById("status").textContent, /without a source/u);
+  controller.destroy();
+  dom.window.close();
+});
+
+test("restores a removed source before saving", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage, {
+      title: "Restorable lecture",
+      text: "Restore this source",
+      url: "https://example.com/week?part=2&token=secret",
+    }),
+  });
+  const sourcePrivacy = dom.window.document.getElementById("sourcePrivacyButton");
+
+  sourcePrivacy.click();
+  sourcePrivacy.click();
+  assert.equal(sourcePrivacy.textContent.trim(), "Remove source");
+  assert.equal(dom.window.document.getElementById("sourceTitle").textContent, "Restorable lecture");
+  assert.equal(
+    dom.window.document.getElementById("sourceLink").href,
+    "https://example.com/week?part=2",
+  );
+
+  dom.window.document.getElementById("noteForm").requestSubmit();
+  await waitFor(() => controller.getState().notes.length === 1);
+  assert.deepEqual(controller.getState().notes[0].source, {
+    title: "Restorable lecture",
+    url: "https://example.com/week?part=2",
+  });
+  controller.destroy();
+  dom.window.close();
+});
+
+test("persists source removal and restores from page context", async () => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const capture = {
+    title: "Draft source",
+    text: "Unfinished private note",
+    url: "https://example.com/draft",
+  };
+  const firstDom = loadPage("popup.html");
+  const firstController = await initPopup({
+    documentValue: firstDom.window.document,
+    chromeApi: chromeMock(storage, capture),
+  });
+
+  firstDom.window.document.getElementById("sourcePrivacyButton").click();
+  await firstController.flushDraft();
+  assert.deepEqual((await loadDraft(storage)).source, { title: "", url: "" });
+  firstController.destroy();
+  firstDom.window.close();
+
+  const secondDom = loadPage("popup.html");
+  const secondController = await initPopup({
+    documentValue: secondDom.window.document,
+    chromeApi: chromeMock(storage, capture),
+  });
+  const sourcePrivacy = secondDom.window.document.getElementById("sourcePrivacyButton");
+
+  assert.equal(sourcePrivacy.textContent.trim(), "Restore source");
+  sourcePrivacy.click();
+  await secondController.flushDraft();
+  assert.deepEqual((await loadDraft(storage)).source, {
+    title: "Draft source",
+    url: "https://example.com/draft",
+  });
+  secondController.destroy();
+  secondDom.window.close();
+});
+
+test("restores a removed queued source after reopening", async () => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  await queueCapture(storage, {
+    text: "Queued private note",
+    title: "Queued source",
+    url: "https://example.com/queued",
+  });
+  const queuedBeforeOpen = structuredClone(await loadPendingCaptures(storage));
+  const firstDom = loadPage("popup.html");
+  const firstController = await initPopup({
+    documentValue: firstDom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+
+  assert.deepEqual(await loadPendingCaptures(storage), queuedBeforeOpen);
+  assert.equal(await loadDraft(storage), null);
+
+  firstDom.window.document.getElementById("sourcePrivacyButton").click();
+  await firstController.flushDraft();
+
+  assert.deepEqual((await loadDraft(storage)).source, { title: "", url: "" });
+  assert.equal((await loadDraft(storage)).body, "Queued private note");
+  assert.deepEqual(await loadPendingCaptures(storage), queuedBeforeOpen);
+  firstController.destroy();
+  firstDom.window.close();
+
+  const secondDom = loadPage("popup.html");
+  const secondController = await initPopup({
+    documentValue: secondDom.window.document,
+    chromeApi: chromeMock(storage, {
+      title: "Current page",
+      text: "",
+      url: "https://example.com/current",
+    }),
+  });
+  const sourcePrivacy = secondDom.window.document.getElementById("sourcePrivacyButton");
+
+  assert.equal(sourcePrivacy.textContent.trim(), "Restore source");
+  sourcePrivacy.click();
+  await secondController.flushDraft();
+
+  assert.deepEqual((await loadDraft(storage)).source, {
+    title: "Queued source",
+    url: "https://example.com/queued",
+  });
+  assert.deepEqual(await loadPendingCaptures(storage), []);
+  secondController.destroy();
+  secondDom.window.close();
+});
+
+test("uses a queued capture after source removal", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.draft]: storedDraft(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  await queueCapture(storage, {
+    text: "Replacement note",
+    title: "Replacement source",
+    url: "https://example.com/replacement",
+  });
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+  const sourcePrivacy = dom.window.document.getElementById("sourcePrivacyButton");
+
+  sourcePrivacy.click();
+  dom.window.document.getElementById("useSelectionButton").click();
+  await waitFor(() => storage.values[STORAGE_KEYS.pendingCaptures]?.captures.length === 0);
+
+  assert.equal(dom.window.document.getElementById("sourceTitle").textContent, "Replacement source");
+  assert.equal(sourcePrivacy.textContent.trim(), "Remove source");
+  assert.deepEqual((await loadDraft(storage)).source, {
+    title: "Replacement source",
+    url: "https://example.com/replacement",
+  });
+  controller.destroy();
+  dom.window.close();
+});
+
+test("resets source removal to the current capture", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage, {
+      title: "Reset source",
+      text: "Reset note",
+      url: "https://example.com/reset",
+    }),
+    confirmDiscard: () => true,
+  });
+  const sourcePrivacy = dom.window.document.getElementById("sourcePrivacyButton");
+
+  sourcePrivacy.click();
+  dom.window.document.getElementById("discardButton").click();
+  await waitFor(() => dom.window.document.getElementById("status").textContent.includes("reset"));
+
+  assert.equal(sourcePrivacy.textContent.trim(), "Remove source");
+  assert.equal(dom.window.document.getElementById("sourceTitle").textContent, "Reset source");
+  assert.equal(dom.window.document.getElementById("sourceLink").href, "https://example.com/reset");
+  controller.destroy();
+  dom.window.close();
+});
+
 test("saves hostile page text as inert note content", async () => {
   const dom = loadPage("popup.html");
   const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
@@ -88,6 +306,34 @@ test("saves hostile page text as inert note content", async () => {
   assert.equal(note.body, '<img src=x onerror="alert(1)"><script>alert(2)</script>');
   assert.equal(dom.window.document.querySelectorAll("script").length, 1);
   assert.equal(dom.window.document.querySelector("img[src='x']"), null);
+  controller.destroy();
+  dom.window.close();
+});
+
+test("renders hostile source text inert after remove and restore", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const hostileTitle = '<img src=x onerror="alert(1)"><script>alert(2)</script>';
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage, {
+      title: hostileTitle,
+      text: "Safe body",
+      url: "javascript:alert(3)",
+    }),
+  });
+  const sourcePrivacy = dom.window.document.getElementById("sourcePrivacyButton");
+
+  assert.equal(dom.window.document.getElementById("sourceTitle").textContent, hostileTitle);
+  assert.equal(dom.window.document.getElementById("sourceTitle").children.length, 0);
+  sourcePrivacy.click();
+  sourcePrivacy.click();
+  assert.equal(dom.window.document.getElementById("sourceTitle").textContent, hostileTitle);
+  assert.equal(dom.window.document.getElementById("sourceTitle").children.length, 0);
+  assert.equal(dom.window.document.getElementById("sourceLink").hidden, true);
   controller.destroy();
   dom.window.close();
 });
