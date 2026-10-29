@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { JSDOM } from "jsdom";
 
+import { validateHtmlAccessibility } from "./extension-html.mjs";
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const readText = (path) => readFileSync(join(root, path), "utf8");
 const manifest = JSON.parse(readText("manifest.json"));
@@ -123,6 +125,7 @@ for (const htmlFile of htmlFiles) {
   assert.ok(documentValue.title.trim(), `${htmlFile} needs a title`);
   assert.equal(documentValue.querySelectorAll("h1").length, 1, `${htmlFile} needs one main heading`);
   assert.equal(documentValue.querySelector("base, iframe, object, embed"), null, `${htmlFile} embeds another document`);
+  validateHtmlAccessibility(documentValue, htmlFile);
 
   for (const element of documentValue.querySelectorAll("*")) {
     for (const attribute of element.attributes) {
