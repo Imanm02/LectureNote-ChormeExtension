@@ -649,6 +649,24 @@ test("uses normalized body, course, and source URL for duplicate checks", () => 
   );
 });
 
+test("detects duplicates across equivalent Persian course labels", () => {
+  const first = addNote(
+    createEmptyState(),
+    sample({ course: "ریاضی" }),
+    { idFactory: () => "note-persian-course", now: START },
+  );
+
+  assert.throws(
+    () =>
+      addNote(
+        first.state,
+        sample({ title: "Renamed", course: "رياضى" }),
+        { idFactory: () => "note-arabic-course", now: LATER },
+      ),
+    { code: "duplicate" },
+  );
+});
+
 test("rejects updating one note into a duplicate", () => {
   const first = addNote(createEmptyState(), sample(), {
     idFactory: () => "note-1",

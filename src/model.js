@@ -659,7 +659,7 @@ export function noteFingerprint(note) {
   const normalized = normalizeNote(note, { idFactory: () => "fingerprint", now: note.createdAt });
   return JSON.stringify([
     normalized.body.normalize("NFKC"),
-    normalized.course.normalize("NFKC").toLowerCase(),
+    normalizeCourseKey(normalized.course),
     normalized.source.url,
   ]);
 }
