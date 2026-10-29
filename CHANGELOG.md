@@ -6,6 +6,20 @@ This file records user-facing changes to Lecture Notes.
 
 No user-facing changes yet.
 
+## 2.1.2 - 2026-10-29
+
+### Fixed
+
+- Kept plain-text lines beginning with up to three spaces and a tab from becoming code blocks in Markdown exports.
+
+### Validation
+
+- Added regression cases for tab indentation after one, two, or three leading spaces.
+- Passed 335 automated tests with 87.15% line coverage, 80.93% branch coverage, and 89.75% function coverage.
+- Passed the dependency audit, ESLint, manifest validation, Chromium product smoke tests, stable Chrome action tests, package validation, and both packaged browser tests.
+- Validated the deterministic 23-file `lecture-notes-2.1.2.zip` package.
+- Recorded SHA-256 `31cedfbebc47baf0e9679b2f1ee01c872e5def56b752526d0171be14aa85c460`.
+
 ## 2.1.1 - 2026-10-29
 
 ### Changed
