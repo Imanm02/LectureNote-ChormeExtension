@@ -450,6 +450,21 @@ test("queues a normalized context-menu capture", async () => {
   assert.deepEqual(await loadPendingCaptures(storage), [result.capture]);
 });
 
+test("keeps a context-menu title well formed at the note limit", async () => {
+  const storage = memoryStorage();
+  const prefix = "T".repeat(LIMITS.title - 1);
+  const result = await captureContextSelection(
+    { selectionText: "Selected text", pageUrl: "https://example.com/lecture" },
+    { title: `${prefix}🎓 after` },
+    storage,
+    () => "context-menu-title-boundary",
+  );
+
+  assert.equal(result.capture.title, prefix);
+  assert.equal(result.capture.title.isWellFormed(), true);
+  assert.equal((await loadPendingCaptures(storage))[0].title, prefix);
+});
+
 test("does not inspect context-menu data before consent", async () => {
   const storage = createMemoryStorage({
     [STORAGE_KEYS.state]: { private: "existing notes" },

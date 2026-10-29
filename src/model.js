@@ -53,12 +53,28 @@ function stripUnsafeControls(value, allowNewlines = false) {
       const codePoint = character.codePointAt(0);
       const allowedWhitespace = allowNewlines && (codePoint === 9 || codePoint === 10);
       const control = (codePoint <= 31 && !allowedWhitespace) || (codePoint >= 127 && codePoint <= 159);
+      const unpairedSurrogate = codePoint >= 0xd800 && codePoint <= 0xdfff;
       const bidirectionalOverride =
         (codePoint >= 0x202a && codePoint <= 0x202e) ||
         (codePoint >= 0x2066 && codePoint <= 0x2069);
-      return !control && !bidirectionalOverride;
+      return !control && !unpairedSurrogate && !bidirectionalOverride;
     })
     .join("");
+}
+
+export function safeTextPrefix(value, maximumLength) {
+  let result = "";
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) {
+      continue;
+    }
+    if (result.length + character.length > maximumLength) {
+      break;
+    }
+    result += character;
+  }
+  return result;
 }
 
 function normalizeSingleLine(value, label, maximum, { required = false } = {}) {
@@ -272,7 +288,7 @@ export function normalizeNote(
   const body = normalizeBody(value.body);
   const fallbackTitle = body.split("\n").find((line) => line.trim())?.trim() || "Untitled note";
   const title = normalizeSingleLine(
-    value.title || fallbackTitle.slice(0, LIMITS.title),
+    value.title || safeTextPrefix(fallbackTitle, LIMITS.title),
     "Title",
     LIMITS.title,
     { required: true },

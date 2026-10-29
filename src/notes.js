@@ -21,6 +21,7 @@ import {
   renameCourse,
   restoreTrashedNote,
   restoreTrashedNotes,
+  safeTextPrefix,
   updateNote,
   updateSettings,
   ValidationError,
@@ -255,15 +256,6 @@ function closeDialog(dialog) {
 
 function isEditableTarget(target) {
   return target?.matches?.("input, textarea, select") === true;
-}
-
-function safeSlice(value, maximumLength) {
-  let result = value.slice(0, maximumLength);
-  const lastCodeUnit = result.charCodeAt(result.length - 1);
-  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
-    result = result.slice(0, -1);
-  }
-  return result;
 }
 
 const DISPLAY_BATCH = 100;
@@ -968,7 +960,7 @@ export async function initLibrary({
     time.title = `${dateLabel} ${dateValue}`;
 
     const excerpt = fragment.querySelector(".note-excerpt");
-    excerpt.textContent = note.body.length > 600 ? `${safeSlice(note.body, 600)}…` : note.body;
+    excerpt.textContent = note.body.length > 600 ? `${safeTextPrefix(note.body, 600)}…` : note.body;
 
     const sourceLink = fragment.querySelector(".note-source-link");
     const sourceTitle = fragment.querySelector(".note-source-title");

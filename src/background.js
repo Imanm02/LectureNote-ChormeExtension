@@ -2,6 +2,7 @@ import {
   isValidIdentifier,
   LIMITS,
   normalizeSource,
+  safeTextPrefix,
   ValidationError,
 } from "./model.js";
 import { MESSAGE_TYPES } from "./messages.js";
@@ -212,15 +213,6 @@ function stripUnsafeSelectionControls(value) {
     .join("");
 }
 
-function safeTextPrefix(value, maximumLength) {
-  let result = value.slice(0, maximumLength);
-  const lastCodeUnit = result.charCodeAt(result.length - 1);
-  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
-    result = result.slice(0, -1);
-  }
-  return result;
-}
-
 export function normalizeContextSelection(value, maximumLength = LIMITS.body) {
   if (typeof value !== "string") {
     return { text: "", wasTruncated: false };
@@ -262,7 +254,7 @@ export async function captureContextSelection(
   const result = await enqueuePendingCapture(
     {
       id: captureIdFactory(),
-      title: source.title.slice(0, LIMITS.title),
+      title: safeTextPrefix(source.title, LIMITS.title),
       text: selection.text,
       url: source.url,
       wasTruncated: selection.wasTruncated,

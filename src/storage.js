@@ -7,6 +7,7 @@ import {
   normalizeEditorDraft,
   normalizeState,
   recoverState,
+  safeTextPrefix,
   ValidationError,
 } from "./model.js";
 
@@ -58,15 +59,6 @@ function sameData(left, right) {
 
 function encodedBytes(value) {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
-}
-
-function safeTextPrefix(value, maximumLength) {
-  let result = value.slice(0, maximumLength);
-  const lastCodeUnit = result.charCodeAt(result.length - 1);
-  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
-    result = result.slice(0, -1);
-  }
-  return result;
 }
 
 export function assertStateFits(value) {

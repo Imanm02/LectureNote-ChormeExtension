@@ -1,6 +1,12 @@
 import { captureActivePage, CaptureError } from "./capture.js";
 import { requireDataConsent } from "./consent.js";
-import { addNote, LIMITS, normalizeSource, ValidationError } from "./model.js";
+import {
+  addNote,
+  LIMITS,
+  normalizeSource,
+  safeTextPrefix,
+  ValidationError,
+} from "./model.js";
 import { MESSAGE_TYPES } from "./messages.js";
 import {
   clearPopupDraft,
@@ -292,7 +298,7 @@ export async function initPopup({
     const capturedTitle = typeof capture?.title === "string" ? capture.title : "";
     const capturedUrl = typeof capture?.url === "string" ? capture.url : "";
     return normalizeSource({
-      title: capturedTitle.slice(0, LIMITS.sourceTitle),
+      title: safeTextPrefix(capturedTitle, LIMITS.sourceTitle),
       url: capturedUrl.length <= LIMITS.captureUrl ? capturedUrl : "",
     });
   }
@@ -498,7 +504,7 @@ export async function initPopup({
 
   function fillFromCapture(capture) {
     const source = sourceFromCapture(capture);
-    elements.title.value = source.title.slice(0, LIMITS.title);
+    elements.title.value = safeTextPrefix(source.title, LIMITS.title);
     elements.body.value = capture.text;
     showSource(source);
     updateBodyCount();
@@ -567,7 +573,7 @@ export async function initPopup({
       return false;
     }
     const source = sourceFromCapture(capture);
-    return draft.title === source.title.slice(0, LIMITS.title) && draft.body === capture.text;
+    return draft.title === safeTextPrefix(source.title, LIMITS.title) && draft.body === capture.text;
   }
 
   function prepareNextNote(course) {
@@ -575,7 +581,7 @@ export async function initPopup({
     elements.course.value = course;
     if (pageCapture) {
       const source = sourceFromCapture(pageCapture);
-      elements.title.value = source.title.slice(0, LIMITS.title);
+      elements.title.value = safeTextPrefix(source.title, LIMITS.title);
       showSource(source);
       elements.useSelection.hidden = !pageCapture.text;
     } else {

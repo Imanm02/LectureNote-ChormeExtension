@@ -22,6 +22,7 @@ import {
   renameCourse,
   restoreTrashedNote,
   restoreTrashedNotes,
+  safeTextPrefix,
   updateSettings,
   updateNote,
   ValidationError,
@@ -79,6 +80,29 @@ test("preserves Persian, emoji, formulas, and line breaks", () => {
 
   assert.equal(note.title, "نظریه گراف");
   assert.equal(note.body, body);
+});
+
+test("keeps truncated and imported text well formed", () => {
+  const fallback = `${"x".repeat(LIMITS.title - 1)}🎓 after`;
+  const note = createNote(sample({ title: "", body: fallback }), {
+    idFactory: () => "note-title-boundary",
+    now: START,
+  });
+  const imported = normalizeNote(
+    sample({
+      title: "Safe\ud83cTitle\udc00",
+      source: { title: "Lecture\ud83cPage\udc00", url: "https://example.com" },
+    }),
+    { idFactory: () => "note-imported-title", now: START },
+  );
+
+  assert.equal(note.title, "x".repeat(LIMITS.title - 1));
+  assert.equal(note.title.isWellFormed(), true);
+  assert.equal(imported.title, "SafeTitle");
+  assert.equal(imported.source.title, "LecturePage");
+  assert.equal(imported.title.isWellFormed(), true);
+  assert.equal(imported.source.title.isWellFormed(), true);
+  assert.equal(safeTextPrefix("a🎓b", 2), "a");
 });
 
 test("rejects empty and oversized note text", () => {

@@ -125,6 +125,37 @@ test("bounds long page metadata before saving a captured note", async () => {
   dom.window.close();
 });
 
+test("keeps captured page titles well formed at field limits", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const titlePrefix = "T".repeat(LIMITS.title - 1);
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage, {
+      title: `${titlePrefix}🎓${"U".repeat(80)}`,
+      text: "Captured note",
+      url: "https://example.com/lecture",
+    }),
+  });
+
+  const title = dom.window.document.getElementById("titleInput").value;
+  const sourceTitle = dom.window.document.getElementById("sourceTitle").textContent;
+  assert.equal(title, titlePrefix);
+  assert.equal(title.isWellFormed(), true);
+  assert.equal(sourceTitle.length, LIMITS.sourceTitle);
+  assert.equal(sourceTitle.isWellFormed(), true);
+
+  submit(dom.window, dom.window.document.getElementById("noteForm"));
+  await waitFor(() => controller.getState().notes.length === 1);
+  const [note] = controller.getState().notes;
+  assert.equal(note.title, titlePrefix);
+  assert.equal(note.source.title, sourceTitle);
+  assert.equal(note.title.isWellFormed(), true);
+  assert.equal(note.source.title.isWellFormed(), true);
+  controller.destroy();
+  dom.window.close();
+});
+
 test("cancels a pending draft write after save", async () => {
   const dom = loadPage("popup.html");
   const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
