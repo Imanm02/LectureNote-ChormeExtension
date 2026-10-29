@@ -1,8 +1,12 @@
 # Changelog
 
-This file records user-facing changes to Lecture Notes. The current code has not yet been published as a tagged release, so the work below remains unreleased.
+This file records user-facing changes to Lecture Notes.
 
 ## Unreleased
+
+No user-facing changes yet.
+
+## 2.1.0 - 2026-10-29
 
 ### Added
 
@@ -63,3 +67,11 @@ This file records user-facing changes to Lecture Notes. The current code has not
 - Removed persistent content scripts, external messaging, and broad host access.
 - Added a source-sharing privacy control without weakening restorable backups.
 - Enabled private vulnerability reports through GitHub.
+
+### Validation
+
+- Passed 320 automated tests with 87.01% line coverage, 80.81% branch coverage, and 90.01% function coverage.
+- Passed the dependency audit, ESLint, manifest validation, source browser smoke, package validation, and packaged browser smoke.
+- Validated the deterministic 23-file `lecture-notes-2.1.0.zip` package.
+- Recorded SHA-256 `38aa95d24ebeaa2b77914a3e74568191e0ddd20de40d90efb67bbef675c07295`.
+- Headless Chromium did not expose the toolbar action popup, so the toolbar-action check remains a manual stable-Chrome release step.

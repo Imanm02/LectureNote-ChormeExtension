@@ -142,9 +142,9 @@ All public links must open without a GitHub sign-in before submission. Do not pu
 - [x] Keep the icon artwork inside the Store's recommended 96 by 96 content area with 16 pixels of transparent padding on each side.
 - [x] Use `store-assets/small-promo.png` as the 440 by 280 small promotional tile after checking its exported dimensions.
 - [x] Generate four 1280 by 800 packaged-extension screenshots with `npm run store:screenshots`.
-- [ ] Rerun the screenshot command after the final source change, then visually inspect every output from that exact package.
-- [ ] Make each screenshot legible when reduced to 640 by 400.
-- [ ] Do not use mock screens, private data, browser profiles, unrelated tabs, developer tools, or test controls in an uploaded image.
+- [x] Rerun the screenshot command after the final source change, then visually inspect every output from that exact package.
+- [x] Make each screenshot legible when reduced to 640 by 400.
+- [x] Do not use mock screens, private data, browser profiles, unrelated tabs, developer tools, or test controls in an uploaded image.
 - [ ] Add a 1400 by 560 marquee image only if one is ready. It is optional.
 - [ ] Add an optional YouTube promo video only if an accurate current video is ready.
 

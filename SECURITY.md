@@ -2,7 +2,7 @@
 
 ## Supported code
 
-Until the first tagged release is published, security fixes are applied to the `main` branch. After releases begin, only the latest release and `main` will receive security fixes.
+Security fixes are applied to the latest tagged release and the `main` branch. Older releases are not supported.
 
 ## Report a vulnerability
 
