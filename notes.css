@@ -52,6 +52,34 @@
   gap: var(--space-2);
 }
 
+.library-view-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-block-end: var(--space-2);
+  border-block-end: 1px solid var(--border);
+}
+
+.library-view-switch [aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.count-badge {
+  min-width: 1.6em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: inherit;
+  font-size: 0.78em;
+  text-align: center;
+}
+
+.view-end-action {
+  margin-inline-start: auto;
+}
+
 .library-feedback {
   display: flex;
   min-height: 30px;
@@ -196,6 +224,14 @@
   gap: var(--space-2);
   padding-block-start: var(--space-2);
   border-block-start: 1px solid var(--border);
+}
+
+.active-note-actions,
+.trash-note-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: end;
+  gap: var(--space-2);
 }
 
 .danger-text {
@@ -353,9 +389,19 @@
   }
 
   .library-actions .button,
+  .library-view-switch .button,
   .draft-recovery-actions .button,
   .dialog-actions .button {
     flex: 1 1 auto;
+  }
+
+  .library-view-switch {
+    flex-wrap: wrap;
+  }
+
+  .view-end-action {
+    width: 100%;
+    margin-inline-start: 0;
   }
 
   .draft-recovery-actions {

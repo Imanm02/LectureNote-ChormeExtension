@@ -2,6 +2,7 @@ import {
   LIMITS,
   normalizeNote,
   normalizeState,
+  normalizeTrashEntry,
   noteFingerprint,
   SCHEMA_VERSION,
   ValidationError,
@@ -34,6 +35,7 @@ export function createBackup(stateValue, { now = new Date().toISOString() } = {}
     schemaVersion: SCHEMA_VERSION,
     exportedAt: validTimestamp(now, new Date().toISOString()),
     notes: state.notes,
+    trash: state.trash,
     settings: state.settings,
   };
 }
@@ -66,44 +68,59 @@ export function parseBackup(
   if (!isRecord(value) || value.format !== "lecturenote-backup") {
     throw new ValidationError("This is not a Lecture Notes backup.", "import-format");
   }
-  if (value.schemaVersion !== SCHEMA_VERSION) {
+  if (![1, SCHEMA_VERSION].includes(value.schemaVersion)) {
     throw new ValidationError("This backup version is not supported.", "schema-version");
+  }
+  if (value.schemaVersion >= 2 && !Array.isArray(value.trash)) {
+    throw new ValidationError("The backup Trash entries must be a list.", "import-trash-type");
   }
 
   const normalized = normalizeState(
     {
       schemaVersion: value.schemaVersion,
       notes: value.notes,
+      trash: value.schemaVersion >= 2 ? value.trash : [],
       settings: value.settings,
     },
     { idFactory, now },
   );
   return {
     notes: normalized.notes,
+    trash: normalized.trash,
     settings: normalized.settings,
   };
 }
 
-export function mergeImportedNotes(stateValue, importedValue, options = {}) {
+export function mergeImportedBackup(stateValue, importedValue, options = {}) {
   const state = normalizeState(stateValue, options);
-  if (!Array.isArray(importedValue)) {
+  if (!isRecord(importedValue) || !Array.isArray(importedValue.notes)) {
     throw new ValidationError("Imported notes must be a list.", "import-notes-type");
   }
+  if (importedValue.trash !== undefined && !Array.isArray(importedValue.trash)) {
+    throw new ValidationError("Imported Trash entries must be a list.", "import-trash-type");
+  }
 
-  const imported = importedValue.map((note) => normalizeNote(note, options));
-  const notesByIdentifier = new Map(state.notes.map((note) => [note.id, note]));
+  const imported = importedValue.notes.map((note) => normalizeNote(note, options));
+  const importedTrash = (importedValue.trash || []).map((entry) =>
+    normalizeTrashEntry(entry, options),
+  );
+  const notesByIdentifier = new Map([
+    ...state.notes.map((note) => [note.id, note]),
+    ...state.trash.map((entry) => [entry.note.id, entry.note]),
+  ]);
   const addedNotes = [];
+  const addedTrash = [];
   let skipped = 0;
   let rekeyed = 0;
 
-  for (const candidate of imported) {
+  function prepareCandidate(candidate) {
     const fingerprint = noteFingerprint(candidate);
     let note = candidate;
     const existing = notesByIdentifier.get(note.id);
     if (existing) {
       if (noteFingerprint(existing) === fingerprint) {
         skipped += 1;
-        continue;
+        return null;
       }
 
       let replacementId = "";
@@ -121,7 +138,7 @@ export function mergeImportedNotes(stateValue, importedValue, options = {}) {
         }
       }
       if (replacementId === null) {
-        continue;
+        return null;
       }
       if (!replacementId) {
         throw new ValidationError("A unique imported note ID could not be created.", "id-collision");
@@ -129,24 +146,51 @@ export function mergeImportedNotes(stateValue, importedValue, options = {}) {
       note = { ...note, id: replacementId };
       rekeyed += 1;
     }
+    notesByIdentifier.set(note.id, note);
+    return note;
+  }
+
+  for (const candidate of imported) {
+    const note = prepareCandidate(candidate);
+    if (!note) {
+      continue;
+    }
     if (state.notes.length + addedNotes.length >= LIMITS.notes) {
       throw new ValidationError("The imported notes would exceed the library limit.", "notes-limit");
     }
-
-    notesByIdentifier.set(note.id, note);
     addedNotes.push(note);
+  }
+
+  for (const candidateEntry of importedTrash) {
+    const note = prepareCandidate(candidateEntry.note);
+    if (!note) {
+      continue;
+    }
+    if (state.trash.length + addedTrash.length >= LIMITS.trash) {
+      throw new ValidationError("The imported Trash entries would exceed the Trash limit.", "trash-limit");
+    }
+    addedTrash.push({ ...candidateEntry, note });
   }
 
   return {
     state: {
       ...state,
-      revision: addedNotes.length > 0 ? state.revision + 1 : state.revision,
+      revision: addedNotes.length + addedTrash.length > 0 ? state.revision + 1 : state.revision,
       notes: [...addedNotes, ...state.notes],
+      trash: [...addedTrash, ...state.trash],
     },
     added: addedNotes.length,
+    trashAdded: addedTrash.length,
     skipped,
     rekeyed,
   };
+}
+
+export function mergeImportedNotes(stateValue, importedValue, options = {}) {
+  if (!Array.isArray(importedValue)) {
+    throw new ValidationError("Imported notes must be a list.", "import-notes-type");
+  }
+  return mergeImportedBackup(stateValue, { notes: importedValue, trash: [] }, options);
 }
 
 export function replaceImportedNotes(stateValue, importedValue, options = {}) {
@@ -160,6 +204,7 @@ export function replaceImportedNotes(stateValue, importedValue, options = {}) {
       schemaVersion: SCHEMA_VERSION,
       revision: state.revision + 1,
       notes: importedValue.notes,
+      trash: importedValue.trash || [],
       settings: importedValue.settings,
     },
     options,

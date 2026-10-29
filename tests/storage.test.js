@@ -72,8 +72,28 @@ test("initializes an empty versioned state", async () => {
   const storage = memoryStorage();
   const state = await loadState(storage, { now: NOW });
 
-  assert.equal(state.schemaVersion, 1);
+  assert.equal(state.schemaVersion, 2);
   assert.deepEqual(state.notes, []);
+  assert.deepEqual(state.trash, []);
+  assert.deepEqual(storage.values[STORAGE_KEYS.state], state);
+});
+
+test("migrates schema 1 state to persistent Trash without losing notes", async () => {
+  const note = createNote(sample("Legacy note"), { idFactory: () => "legacy", now: NOW });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: {
+      schemaVersion: 1,
+      revision: 4,
+      notes: [note],
+      settings: { theme: "dark", sort: "title-asc" },
+    },
+  });
+  const state = await loadState(storage, { now: NOW });
+
+  assert.equal(state.schemaVersion, 2);
+  assert.equal(state.revision, 4);
+  assert.deepEqual(state.notes, [note]);
+  assert.deepEqual(state.trash, []);
   assert.deepEqual(storage.values[STORAGE_KEYS.state], state);
 });
 

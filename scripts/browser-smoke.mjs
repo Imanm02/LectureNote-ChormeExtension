@@ -244,18 +244,55 @@ try {
     await library.screenshot({ path: join(screenshotDirectory, "library-light.png"), fullPage: true });
   }
 
+  await graphCard.getByRole("button", { name: "Move to Trash Graph basics" }).click();
+  await library.locator("#deleteForm").getByRole("button", { name: "Move to Trash" }).click();
+  await library.locator("#undoBar").waitFor();
+  assert.equal(await library.locator(".note-card").count(), 1);
+  assert.equal(await library.locator("#trashNoteCount").textContent(), "1");
+  await library.getByRole("button", { name: "Dismiss" }).click();
+
   const downloadPromise = library.waitForEvent("download");
   await library.getByRole("button", { name: "Export backup" }).click();
   const download = await downloadPromise;
   assert.match(download.suggestedFilename(), /^lecture-notes-\d{4}-\d{2}-\d{2}\.json$/u);
   const backupPath = join(profile, "backup.json");
   await download.saveAs(backupPath);
+  const backup = JSON.parse(await readFile(backupPath, "utf8"));
+  assert.equal(backup.schemaVersion, 2);
+  assert.equal(backup.notes.length, 1);
+  assert.equal(backup.trash.length, 1);
+  assert.equal(backup.trash[0].note.title, "Graph basics");
 
   await library.getByRole("button", { name: "Restore backup" }).click();
   await library.locator("#importFileInput").setInputFiles(backupPath);
   await library.getByRole("heading", { name: "Choose how to restore" }).waitFor();
   await library.getByRole("button", { name: "Merge notes" }).click();
-  await library.locator("#libraryStatus").filter({ hasText: "Restored 0 notes. Skipped 2 notes already present." }).waitFor();
+  await library.locator("#libraryStatus").filter({
+    hasText: "Restored 0 active notes and 0 Trash entries. Skipped 2 notes already present.",
+  }).waitFor();
+
+  await library.getByRole("button", { name: "Trash, 1" }).click();
+  await library.getByRole("heading", { name: "Graph basics" }).waitFor();
+  await library.getByRole("button", { name: "Restore Graph basics" }).click();
+  await library.locator("#libraryStatus").filter({ hasText: "Restored “Graph basics”." }).waitFor();
+  assert.equal(await library.locator("#activeNoteCount").textContent(), "2");
+  assert.equal(await library.locator("#trashNoteCount").textContent(), "0");
+
+  await library.getByRole("button", { name: "Restore backup" }).click();
+  await library.locator("#importFileInput").setInputFiles(backupPath);
+  await library.getByRole("heading", { name: "Choose how to restore" }).waitFor();
+  await library.getByRole("button", { name: "Replace library" }).click();
+  await library.getByRole("heading", { name: "Remove current notes?" }).waitFor();
+  await library.getByRole("button", { name: "Replace all notes" }).click();
+  await library.locator("#libraryStatus").filter({
+    hasText: "Library replaced with 1 active note and 1 Trash entry.",
+  }).waitFor();
+  assert.equal(await library.locator("#activeNoteCount").textContent(), "1");
+  assert.equal(await library.locator("#trashNoteCount").textContent(), "1");
+  await library.getByRole("heading", { name: "Graph basics" }).waitFor();
+  await library.getByRole("button", { name: "Restore Graph basics" }).click();
+  await library.getByRole("button", { name: "Notes, 2" }).click();
+  await library.getByRole("heading", { name: "Graph basics" }).waitFor();
 
   await library.locator("#themeSelect").selectOption("dark");
   await library.locator('html[data-theme="dark"]').waitFor();
@@ -263,8 +300,8 @@ try {
     await library.screenshot({ path: join(screenshotDirectory, "library-dark.png"), fullPage: true });
   }
 
-  await graphCard.getByRole("button", { name: "Delete" }).click();
-  await library.getByRole("button", { name: "Delete note" }).click();
+  await graphCard.getByRole("button", { name: "Move to Trash Graph basics" }).click();
+  await library.locator("#deleteForm").getByRole("button", { name: "Move to Trash" }).click();
   await library.locator("#undoBar").waitFor();
   assert.equal(await library.locator(".note-card").count(), 1);
   await library.getByRole("button", { name: "Undo" }).click();
@@ -297,7 +334,7 @@ try {
   const shortcutResult = shortcutCaptureVerified
     ? " Action shortcut capture also passed."
     : " Headless Chromium did not expose the action popup.";
-  console.log(`Browser smoke test passed: selection handling, popup and editor draft recovery, persistence, CRUD, search, backup, theme, and undo.${shortcutResult}`);
+  console.log(`Browser smoke test passed: selection handling, popup and editor draft recovery, persistence, CRUD, search, Trash-aware backup and restore, theme, and undo.${shortcutResult}`);
 } finally {
   await context?.close().catch(() => undefined);
   await closeFixtureServer(fixtureServer).catch(() => undefined);

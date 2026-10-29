@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { serializeBackup } from "../src/backup.js";
-import { createEmptyState, createNote } from "../src/model.js";
+import { createEmptyState, createNote, moveNoteToTrash } from "../src/model.js";
 import { initLibrary } from "../src/notes.js";
 import {
   clearEditorDraft,
@@ -346,6 +346,7 @@ test("keeps undo available until it is dismissed", async (t) => {
   documentValue.querySelector("[data-action='delete']").click();
   submit(documentValue, "deleteForm");
   await waitFor(() => controller.getState().notes.length === 0);
+  assert.equal(controller.getState().trash.length, 1);
 
   const undoBar = documentValue.getElementById("undoBar");
   assert.equal(undoBar.hidden, false);
@@ -358,6 +359,81 @@ test("keeps undo available until it is dismissed", async (t) => {
   documentValue.getElementById("undoButton").click();
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
   assert.equal(controller.getState().notes.length, 0);
+  assert.equal(controller.getState().trash.length, 1);
+});
+
+test("restores and permanently deletes notes from the persistent Trash view", async (t) => {
+  const setup = await setupLibrary(t, [note("first", "Saved body")]);
+  const { controller, documentValue } = setup;
+
+  documentValue.querySelector("[data-action='delete']").click();
+  submit(documentValue, "deleteForm");
+  await waitFor(() => controller.getState().trash.length === 1);
+
+  assert.equal(documentValue.getElementById("trashNoteCount").textContent, "1");
+  documentValue.getElementById("trashViewButton").click();
+  assert.match(documentValue.querySelector(".note-time").textContent, /^Deleted /u);
+  documentValue.querySelector("[data-action='restore']").click();
+  await waitFor(() => controller.getState().notes.length === 1);
+  assert.equal(controller.getState().trash.length, 0);
+
+  documentValue.getElementById("notesViewButton").click();
+  documentValue.querySelector("[data-action='delete']").click();
+  submit(documentValue, "deleteForm");
+  await waitFor(() => controller.getState().trash.length === 1);
+  documentValue.getElementById("trashViewButton").click();
+  documentValue.querySelector("[data-action='permanent-delete']").click();
+  assert.equal(documentValue.getElementById("permanentDeleteDialog").open, true);
+  submit(documentValue, "permanentDeleteForm");
+  await waitFor(() => controller.getState().trash.length === 0);
+
+  assert.equal(documentValue.getElementById("resultSummary").textContent, "Trash is empty");
+  assert.equal(documentValue.querySelector("[data-action='restore']"), null);
+});
+
+test("empties Trash only after confirmation", async (t) => {
+  let state = { ...createEmptyState(), notes: [note("first", "First"), note("second", "Second")] };
+  state = moveNoteToTrash(state, "first", { now: START }).state;
+  state = moveNoteToTrash(state, "second", { now: START }).state;
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: state });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+
+  documentValue.getElementById("trashViewButton").click();
+  documentValue.getElementById("emptyTrashButton").click();
+  assert.equal(documentValue.getElementById("emptyTrashDialog").open, true);
+  assert.match(documentValue.getElementById("emptyTrashMessage").textContent, /2 notes/u);
+  submit(documentValue, "emptyTrashForm");
+  await waitFor(() => controller.getState().trash.length === 0);
+
+  assert.equal(documentValue.getElementById("emptyTrashButton").disabled, true);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /2 notes permanently deleted/u);
+});
+
+test("does not permanently delete a Trash entry restored in another window", async (t) => {
+  const original = note("first", "First");
+  const trashed = moveNoteToTrash({ ...createEmptyState(), notes: [original] }, "first", {
+    now: START,
+  }).state;
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: trashed });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+
+  documentValue.getElementById("trashViewButton").click();
+  documentValue.querySelector("[data-action='permanent-delete']").click();
+  storage.values[STORAGE_KEYS.state] = {
+    ...trashed,
+    revision: trashed.revision + 1,
+    notes: [original],
+    trash: [],
+  };
+  submit(documentValue, "permanentDeleteForm");
+  await waitFor(() => documentValue.getElementById("permanentDeleteStatus").textContent.length > 0);
+
+  assert.match(documentValue.getElementById("permanentDeleteStatus").textContent, /another window/u);
+  assert.equal(documentValue.getElementById("permanentDeleteDialog").open, true);
+  assert.equal(storage.values[STORAGE_KEYS.state].notes[0].id, "first");
+  assert.equal(controller.getState().trash.length, 1);
 });
 
 test("clears a prior undo record after replacing the library", async (t) => {

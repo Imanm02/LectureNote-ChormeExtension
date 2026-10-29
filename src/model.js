@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export const LIMITS = Object.freeze({
   identifier: 100,
@@ -9,6 +9,7 @@ export const LIMITS = Object.freeze({
   sourceUrl: 2_048,
   captureUrl: 100_000,
   notes: 2_000,
+  trash: 2_000,
   importBytes: 8_000_000,
   stateBytes: 7_000_000,
   editorDraftBytes: 1_500_000,
@@ -244,6 +245,7 @@ export function createEmptyState() {
     schemaVersion: SCHEMA_VERSION,
     revision: 0,
     notes: [],
+    trash: [],
     settings: {
       theme: "system",
       sort: "updated-desc",
@@ -294,6 +296,25 @@ export function normalizeNote(
   };
 }
 
+export function normalizeTrashEntry(
+  value,
+  {
+    idFactory = () => crypto.randomUUID(),
+    now = new Date().toISOString(),
+  } = {},
+) {
+  if (!isRecord(value)) {
+    throw new ValidationError("Each Trash entry must be an object.", "trash-entry-type");
+  }
+
+  const note = normalizeNote(value.note, { idFactory, now });
+  const deletedAt = normalizeTimestamp(value.deletedAt, normalizeTimestamp(now, new Date().toISOString()));
+  const originalIndex = Number.isSafeInteger(value.originalIndex) && value.originalIndex >= 0
+    ? Math.min(value.originalIndex, LIMITS.notes)
+    : 0;
+  return { note, deletedAt, originalIndex };
+}
+
 export function normalizeState(
   value,
   { idFactory = () => crypto.randomUUID(), now = new Date().toISOString() } = {},
@@ -319,6 +340,17 @@ export function normalizeState(
     );
   }
 
+  const trashValue = version >= 2 ? (value.trash ?? []) : [];
+  if (!Array.isArray(trashValue)) {
+    throw new ValidationError("The saved Trash list is invalid.", "trash-type");
+  }
+  if (trashValue.length > LIMITS.trash) {
+    throw new ValidationError(
+      `Trash can contain at most ${LIMITS.trash.toLocaleString()} notes.`,
+      "trash-limit",
+    );
+  }
+
   const identifiers = new Set();
   const notes = value.notes.map((note) => {
     const normalized = normalizeNote(note, { idFactory, now });
@@ -326,6 +358,14 @@ export function normalizeState(
       normalized.id = allocateIdentifier(identifiers, idFactory);
     }
     identifiers.add(normalized.id);
+    return normalized;
+  });
+  const trash = trashValue.map((entry) => {
+    const normalized = normalizeTrashEntry(entry, { idFactory, now });
+    if (identifiers.has(normalized.note.id)) {
+      normalized.note.id = allocateIdentifier(identifiers, idFactory);
+    }
+    identifiers.add(normalized.note.id);
     return normalized;
   });
 
@@ -338,6 +378,7 @@ export function normalizeState(
     schemaVersion: SCHEMA_VERSION,
     revision,
     notes,
+    trash,
     settings: { theme, sort },
   };
 }
@@ -346,8 +387,13 @@ export function recoverState(value, options = {}) {
   if (!isRecord(value) || !Array.isArray(value.notes)) {
     throw new ValidationError("Saved note data cannot be recovered.", "state-unrecoverable");
   }
+  const version = value.schemaVersion ?? value.version ?? SCHEMA_VERSION;
+  if (!Number.isInteger(version) || version < 1 || version > SCHEMA_VERSION) {
+    throw new ValidationError("This note data version is not supported.", "schema-version");
+  }
 
   const accepted = [];
+  const acceptedTrash = [];
   const rejected = [];
   value.notes.forEach((note, index) => {
     if (accepted.length >= LIMITS.notes) {
@@ -365,7 +411,31 @@ export function recoverState(value, options = {}) {
     }
   });
 
-  const state = normalizeState({ ...value, notes: accepted }, options);
+  const trashValue = version >= 2 ? value.trash : [];
+  if (trashValue !== undefined && !Array.isArray(trashValue)) {
+    rejected.push({ index: -1, note: null, reason: "Trash list is invalid" });
+  } else {
+    (trashValue || []).forEach((entry, index) => {
+      if (acceptedTrash.length >= LIMITS.trash) {
+        rejected.push({ index, note: entry, reason: "Trash note limit exceeded" });
+        return;
+      }
+      try {
+        acceptedTrash.push(normalizeTrashEntry(entry, options));
+      } catch (error) {
+        rejected.push({
+          index,
+          note: entry,
+          reason: error instanceof Error ? error.message : "Invalid Trash entry",
+        });
+      }
+    });
+  }
+
+  const state = normalizeState(
+    { ...value, schemaVersion: SCHEMA_VERSION, notes: accepted, trash: acceptedTrash },
+    options,
+  );
   state.revision = Number.isSafeInteger(value.revision) ? value.revision + 1 : 1;
   return { state, rejected };
 }
@@ -555,7 +625,10 @@ export function addNote(stateValue, input, options = {}) {
   }
 
   let note = createNote(input, options);
-  const identifiers = new Set(state.notes.map((candidate) => candidate.id));
+  const identifiers = new Set([
+    ...state.notes.map((candidate) => candidate.id),
+    ...state.trash.map((entry) => entry.note.id),
+  ]);
   if (identifiers.has(note.id)) {
     note = {
       ...note,
@@ -616,39 +689,84 @@ export function updateNote(stateValue, identifier, changes, options = {}) {
   };
 }
 
-export function removeNote(stateValue, identifier, options = {}) {
+export function moveNoteToTrash(stateValue, identifier, options = {}) {
   const state = normalizeState(stateValue, options);
   const index = state.notes.findIndex((note) => note.id === identifier);
   if (index < 0) {
     throw new ValidationError("The note no longer exists.", "note-missing");
   }
+  if (state.trash.length >= LIMITS.trash) {
+    throw new ValidationError(
+      "Trash is full. Permanently delete a note from Trash before removing another note.",
+      "trash-limit",
+    );
+  }
 
   const notes = [...state.notes];
   const [note] = notes.splice(index, 1);
-  return {
-    state: { ...state, revision: nextRevision(state), notes },
+  const entry = {
     note,
+    deletedAt: normalizeTimestamp(options.now, new Date().toISOString()),
+    originalIndex: index,
+  };
+  return {
+    state: { ...state, revision: nextRevision(state), notes, trash: [entry, ...state.trash] },
+    note,
+    entry,
     index,
   };
 }
 
-export function restoreNote(stateValue, noteValue, index = 0, options = {}) {
+export function restoreTrashedNote(stateValue, identifier, options = {}) {
   const state = normalizeState(stateValue, options);
   if (state.notes.length >= LIMITS.notes) {
     throw new ValidationError("The note library is full.", "notes-limit");
   }
 
-  const note = normalizeNote(noteValue, options);
+  const trashIndex = state.trash.findIndex((entry) => entry.note.id === identifier);
+  if (trashIndex < 0) {
+    throw new ValidationError("The note is no longer in Trash.", "trash-note-missing");
+  }
+  const entry = state.trash[trashIndex];
+  const note = entry.note;
   if (state.notes.some((candidate) => candidate.id === note.id)) {
     throw new ValidationError("That note has already been restored.", "duplicate-id");
   }
 
-  const targetIndex = Math.max(0, Math.min(Number.isInteger(index) ? index : 0, state.notes.length));
+  const targetIndex = Math.max(0, Math.min(entry.originalIndex, state.notes.length));
   const notes = [...state.notes];
   notes.splice(targetIndex, 0, note);
+  const trash = [...state.trash];
+  trash.splice(trashIndex, 1);
   return {
-    state: { ...state, revision: nextRevision(state), notes },
+    state: { ...state, revision: nextRevision(state), notes, trash },
     note,
+    entry,
+  };
+}
+
+export function permanentlyDeleteTrashedNote(stateValue, identifier, options = {}) {
+  const state = normalizeState(stateValue, options);
+  const index = state.trash.findIndex((entry) => entry.note.id === identifier);
+  if (index < 0) {
+    throw new ValidationError("The note is no longer in Trash.", "trash-note-missing");
+  }
+  const trash = [...state.trash];
+  const [entry] = trash.splice(index, 1);
+  return {
+    state: { ...state, revision: nextRevision(state), trash },
+    entry,
+  };
+}
+
+export function emptyTrash(stateValue, options = {}) {
+  const state = normalizeState(stateValue, options);
+  if (state.trash.length === 0) {
+    return { state, deleted: 0 };
+  }
+  return {
+    state: { ...state, revision: nextRevision(state), trash: [] },
+    deleted: state.trash.length,
   };
 }
 

@@ -5,19 +5,23 @@ import {
   addNote,
   createEmptyState,
   createNote,
+  emptyTrash,
   LIMITS,
+  moveNoteToTrash,
   normalizeDraft,
   normalizeEditorDraft,
   normalizeNote,
   normalizeSource,
-  removeNote,
-  restoreNote,
+  recoverState,
+  permanentlyDeleteTrashedNote,
+  restoreTrashedNote,
   updateSettings,
   updateNote,
   ValidationError,
 } from "../src/model.js";
 import {
   createBackup,
+  mergeImportedBackup,
   mergeImportedNotes,
   notesToMarkdown,
   parseBackup,
@@ -113,20 +117,68 @@ test("strips display controls from single-line fields", () => {
   assert.equal(note.course, "CS 101");
 });
 
-test("adds, edits, removes, and restores a note", () => {
+test("adds, edits, moves, and restores a note from Trash", () => {
   const added = addNote(createEmptyState(), sample(), {
     idFactory: () => "note-1",
     now: START,
   });
   const updated = updateNote(added.state, "note-1", { body: "Updated content" }, { now: LATER });
-  const removed = removeNote(updated.state, "note-1");
-  const restored = restoreNote(removed.state, removed.note, removed.index);
+  const removed = moveNoteToTrash(updated.state, "note-1", { now: LATER });
+  const restored = restoreTrashedNote(removed.state, "note-1");
 
   assert.equal(added.state.revision, 1);
   assert.equal(updated.note.createdAt, START);
   assert.equal(updated.note.updatedAt, LATER);
   assert.equal(removed.state.notes.length, 0);
+  assert.equal(removed.state.trash[0].deletedAt, LATER);
+  assert.equal(removed.state.trash[0].originalIndex, 0);
   assert.deepEqual(restored.state.notes, [updated.note]);
+  assert.deepEqual(restored.state.trash, []);
+});
+
+test("permanently deletes one Trash entry or empties Trash", () => {
+  const first = addNote(createEmptyState(), sample({ body: "First" }), {
+    idFactory: () => "first",
+    now: START,
+  }).state;
+  const second = addNote(first, sample({ body: "Second" }), {
+    idFactory: () => "second",
+    now: START,
+  }).state;
+  const trashedFirst = moveNoteToTrash(second, "first", { now: LATER }).state;
+  const trashedBoth = moveNoteToTrash(trashedFirst, "second", { now: LATER }).state;
+  const deleted = permanentlyDeleteTrashedNote(trashedBoth, "first");
+
+  assert.deepEqual(deleted.state.trash.map((entry) => entry.note.id), ["second"]);
+  const emptied = emptyTrash(deleted.state);
+  assert.equal(emptied.deleted, 1);
+  assert.deepEqual(emptied.state.trash, []);
+});
+
+test("keeps active limits and identifiers separate from persistent Trash", () => {
+  const deleted = createNote(sample({ body: "Deleted" }), {
+    idFactory: () => "same-id",
+    now: START,
+  });
+  const state = {
+    ...createEmptyState(),
+    trash: [{ note: deleted, deletedAt: LATER, originalIndex: 0 }],
+  };
+  const added = addNote(state, sample({ body: "Active" }), {
+    idFactory: identifiers("same-id", "active-id"),
+    now: LATER,
+  });
+
+  assert.equal(added.note.id, "active-id");
+  assert.equal(added.state.notes.length, 1);
+  assert.equal(added.state.trash.length, 1);
+});
+
+test("does not recover state written by a newer schema", () => {
+  assert.throws(
+    () => recoverState({ schemaVersion: 3, revision: 1, notes: [], trash: [] }),
+    { code: "schema-version" },
+  );
 });
 
 test("detects exact duplicate notes unless explicitly allowed", () => {
@@ -247,12 +299,28 @@ test("exports and restores a versioned backup", () => {
     idFactory: () => "note-1",
     now: START,
   });
-  const state = { ...createEmptyState(), notes: [note] };
+  const state = moveNoteToTrash({ ...createEmptyState(), notes: [note] }, "note-1", {
+    now: LATER,
+  }).state;
   const text = serializeBackup(state, { now: LATER });
   const restored = parseBackup(text, { idFactory: () => "unused", now: LATER });
 
   assert.equal(createBackup(state, { now: LATER }).format, "lecturenote-backup");
+  assert.deepEqual(restored.notes, []);
+  assert.deepEqual(restored.trash, state.trash);
+});
+
+test("imports version 1 backups with an empty Trash", () => {
+  const note = createNote(sample(), { idFactory: () => "legacy", now: START });
+  const restored = parseBackup(JSON.stringify({
+    format: "lecturenote-backup",
+    schemaVersion: 1,
+    notes: [note],
+    settings: { theme: "light", sort: "created-desc" },
+  }), { now: LATER });
+
   assert.deepEqual(restored.notes, [note]);
+  assert.deepEqual(restored.trash, []);
 });
 
 test("replaces imported notes and advances the revision", () => {
@@ -272,15 +340,44 @@ test("replaces imported notes and advances the revision", () => {
 
   assert.equal(state.revision, current.revision + 1);
   assert.deepEqual(state.notes, [replacement]);
+  assert.deepEqual(state.trash, []);
   assert.equal(state.settings.theme, "dark");
+});
+
+test("merges and replaces Trash entries from backups", () => {
+  const active = createNote(sample({ body: "Active" }), { idFactory: () => "active", now: START });
+  const deleted = createNote(sample({ body: "Deleted" }), { idFactory: () => "deleted", now: START });
+  const trash = [{ note: deleted, deletedAt: LATER, originalIndex: 1 }];
+  const merged = mergeImportedBackup(createEmptyState(), { notes: [active], trash }, { now: LATER });
+
+  assert.equal(merged.added, 1);
+  assert.equal(merged.trashAdded, 1);
+  assert.deepEqual(merged.state.trash, trash);
+
+  const repeated = mergeImportedBackup(merged.state, { notes: [active], trash }, { now: LATER });
+  assert.equal(repeated.added, 0);
+  assert.equal(repeated.trashAdded, 0);
+  assert.equal(repeated.skipped, 2);
+
+  const replaced = replaceImportedNotes(merged.state, {
+    notes: [],
+    trash,
+    settings: { theme: "system", sort: "updated-desc" },
+  });
+  assert.deepEqual(replaced.notes, []);
+  assert.deepEqual(replaced.trash, trash);
 });
 
 test("rejects malformed, wrong-format, and oversized backups", () => {
   assert.throws(() => parseBackup("{"), { code: "import-json" });
   assert.throws(() => parseBackup('{"notes":[]}'), { code: "import-format" });
   assert.throws(
-    () => parseBackup(`{"format":"lecturenote-backup","schemaVersion":2,"notes":[]}`),
+    () => parseBackup(`{"format":"lecturenote-backup","schemaVersion":3,"notes":[]}`),
     { code: "schema-version" },
+  );
+  assert.throws(
+    () => parseBackup(`{"format":"lecturenote-backup","schemaVersion":2,"notes":[]}`),
+    { code: "import-trash-type" },
   );
   assert.throws(() => parseBackup("x".repeat(LIMITS.importBytes + 1)), { code: "import-size" });
 });

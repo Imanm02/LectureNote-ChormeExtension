@@ -1,5 +1,5 @@
 import {
-  mergeImportedNotes,
+  mergeImportedBackup,
   notesToMarkdown,
   parseBackup,
   replaceImportedNotes,
@@ -7,9 +7,11 @@ import {
 } from "./backup.js";
 import {
   addNote,
+  emptyTrash,
   LIMITS,
-  removeNote,
-  restoreNote,
+  moveNoteToTrash,
+  permanentlyDeleteTrashedNote,
+  restoreTrashedNote,
   updateNote,
   updateSettings,
   ValidationError,
@@ -54,6 +56,11 @@ function libraryElements(documentValue) {
     courseSuggestions: requiredElement(documentValue, "editorCourseSuggestions"),
     sort: requiredElement(documentValue, "sortSelect"),
     theme: requiredElement(documentValue, "themeSelect"),
+    notesView: requiredElement(documentValue, "notesViewButton"),
+    trashView: requiredElement(documentValue, "trashViewButton"),
+    activeNoteCount: requiredElement(documentValue, "activeNoteCount"),
+    trashNoteCount: requiredElement(documentValue, "trashNoteCount"),
+    emptyTrash: requiredElement(documentValue, "emptyTrashButton"),
     exportJson: requiredElement(documentValue, "exportJsonButton"),
     exportMarkdown: requiredElement(documentValue, "exportMarkdownButton"),
     importButton: requiredElement(documentValue, "importButton"),
@@ -67,6 +74,8 @@ function libraryElements(documentValue) {
     resumeEditorDraft: requiredElement(documentValue, "resumeEditorDraftButton"),
     discardEditorDraft: requiredElement(documentValue, "discardEditorDraftButton"),
     empty: requiredElement(documentValue, "emptyState"),
+    emptyHeading: requiredElement(documentValue, "emptyStateHeading"),
+    emptyMessage: requiredElement(documentValue, "emptyStateMessage"),
     noResults: requiredElement(documentValue, "noResultsState"),
     clearFilters: requiredElement(documentValue, "clearFiltersButton"),
     list: requiredElement(documentValue, "notesList"),
@@ -96,6 +105,18 @@ function libraryElements(documentValue) {
     deleteStatus: requiredElement(documentValue, "deleteStatus"),
     cancelDelete: requiredElement(documentValue, "cancelDeleteButton"),
     confirmDelete: requiredElement(documentValue, "confirmDeleteButton"),
+    permanentDeleteDialog: requiredElement(documentValue, "permanentDeleteDialog"),
+    permanentDeleteForm: requiredElement(documentValue, "permanentDeleteForm"),
+    permanentDeleteMessage: requiredElement(documentValue, "permanentDeleteMessage"),
+    permanentDeleteStatus: requiredElement(documentValue, "permanentDeleteStatus"),
+    cancelPermanentDelete: requiredElement(documentValue, "cancelPermanentDeleteButton"),
+    confirmPermanentDelete: requiredElement(documentValue, "confirmPermanentDeleteButton"),
+    emptyTrashDialog: requiredElement(documentValue, "emptyTrashDialog"),
+    emptyTrashForm: requiredElement(documentValue, "emptyTrashForm"),
+    emptyTrashMessage: requiredElement(documentValue, "emptyTrashMessage"),
+    emptyTrashStatus: requiredElement(documentValue, "emptyTrashStatus"),
+    cancelEmptyTrash: requiredElement(documentValue, "cancelEmptyTrashButton"),
+    confirmEmptyTrash: requiredElement(documentValue, "confirmEmptyTrashButton"),
     importDialog: requiredElement(documentValue, "importDialog"),
     importMessage: requiredElement(documentValue, "importMessage"),
     importStatus: requiredElement(documentValue, "importStatus"),
@@ -183,10 +204,14 @@ export async function initLibrary({
   let editorDraftUnavailable = false;
   let pendingDelete = null;
   let deleteReturnFocus = null;
+  let pendingPermanentDelete = null;
+  let permanentDeleteReturnFocus = null;
+  let emptyTrashSnapshot = null;
   let pendingImport = null;
   let undoRecord = null;
   let searchTimer = null;
   let visibleLimit = DISPLAY_BATCH;
+  let viewMode = "notes";
   let courseSignature = "";
   let ready = false;
   let hashHandled = false;
@@ -213,6 +238,8 @@ export async function initLibrary({
       elements.course,
       elements.sort,
       elements.theme,
+      elements.notesView,
+      elements.trashView,
       elements.exportJson,
       elements.exportMarkdown,
       elements.importButton,
@@ -222,11 +249,15 @@ export async function initLibrary({
     ]) {
       control.disabled = !available;
     }
+    elements.emptyTrash.disabled = !available || !state || state.trash.length === 0;
     elements.list.inert = !available;
   }
 
   function selectedNotes() {
-    return selectNotes(state.notes, {
+    const notes = viewMode === "trash"
+      ? state.trash.map((entry) => ({ ...entry.note, updatedAt: entry.deletedAt }))
+      : state.notes;
+    return selectNotes(notes, {
       query: elements.search.value,
       course: elements.course.value,
       sort: elements.sort.value,
@@ -234,8 +265,9 @@ export async function initLibrary({
   }
 
   function renderCourseOptions() {
-    const courses = listCourses(state.notes);
-    const signature = JSON.stringify(courses);
+    const notes = viewMode === "trash" ? state.trash.map((entry) => entry.note) : state.notes;
+    const courses = listCourses(notes);
+    const signature = JSON.stringify([viewMode, courses]);
     if (signature === courseSignature) {
       return;
     }
@@ -272,9 +304,12 @@ export async function initLibrary({
     const title = fragment.querySelector(".note-title");
     title.textContent = note.title;
     const time = fragment.querySelector(".note-time");
+    const trashEntry = viewMode === "trash"
+      ? state.trash.find((entry) => entry.note.id === note.id)
+      : null;
     const showCreated = state.settings.sort.startsWith("created-");
-    const dateValue = showCreated ? note.createdAt : note.updatedAt;
-    const dateLabel = showCreated ? "Created" : "Updated";
+    const dateValue = trashEntry?.deletedAt || (showCreated ? note.createdAt : note.updatedAt);
+    const dateLabel = trashEntry ? "Deleted" : showCreated ? "Created" : "Updated";
     time.dateTime = dateValue;
     time.textContent = `${dateLabel} ${formatDate(dateValue)}`;
     time.title = `${dateLabel} ${dateValue}`;
@@ -293,9 +328,18 @@ export async function initLibrary({
       sourceTitle.hidden = false;
     }
 
+    fragment.querySelector(".active-note-actions").hidden = Boolean(trashEntry);
+    fragment.querySelector(".trash-note-actions").hidden = !trashEntry;
     for (const button of fragment.querySelectorAll("button[data-action]")) {
       const action = button.dataset.action;
-      const label = action === "copy" ? "Copy" : action === "edit" ? "Edit" : "Delete";
+      const labels = {
+        copy: "Copy",
+        edit: "Edit",
+        delete: "Move to Trash",
+        restore: "Restore",
+        "permanent-delete": "Delete permanently",
+      };
+      const label = labels[action] || "Open";
       button.setAttribute("aria-label", `${label} ${note.title}`);
     }
 
@@ -323,31 +367,53 @@ export async function initLibrary({
     }
     renderCourseOptions();
     elements.sort.value = state.settings.sort;
+    elements.sort.options[0].textContent = viewMode === "trash" ? "Recently deleted" : "Recently updated";
     elements.theme.value = state.settings.theme;
     const notes = selectedNotes();
     const shownNotes = notes.slice(0, visibleLimit);
     elements.list.replaceChildren(...shownNotes.map(createNoteCard));
     editorReturnFocus = refreshReturnFocus(editorReturnFocus);
     deleteReturnFocus = refreshReturnFocus(deleteReturnFocus);
+    permanentDeleteReturnFocus = refreshReturnFocus(permanentDeleteReturnFocus);
 
-    const hasNotes = state.notes.length > 0;
+    const total = viewMode === "trash" ? state.trash.length : state.notes.length;
+    const hasNotes = total > 0;
     const hasFilters = Boolean(elements.search.value.trim() || elements.course.value);
+    elements.notesView.setAttribute("aria-pressed", String(viewMode === "notes"));
+    elements.trashView.setAttribute("aria-pressed", String(viewMode === "trash"));
+    elements.notesView.classList.toggle("button-secondary", viewMode === "notes");
+    elements.notesView.classList.toggle("button-quiet", viewMode !== "notes");
+    elements.trashView.classList.toggle("button-secondary", viewMode === "trash");
+    elements.trashView.classList.toggle("button-quiet", viewMode !== "trash");
+    elements.activeNoteCount.textContent = numberFormatter.format(state.notes.length);
+    elements.trashNoteCount.textContent = numberFormatter.format(state.trash.length);
+    elements.notesView.setAttribute("aria-label", `Notes, ${numberFormatter.format(state.notes.length)}`);
+    elements.trashView.setAttribute("aria-label", `Trash, ${numberFormatter.format(state.trash.length)}`);
+    elements.emptyTrash.hidden = viewMode !== "trash";
+    elements.emptyTrash.disabled = !ready || state.trash.length === 0;
+    elements.emptyNewNote.hidden = viewMode === "trash";
+    elements.emptyHeading.textContent = viewMode === "trash" ? "Trash is empty" : "No saved notes yet";
+    elements.emptyMessage.textContent = viewMode === "trash"
+      ? "Notes moved to Trash remain here until you restore or permanently delete them."
+      : "Your notes stay in this Chrome profile. Create one here, or select text on a page and open the extension.";
     elements.empty.hidden = hasNotes;
     elements.noResults.hidden = !hasNotes || notes.length > 0 || !hasFilters;
     elements.list.hidden = !hasNotes || notes.length === 0;
     elements.showMore.hidden = shownNotes.length >= notes.length;
     if (!hasNotes) {
-      elements.summary.textContent = "No saved notes";
+      elements.summary.textContent = viewMode === "trash" ? "Trash is empty" : "No saved notes";
     } else if (notes.length === 0) {
       elements.summary.textContent = "No matching notes";
     } else if (shownNotes.length < notes.length) {
       elements.summary.textContent = hasFilters
-        ? `Showing ${numberFormatter.format(shownNotes.length)} of ${numberFormatter.format(notes.length)} matching ${noteWord(notes.length)} (${numberFormatter.format(state.notes.length)} total)`
-        : `Showing ${numberFormatter.format(shownNotes.length)} of ${numberFormatter.format(state.notes.length)} ${noteWord(state.notes.length)}`;
+        ? `Showing ${numberFormatter.format(shownNotes.length)} of ${numberFormatter.format(notes.length)} matching ${noteWord(notes.length)} (${numberFormatter.format(total)} total)`
+        : `Showing ${numberFormatter.format(shownNotes.length)} of ${numberFormatter.format(total)} ${noteWord(total)}`;
     } else if (hasFilters) {
-      elements.summary.textContent = `${numberFormatter.format(notes.length)} matching ${noteWord(notes.length)} (${numberFormatter.format(state.notes.length)} total)`;
+      elements.summary.textContent = `${numberFormatter.format(notes.length)} matching ${noteWord(notes.length)} (${numberFormatter.format(total)} total)`;
     } else {
-      elements.summary.textContent = `${numberFormatter.format(state.notes.length)} ${noteWord(state.notes.length)}`;
+      elements.summary.textContent = viewMode === "trash"
+        ? `${numberFormatter.format(total)} ${noteWord(total)} in Trash`
+        : `${numberFormatter.format(total)} ${noteWord(total)}`;
     }
     renderEditorDraftRecovery();
   }
@@ -970,7 +1036,7 @@ export async function initLibrary({
     const title = documentValue.createElement("bdi");
     title.dir = "auto";
     title.textContent = note.title;
-    elements.deleteMessage.replaceChildren("“", title, "” will be removed from this Chrome profile.");
+    elements.deleteMessage.replaceChildren("“", title, "” will move to Trash and remain in backups until permanently deleted.");
     setStatus(elements.deleteStatus, "", "info");
     showDialog(elements.deleteDialog);
     elements.cancelDelete.focus();
@@ -1006,7 +1072,7 @@ export async function initLibrary({
             "delete-conflict",
           );
         }
-        return removeNote(current, noteToDelete.id);
+        return moveNoteToTrash(current, noteToDelete.id);
       }, storage);
       state = result.state;
       pendingDelete = null;
@@ -1014,7 +1080,7 @@ export async function initLibrary({
       closeDialog(elements.deleteDialog);
       render();
       showUndo({ note: result.note, index: result.index, stateSnapshot: JSON.stringify(state) });
-      setStatus(elements.status, "Note deleted. Undo is available in this tab until the library changes.", "success");
+      setStatus(elements.status, "Note moved to Trash. You can restore it now or later from Trash.", "success");
       const nextFocus = elements.list.querySelector("[data-action='edit']") || elements.newNote;
       nextFocus.focus();
     } catch (error) {
@@ -1034,7 +1100,7 @@ export async function initLibrary({
     try {
       const record = undoRecord;
       const result = await mutateState(
-        (current) => restoreNote(current, record.note, record.index),
+        (current) => restoreTrashedNote(current, record.note.id),
         storage,
       );
       state = result.state;
@@ -1049,6 +1115,120 @@ export async function initLibrary({
       setStatus(elements.status, errorMessage(error), "error");
     } finally {
       elements.undo.disabled = false;
+    }
+  }
+
+  async function restoreFromTrash(entry, button) {
+    button.disabled = true;
+    try {
+      const result = await mutateState((current) => {
+        const latest = current.trash.find((candidate) => candidate.note.id === entry.note.id);
+        if (!latest) {
+          throw new ValidationError("The note was restored or deleted in another window.", "trash-note-missing");
+        }
+        if (JSON.stringify(latest) !== JSON.stringify(entry)) {
+          throw new ValidationError("This Trash entry changed in another window. Review it before restoring.", "trash-conflict");
+        }
+        return restoreTrashedNote(current, entry.note.id);
+      }, storage);
+      state = result.state;
+      hideUndo();
+      render();
+      setStatusWithValue(elements.status, "Restored “", result.note.title, "”.", "success");
+    } catch (error) {
+      setStatus(elements.status, errorMessage(error), "error");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function openPermanentDelete(entry, trigger) {
+    pendingPermanentDelete = entry;
+    permanentDeleteReturnFocus = trigger;
+    const title = documentValue.createElement("bdi");
+    title.dir = "auto";
+    title.textContent = entry.note.title;
+    elements.permanentDeleteMessage.replaceChildren("“", title, "” will be removed from this Chrome profile.");
+    setStatus(elements.permanentDeleteStatus, "", "info");
+    showDialog(elements.permanentDeleteDialog);
+    elements.cancelPermanentDelete.focus();
+  }
+
+  async function permanentlyDeleteNote() {
+    if (!pendingPermanentDelete) {
+      return;
+    }
+    const entry = pendingPermanentDelete;
+    elements.confirmPermanentDelete.disabled = true;
+    elements.cancelPermanentDelete.disabled = true;
+    try {
+      const result = await mutateState((current) => {
+        const latest = current.trash.find((candidate) => candidate.note.id === entry.note.id);
+        if (!latest) {
+          throw new ValidationError("The note was restored or deleted in another window.", "trash-note-missing");
+        }
+        if (JSON.stringify(latest) !== JSON.stringify(entry)) {
+          throw new ValidationError("This Trash entry changed in another window. Close this confirmation and review it.", "trash-conflict");
+        }
+        return permanentlyDeleteTrashedNote(current, entry.note.id);
+      }, storage);
+      state = result.state;
+      pendingPermanentDelete = null;
+      permanentDeleteReturnFocus = null;
+      closeDialog(elements.permanentDeleteDialog);
+      render();
+      setStatus(elements.status, "Note permanently deleted.", "success");
+      (elements.list.querySelector("[data-action='restore']") || elements.trashView).focus();
+    } catch (error) {
+      setStatus(elements.permanentDeleteStatus, errorMessage(error), "error");
+      timerApi.setTimeout(() => elements.confirmPermanentDelete.focus(), 0);
+    } finally {
+      elements.confirmPermanentDelete.disabled = false;
+      elements.cancelPermanentDelete.disabled = false;
+    }
+  }
+
+  function openEmptyTrash() {
+    if (!state?.trash.length) {
+      return;
+    }
+    emptyTrashSnapshot = JSON.stringify(state.trash);
+    const count = state.trash.length;
+    elements.emptyTrashMessage.textContent = `${numberFormatter.format(count)} ${noteWord(count)} will be permanently deleted.`;
+    setStatus(elements.emptyTrashStatus, "", "info");
+    showDialog(elements.emptyTrashDialog);
+    elements.cancelEmptyTrash.focus();
+  }
+
+  async function deleteAllTrash() {
+    if (!emptyTrashSnapshot) {
+      return;
+    }
+    const snapshot = emptyTrashSnapshot;
+    elements.confirmEmptyTrash.disabled = true;
+    elements.cancelEmptyTrash.disabled = true;
+    try {
+      const result = await mutateState((current) => {
+        if (JSON.stringify(current.trash) !== snapshot) {
+          throw new ValidationError(
+            "Trash changed in another window. Close this confirmation and review it before trying again.",
+            "trash-conflict",
+          );
+        }
+        return emptyTrash(current);
+      }, storage);
+      state = result.state;
+      emptyTrashSnapshot = null;
+      closeDialog(elements.emptyTrashDialog);
+      render();
+      setStatus(elements.status, `${numberFormatter.format(result.deleted)} ${noteWord(result.deleted)} permanently deleted.`, "success");
+      elements.trashView.focus();
+    } catch (error) {
+      setStatus(elements.emptyTrashStatus, errorMessage(error), "error");
+      timerApi.setTimeout(() => elements.confirmEmptyTrash.focus(), 0);
+    } finally {
+      elements.confirmEmptyTrash.disabled = false;
+      elements.cancelEmptyTrash.disabled = false;
     }
   }
 
@@ -1119,7 +1299,8 @@ export async function initLibrary({
       assertStateFits(replaceImportedNotes(state, parsed));
       pendingImport = parsed;
       const count = pendingImport.notes.length;
-      elements.importMessage.textContent = `The backup contains ${numberFormatter.format(count)} ${noteWord(count)}.`;
+      const trashCount = pendingImport.trash.length;
+      elements.importMessage.textContent = `The backup contains ${numberFormatter.format(count)} active ${noteWord(count)} and ${numberFormatter.format(trashCount)} ${trashCount === 1 ? "Trash entry" : "Trash entries"}.`;
       setStatus(elements.importStatus, "", "info");
       showDialog(elements.importDialog);
       elements.cancelImport.focus();
@@ -1141,7 +1322,7 @@ export async function initLibrary({
     elements.replaceImport.disabled = true;
     try {
       const result = await mutateState(
-        (current) => mergeImportedNotes(current, importValue.notes),
+        (current) => mergeImportedBackup(current, importValue),
         storage,
       );
       state = result.state;
@@ -1150,7 +1331,7 @@ export async function initLibrary({
       render();
       setStatus(
         elements.status,
-        `Restored ${numberFormatter.format(result.added)} ${noteWord(result.added)}. Skipped ${numberFormatter.format(result.skipped)} ${result.skipped === 1 ? "note" : "notes"} already present.`,
+        `Restored ${numberFormatter.format(result.added)} active ${noteWord(result.added)} and ${numberFormatter.format(result.trashAdded)} ${result.trashAdded === 1 ? "Trash entry" : "Trash entries"}. Skipped ${numberFormatter.format(result.skipped)} ${result.skipped === 1 ? "note" : "notes"} already present.`,
         "success",
       );
     } catch (error) {
@@ -1182,7 +1363,7 @@ export async function initLibrary({
       render();
       setStatus(
         elements.status,
-        `Library replaced with ${numberFormatter.format(state.notes.length)} ${noteWord(state.notes.length)}.`,
+        `Library replaced with ${numberFormatter.format(state.notes.length)} active ${noteWord(state.notes.length)} and ${numberFormatter.format(state.trash.length)} ${state.trash.length === 1 ? "Trash entry" : "Trash entries"}.`,
         "success",
       );
     } catch (error) {
@@ -1232,6 +1413,20 @@ export async function initLibrary({
     visibleLimit = DISPLAY_BATCH;
     render();
   });
+  function changeView(nextView) {
+    if (viewMode === nextView) {
+      return;
+    }
+    viewMode = nextView;
+    elements.search.value = "";
+    elements.course.value = "";
+    courseSignature = "";
+    visibleLimit = DISPLAY_BATCH;
+    render();
+  }
+  elements.notesView.addEventListener("click", () => changeView("notes"));
+  elements.trashView.addEventListener("click", () => changeView("trash"));
+  elements.emptyTrash.addEventListener("click", openEmptyTrash);
   elements.sort.addEventListener("change", () => void changeSettings({ sort: elements.sort.value }));
   elements.theme.addEventListener("change", () => void changeSettings({ theme: elements.theme.value }));
   elements.clearFilters.addEventListener("click", () => {
@@ -1255,7 +1450,9 @@ export async function initLibrary({
   elements.list.addEventListener("click", (event) => {
     const button = event.target.closest?.("button[data-action]");
     const card = button?.closest("[data-note-id]");
-    const note = state?.notes.find((candidate) => candidate.id === card?.dataset.noteId);
+    const note = viewMode === "trash"
+      ? state?.trash.find((entry) => entry.note.id === card?.dataset.noteId)?.note
+      : state?.notes.find((candidate) => candidate.id === card?.dataset.noteId);
     if (!button || !note) {
       return;
     }
@@ -1265,6 +1462,16 @@ export async function initLibrary({
       openDelete(note, button);
     } else if (button.dataset.action === "copy") {
       void copyNote(note, button);
+    } else if (button.dataset.action === "restore") {
+      const entry = state.trash.find((candidate) => candidate.note.id === note.id);
+      if (entry) {
+        void restoreFromTrash(entry, button);
+      }
+    } else if (button.dataset.action === "permanent-delete") {
+      const entry = state.trash.find((candidate) => candidate.note.id === note.id);
+      if (entry) {
+        openPermanentDelete(entry, button);
+      }
     }
   });
 
@@ -1340,6 +1547,37 @@ export async function initLibrary({
   elements.undo.addEventListener("click", () => void undoDelete());
   elements.dismissUndo.addEventListener("click", hideUndo);
 
+  elements.permanentDeleteForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void permanentlyDeleteNote();
+  });
+  elements.cancelPermanentDelete.addEventListener("click", () => closeDialog(elements.permanentDeleteDialog));
+  elements.permanentDeleteDialog.addEventListener("close", () => {
+    permanentDeleteReturnFocus?.focus?.();
+    permanentDeleteReturnFocus = null;
+    pendingPermanentDelete = null;
+  });
+  elements.permanentDeleteDialog.addEventListener("cancel", (event) => {
+    if (elements.confirmPermanentDelete.disabled) {
+      event.preventDefault();
+    }
+  });
+
+  elements.emptyTrashForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void deleteAllTrash();
+  });
+  elements.cancelEmptyTrash.addEventListener("click", () => closeDialog(elements.emptyTrashDialog));
+  elements.emptyTrashDialog.addEventListener("close", () => {
+    emptyTrashSnapshot = null;
+    elements.emptyTrash.focus();
+  });
+  elements.emptyTrashDialog.addEventListener("cancel", (event) => {
+    if (elements.confirmEmptyTrash.disabled) {
+      event.preventDefault();
+    }
+  });
+
   elements.exportJson.addEventListener("click", () => void exportJson());
   elements.exportMarkdown.addEventListener("click", () => void exportMarkdown());
   elements.importButton.addEventListener("click", () => elements.importFile.click());
@@ -1366,7 +1604,7 @@ export async function initLibrary({
       return;
     }
     closeDialog(elements.importDialog);
-    elements.replaceMessage.textContent = `This will remove ${numberFormatter.format(state.notes.length)} current ${noteWord(state.notes.length)} and restore ${numberFormatter.format(pendingImport.notes.length)} ${noteWord(pendingImport.notes.length)}.`;
+    elements.replaceMessage.textContent = `This will remove ${numberFormatter.format(state.notes.length)} active ${noteWord(state.notes.length)} and ${numberFormatter.format(state.trash.length)} current Trash entries. It will restore ${numberFormatter.format(pendingImport.notes.length)} active ${noteWord(pendingImport.notes.length)} and ${numberFormatter.format(pendingImport.trash.length)} Trash entries.`;
     setStatus(elements.replaceStatus, "", "info");
     showDialog(elements.replaceDialog);
     elements.cancelReplace.focus();

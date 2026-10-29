@@ -55,6 +55,16 @@
         </label>
       </section>
 
+      <nav class="library-view-switch" aria-label="Library sections">
+        <button id="notesViewButton" class="button button-secondary" type="button" aria-pressed="true" disabled>
+          Notes <span id="activeNoteCount" class="count-badge" aria-hidden="true">0</span>
+        </button>
+        <button id="trashViewButton" class="button button-quiet" type="button" aria-pressed="false" disabled>
+          Trash <span id="trashNoteCount" class="count-badge" aria-hidden="true">0</span>
+        </button>
+        <button id="emptyTrashButton" class="button button-quiet danger-text view-end-action" type="button" hidden disabled>Empty Trash</button>
+      </nav>
+
       <section class="library-actions" aria-label="Backup and restore notes">
         <button id="exportJsonButton" class="button button-secondary" type="button" disabled>Export backup</button>
         <button id="exportMarkdownButton" class="button button-secondary" type="button" disabled>Export view as Markdown</button>
@@ -83,8 +93,8 @@
       </section>
 
       <section id="emptyState" class="empty-state" hidden>
-        <h2>No saved notes yet</h2>
-        <p>Your notes stay in this Chrome profile. Create one here, or select text on a page and open the extension.</p>
+        <h2 id="emptyStateHeading">No saved notes yet</h2>
+        <p id="emptyStateMessage">Your notes stay in this Chrome profile. Create one here, or select text on a page and open the extension.</p>
         <button id="emptyNewNoteButton" class="button button-primary" type="button" data-empty-action disabled>Create your first note</button>
       </section>
 
@@ -113,9 +123,15 @@
           <span class="note-source-title" dir="auto" hidden></span>
         </div>
         <footer class="note-actions">
-          <button class="button button-quiet compact" type="button" data-action="copy">Copy</button>
-          <button class="button button-secondary compact" type="button" data-action="edit">Edit</button>
-          <button class="button button-quiet compact danger-text" type="button" data-action="delete">Delete</button>
+          <div class="active-note-actions">
+            <button class="button button-quiet compact" type="button" data-action="copy">Copy</button>
+            <button class="button button-secondary compact" type="button" data-action="edit">Edit</button>
+            <button class="button button-quiet compact danger-text" type="button" data-action="delete">Move to Trash</button>
+          </div>
+          <div class="trash-note-actions" hidden>
+            <button class="button button-primary compact" type="button" data-action="restore">Restore</button>
+            <button class="button button-quiet compact danger-text" type="button" data-action="permanent-delete">Delete permanently</button>
+          </div>
         </footer>
       </article>
     </template>
@@ -183,14 +199,46 @@
     <dialog id="deleteDialog" class="dialog compact-dialog" aria-labelledby="deleteHeading" aria-describedby="deleteMessage deleteStatus">
       <form id="deleteForm" class="dialog-form">
         <div class="dialog-content">
-          <p class="eyebrow">Delete note</p>
-          <h2 id="deleteHeading">Delete this note?</h2>
+          <p class="eyebrow">Move note</p>
+          <h2 id="deleteHeading">Move this note to Trash?</h2>
           <p id="deleteMessage" dir="auto"></p>
           <p id="deleteStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
         </div>
         <footer class="dialog-actions">
           <button id="cancelDeleteButton" class="button button-secondary" type="button">Cancel</button>
-          <button id="confirmDeleteButton" class="button button-danger" type="submit">Delete note</button>
+          <button id="confirmDeleteButton" class="button button-danger" type="submit">Move to Trash</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="permanentDeleteDialog" class="dialog compact-dialog" aria-labelledby="permanentDeleteHeading" aria-describedby="permanentDeleteMessage permanentDeleteStatus">
+      <form id="permanentDeleteForm" class="dialog-form">
+        <div class="dialog-content">
+          <p class="eyebrow">Permanent deletion</p>
+          <h2 id="permanentDeleteHeading">Delete this note permanently?</h2>
+          <p id="permanentDeleteMessage" dir="auto"></p>
+          <p>This cannot be undone. The note will also be absent from future backups.</p>
+          <p id="permanentDeleteStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions">
+          <button id="cancelPermanentDeleteButton" class="button button-secondary" type="button">Cancel</button>
+          <button id="confirmPermanentDeleteButton" class="button button-danger" type="submit">Delete permanently</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="emptyTrashDialog" class="dialog compact-dialog" aria-labelledby="emptyTrashHeading" aria-describedby="emptyTrashMessage emptyTrashStatus">
+      <form id="emptyTrashForm" class="dialog-form">
+        <div class="dialog-content">
+          <p class="eyebrow">Empty Trash</p>
+          <h2 id="emptyTrashHeading">Delete every note in Trash?</h2>
+          <p id="emptyTrashMessage"></p>
+          <p>This cannot be undone. These notes will also be absent from future backups.</p>
+          <p id="emptyTrashStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions">
+          <button id="cancelEmptyTrashButton" class="button button-secondary" type="button">Cancel</button>
+          <button id="confirmEmptyTrashButton" class="button button-danger" type="submit">Empty Trash</button>
         </footer>
       </form>
     </dialog>
@@ -201,7 +249,7 @@
           <p class="eyebrow">Restore backup</p>
           <h2 id="importHeading">Choose how to restore</h2>
           <p id="importMessage"></p>
-          <p id="importExplanation">Merge keeps your current notes. Replace removes the current library first.</p>
+          <p id="importExplanation">Merge keeps your current library. Replace removes current notes and Trash entries first.</p>
           <p id="importStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
         </div>
         <footer class="dialog-actions stacked-actions">
@@ -218,7 +266,7 @@
           <p class="eyebrow">Replace library</p>
           <h2 id="replaceHeading">Remove current notes?</h2>
           <p id="replaceMessage"></p>
-          <p id="replaceWarning">This cannot be undone from the extension. Export a backup first if you need the current notes.</p>
+          <p id="replaceWarning">This cannot be undone from the extension. Export a backup first if you need the current notes or Trash entries.</p>
           <p id="replaceStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
         </div>
         <footer class="dialog-actions">
@@ -229,7 +277,7 @@
     </dialog>
 
     <aside id="undoBar" class="undo-bar" role="status" aria-live="polite" hidden>
-      <span>Note deleted.</span>
+      <span>Note moved to Trash.</span>
       <button id="undoButton" class="button button-secondary compact" type="button">Undo</button>
       <button id="dismissUndoButton" class="button button-quiet compact" type="button">Dismiss</button>
     </aside>
