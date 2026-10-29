@@ -82,6 +82,14 @@ Password-field selections are ignored. Saved source URLs accept only HTTP or HTT
 
 Stored notes, unfinished drafts, and exported files are not encrypted. Anyone with access to the Chrome profile or an exported file may be able to read them.
 
+The full data-handling statement is in the [Privacy Policy](PRIVACY.md).
+
+### Backups and removal
+
+Treat JSON backups and Markdown exports as private files. They can contain note text, course names, page titles, and source URLs. Review an export before sharing it and keep backups in a location you trust.
+
+Export a JSON backup before uninstalling the extension, clearing its storage, or removing the Chrome profile. Uninstalling the extension removes its local notes, settings, and drafts. A later installation does not restore them automatically.
+
 ## Development
 
 Install Node.js 24.15 or newer in the Node 24 line, or Node.js 26 or newer. Then install the locked development dependencies:
@@ -110,6 +118,7 @@ npm run lint
 npm test
 npm run check:extension
 npm run test:coverage
+npm run release:check
 npm audit --audit-level=moderate
 ```
 
@@ -118,9 +127,27 @@ npm audit --audit-level=moderate
 - `npm run check:extension` validates the manifest, permissions, icons, local resources, script syntax, unsafe HTML sinks, dynamic code, network calls, and common credential patterns.
 - `npm run validate` runs lint, tests, and extension validation.
 - `npm run test:browser` loads the unpacked extension in Playwright Chromium against a local test page and checks selection handling, capture and editor draft recovery, browser restart persistence, note operations, Persian search, backup restore, theme switching, and delete undo.
-- `npm run test:coverage` runs the test suite with Node's coverage reporter.
+- `npm run test:coverage` runs the test suite with Node's coverage reporter and enforces the committed coverage floors.
+- `npm run release:check` runs the audit, lint, coverage gates, extension validation, browser test, package creation, and package validation.
+
+The release gate creates `dist/lecture-notes-<version>.zip` and its SHA-256 file. The generated `dist/` directory is not committed.
 
 Headless Chromium may not expose the browser action popup after the `_execute_action` command. The browser test reports that case, while still testing the popup directly and exercising the same selection reader in a real page.
+
+## Troubleshooting
+
+- If capture is empty on `chrome://` pages, the Chrome Web Store, or another protected page, enter the note manually. Chrome does not allow selection injection there.
+- If `Ctrl+Shift+Y` or `Command+Shift+Y` does not open the popup, check `chrome://extensions/shortcuts` for a conflict.
+- After pulling source changes, select **Reload** on the extension card at `chrome://extensions`.
+- Loading the unpacked extension from a different folder may give it a different extension identity and separate local storage. Load the original folder to find its notes, or restore a JSON backup.
+- If a backup is rejected, confirm that it is an unedited Lecture Notes JSON backup within the documented size limit and from a supported schema version.
+- For a repeatable problem, use the [bug report form](https://github.com/Imanm02/LectureNote-ChormeExtension/issues/new?template=bug_report.yml). Remove private note text and URLs before posting.
+
+## Releases and security
+
+Releases are checked on a local machine because this repository does not use GitHub Actions. Run `npm run release:check`, follow the [local release checklist](docs/RELEASE_CHECKLIST.md), and record user-facing changes in [CHANGELOG.md](CHANGELOG.md).
+
+Report suspected vulnerabilities using [SECURITY.md](SECURITY.md). Do not post exploit details, credentials, backups, or private notes in a public issue.
 
 ## Project structure
 
@@ -135,7 +162,7 @@ Headless Chromium may not expose the browser action popup after the `_execute_ac
 | `src/backup.js` | JSON backup restore and Markdown export |
 | `src/background.js` | Internal draft handoff when an extension page closes |
 | `tests/` | Model, storage, popup, library, capture, and worker tests |
-| `scripts/` | Extension validation, browser smoke testing, and icon generation |
+| `scripts/` | Extension and package validation, browser smoke testing, release packaging, and icon generation |
 
 ## Data limits
 

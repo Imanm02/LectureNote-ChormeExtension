@@ -1,0 +1,97 @@
+name: Bug report
+description: Report a repeatable problem with Lecture Notes
+title: "[Bug] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Do not attach a note backup or include private note text, credentials, or private page URLs. Follow the [security policy](https://github.com/Imanm02/LectureNote-ChormeExtension/blob/main/SECURITY.md) instead if the problem could expose data or code execution.
+
+  - type: input
+    id: version
+    attributes:
+      label: Extension version
+      description: Find this on the extension card at chrome://extensions.
+      placeholder: 2.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: chrome
+    attributes:
+      label: Chrome version
+      description: Copy the version from chrome://version.
+      placeholder: 141.0.0.0
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Operating system
+      placeholder: Windows 11, macOS 26, or a Linux distribution
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Loaded unpacked from this repository
+        - Installed from a packaged ZIP
+        - Installed from the Chrome Web Store
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Use sample text and a public test page when page content matters.
+      placeholder: |
+        1. Open...
+        2. Select...
+        3. Click...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: Include the exact visible error after removing private information.
+    validations:
+      required: true
+
+  - type: textarea
+    id: console
+    attributes:
+      label: Console or service-worker errors
+      description: Paste relevant errors after removing tokens, note text, private URLs, and personal information.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Other useful details
+      description: Add keyboard, theme, language direction, or data-size details when they affect the problem.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I removed private notes, credentials, and private URLs from this report.
+          required: true
