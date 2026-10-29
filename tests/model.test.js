@@ -1152,6 +1152,9 @@ test("creates readable Markdown while escaping active markup", () => {
         "~~strike~~",
         "    indented code",
         "\ttabbed code",
+        " \ttabbed after one space",
+        "  \ttabbed after two spaces",
+        "   \ttabbed after three spaces",
       ].join("\n"),
     }),
     { idFactory: () => "note-1", now: START },
@@ -1169,5 +1172,8 @@ test("creates readable Markdown while escaping active markup", () => {
   assert.match(markdown, /^\\~\\~strike\\~\\~$/mu);
   assert.match(markdown, /^&#32; {3}indented code$/mu);
   assert.match(markdown, /^&#9;tabbed code$/mu);
+  assert.match(markdown, /^ &#9;tabbed after one space$/mu);
+  assert.match(markdown, /^ {2}&#9;tabbed after two spaces$/mu);
+  assert.match(markdown, /^ {3}&#9;tabbed after three spaces$/mu);
   assert.doesNotMatch(markdown, /<script>|<b>/u);
 });

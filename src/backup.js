@@ -282,8 +282,8 @@ function escapeMarkdownText(value) {
     .replace(/([\\`*_[\]#|~+-])/gu, "\\$1")
     .replace(/^(\s{0,3}\d{1,9})([.)])(?=\s)/gmu, "$1\\$2")
     .replace(/^(\s{0,3})(=+)(\s*)$/gmu, "$1\\$2$3")
-    .replace(/^( {4}|\t)/gmu, (indent) =>
-      indent === "\t" ? "&#9;" : "&#32;   ");
+    .replace(/^( {0,3})\t/gmu, "$1&#9;")
+    .replace(/^ {4}/gmu, "&#32;   ");
 }
 
 function markdownUrl(value) {
