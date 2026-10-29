@@ -12,6 +12,8 @@ import {
 
 export const STORAGE_KEYS = Object.freeze({
   state: "lectureNoteState",
+  dataEpoch: "lectureNoteDataEpoch",
+  resetCleanup: "lectureNoteResetCleanup",
   draft: "lectureNoteDraft",
   editorDraft: "lectureNoteEditorDraft",
   pendingCaptures: "lectureNotePendingCaptures",
@@ -25,6 +27,14 @@ const STATE_LOCK = "lecture-note-state";
 const POPUP_DRAFT_VERSION = 1;
 const EDITOR_DRAFT_VERSION = 1;
 const PENDING_CAPTURE_VERSION = 1;
+const DATA_EPOCH_ATTEMPTS = 25;
+const RESET_CLEANUP_KEYS = Object.freeze([
+  STORAGE_KEYS.pendingCaptures,
+  STORAGE_KEYS.recovery,
+  STORAGE_KEYS.helpSeen,
+  STORAGE_KEYS.legacyResult,
+  STORAGE_KEYS.legacySelection,
+]);
 export const MAX_PENDING_CAPTURES = 10;
 let localMutationQueue = Promise.resolve();
 
@@ -290,6 +300,165 @@ async function withStateLock(task, lockManager = globalThis.navigator?.locks) {
   return result;
 }
 
+function createDataEpoch(epochFactory, previousEpoch = "") {
+  for (let attempt = 0; attempt < DATA_EPOCH_ATTEMPTS; attempt += 1) {
+    const candidate = epochFactory();
+    if (isValidIdentifier(candidate) && candidate !== previousEpoch) {
+      return candidate;
+    }
+  }
+  throw new ValidationError("A new data reset token could not be created.", "data-epoch-create");
+}
+
+async function removeResetAncillaryData(area) {
+  if (typeof area.remove !== "function") {
+    throw new TypeError("The storage area cannot finish a data reset.");
+  }
+  await area.remove(RESET_CLEANUP_KEYS);
+  await area.remove(STORAGE_KEYS.resetCleanup);
+}
+
+async function loadDataEpochUnlocked(area, options = {}) {
+  const stored = await area.get([STORAGE_KEYS.dataEpoch, STORAGE_KEYS.resetCleanup]);
+  const storedEpoch = stored[STORAGE_KEYS.dataEpoch];
+  const epoch = isValidIdentifier(storedEpoch)
+    ? storedEpoch
+    : createDataEpoch(options.epochFactory || (() => crypto.randomUUID()));
+
+  if (epoch !== storedEpoch) {
+    await area.set({ [STORAGE_KEYS.dataEpoch]: epoch });
+  }
+
+  if (stored[STORAGE_KEYS.resetCleanup] !== undefined) {
+    if (stored[STORAGE_KEYS.resetCleanup] === epoch) {
+      await removeResetAncillaryData(area);
+    } else {
+      if (typeof area.remove !== "function") {
+        throw new TypeError("The storage area cannot remove an invalid reset marker.");
+      }
+      await area.remove(STORAGE_KEYS.resetCleanup);
+    }
+  }
+  return epoch;
+}
+
+function validateExpectedDataEpoch(options) {
+  if (options.expectedEpoch !== undefined && !isValidIdentifier(options.expectedEpoch)) {
+    throw new ValidationError("The expected data reset token is invalid.", "data-epoch-invalid");
+  }
+}
+
+function throwDataResetConflict() {
+  throw new ValidationError(
+    "The note data was reset in another window. This older change was not saved.",
+    "data-reset",
+  );
+}
+
+async function assertExistingExpectedDataEpochUnlocked(area, options = {}) {
+  validateExpectedDataEpoch(options);
+  if (options.expectedEpoch === undefined) {
+    return;
+  }
+  const stored = await area.get(STORAGE_KEYS.dataEpoch);
+  const epoch = stored[STORAGE_KEYS.dataEpoch];
+  if (isValidIdentifier(epoch) && options.expectedEpoch !== epoch) {
+    throwDataResetConflict();
+  }
+}
+
+async function assertExpectedDataEpochUnlocked(area, options = {}) {
+  validateExpectedDataEpoch(options);
+  const epoch = await loadDataEpochUnlocked(area, options);
+  if (options.expectedEpoch !== undefined && options.expectedEpoch !== epoch) {
+    throwDataResetConflict();
+  }
+  return epoch;
+}
+
+export async function loadDataEpoch(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => loadDataEpochUnlocked(area, options), lockManager);
+}
+
+function nextDraftTombstoneGeneration(value) {
+  if (Number.isSafeInteger(value) && value >= 0 && value < Number.MAX_SAFE_INTEGER) {
+    return value + 1;
+  }
+  return 1;
+}
+
+function createDraftTombstone(version, value, ownerSessionId) {
+  return {
+    version,
+    ownerSessionId,
+    generation: nextDraftTombstoneGeneration(value?.generation),
+    contentGeneration: nextDraftTombstoneGeneration(value?.contentGeneration),
+    draft: null,
+  };
+}
+
+export async function resetAllData(
+  storage = chrome.storage.local,
+  {
+    lockManager = globalThis.navigator?.locks,
+    epochFactory = () => crypto.randomUUID(),
+  } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    const currentEpoch = await loadDataEpochUnlocked(area, { epochFactory });
+    const nextEpoch = createDataEpoch(epochFactory, currentEpoch);
+    const stored = await area.get([
+      STORAGE_KEYS.state,
+      STORAGE_KEYS.draft,
+      STORAGE_KEYS.editorDraft,
+    ]);
+    const storedRevision = stored[STORAGE_KEYS.state]?.revision;
+    const currentRevision = Number.isSafeInteger(storedRevision) && storedRevision >= 0
+      ? storedRevision
+      : 0;
+    if (currentRevision === Number.MAX_SAFE_INTEGER) {
+      throw new ValidationError("The note library revision cannot be advanced.", "revision-invalid");
+    }
+
+    const state = {
+      ...createEmptyState(),
+      revision: currentRevision + 1,
+    };
+    const resetOwnerSessionId = `reset_${nextEpoch}`;
+    const popupDraftRecord = createDraftTombstone(
+      POPUP_DRAFT_VERSION,
+      stored[STORAGE_KEYS.draft],
+      resetOwnerSessionId,
+    );
+    const editorDraftRecord = createDraftTombstone(
+      EDITOR_DRAFT_VERSION,
+      stored[STORAGE_KEYS.editorDraft],
+      resetOwnerSessionId,
+    );
+    assertStateFits(state);
+    await area.set({
+      [STORAGE_KEYS.state]: state,
+      [STORAGE_KEYS.dataEpoch]: nextEpoch,
+      [STORAGE_KEYS.resetCleanup]: nextEpoch,
+      [STORAGE_KEYS.draft]: popupDraftRecord,
+      [STORAGE_KEYS.editorDraft]: editorDraftRecord,
+    });
+    await removeResetAncillaryData(area);
+
+    return {
+      state,
+      epoch: nextEpoch,
+      popupDraftRecord,
+      editorDraftRecord,
+    };
+  }, lockManager);
+}
+
 function recoveryCount(value, key) {
   const stored = value?.[key];
   if (Array.isArray(stored)) {
@@ -470,7 +639,10 @@ export async function loadState(
   return withStateLock(() => loadStateUnlocked(area, options), lockManager);
 }
 
-async function saveStateUnlocked(value, area, options) {
+async function saveStateUnlocked(value, area, options, epochChecked = false) {
+  if (!epochChecked) {
+    await assertExpectedDataEpochUnlocked(area, options);
+  }
   const state = normalizeState(value, options);
   assertStateFits(state);
   if (options.expectedRevision !== undefined) {
@@ -511,16 +683,22 @@ export async function mutateState(
 
   return withStateLock(async () => {
     const area = getStorage(storage);
+    await assertExpectedDataEpochUnlocked(area, options);
     const current = await loadStateUnlocked(area, options);
     const result = await mutation(current);
     const nextState = result?.state || result;
     if (sameData(nextState, current)) {
       return result;
     }
-    const saved = await saveStateUnlocked(nextState, area, {
-      ...options,
-      expectedRevision: current.revision,
-    });
+    const saved = await saveStateUnlocked(
+      nextState,
+      area,
+      {
+        ...options,
+        expectedRevision: current.revision,
+      },
+      true,
+    );
     if (result && typeof result === "object" && "state" in result) {
       return { ...result, state: saved };
     }
@@ -543,10 +721,10 @@ export async function loadPendingCaptures(
   { lockManager = globalThis.navigator?.locks, ...options } = {},
 ) {
   const area = getStorage(storage);
-  const record = await withStateLock(
-    () => loadPendingCapturesUnlocked(area, options),
-    lockManager,
-  );
+  const record = await withStateLock(async () => {
+    await loadDataEpochUnlocked(area, options);
+    return loadPendingCapturesUnlocked(area, options);
+  }, lockManager);
   return record.captures;
 }
 
@@ -562,6 +740,7 @@ export async function enqueuePendingCapture(
 ) {
   const area = getStorage(storage);
   return withStateLock(async () => {
+    await assertExpectedDataEpochUnlocked(area, options);
     const current = await loadPendingCapturesUnlocked(area, { ...options, now });
     if (current.captures.length >= MAX_PENDING_CAPTURES) {
       throw new ValidationError(
@@ -604,6 +783,7 @@ export async function removePendingCapture(
   }
   const area = getStorage(storage);
   return withStateLock(async () => {
+    await assertExpectedDataEpochUnlocked(area, options);
     const current = await loadPendingCapturesUnlocked(area, options);
     const captures = current.captures.filter((capture) => capture.id !== identifier);
     const removed = captures.length !== current.captures.length;
@@ -670,6 +850,7 @@ export async function saveDraft(
 ) {
   const area = getStorage(storage);
   return withStateLock(async () => {
+    await assertExpectedDataEpochUnlocked(area, options);
     const draft = normalizeDraft(value, options);
     if (!draft) {
       await clearDraftUnlocked(area);
@@ -695,10 +876,14 @@ export async function clearDraft(
   { lockManager = globalThis.navigator?.locks, ...options } = {},
 ) {
   const area = getStorage(storage);
-  return withStateLock(() => clearDraftUnlocked(area, options), lockManager);
+  return withStateLock(async () => {
+    await assertExpectedDataEpochUnlocked(area, options);
+    return clearDraftUnlocked(area, options);
+  }, lockManager);
 }
 
 async function writePopupDraftUnlocked(value, area, options) {
+  await assertExistingExpectedDataEpochUnlocked(area, options);
   const {
     sessionId,
     expectedOwnerSessionId = "",
@@ -725,6 +910,7 @@ async function writePopupDraftUnlocked(value, area, options) {
 
   const current = await loadPopupDraftUnlocked(area, normalizeOptions);
   const draft = value === null ? null : normalizeDraft(value, normalizeOptions);
+  await assertExpectedDataEpochUnlocked(area, options);
   const cursorMatches = samePopupDraftCursor(
     current,
     expectedOwnerSessionId,
@@ -785,6 +971,7 @@ export async function mutateStateAndClearPopupDraft(
 
   return withStateLock(async () => {
     const area = getStorage(storage);
+    await assertExistingExpectedDataEpochUnlocked(area, options);
     const expectedOwnerSessionId = options.expectedOwnerSessionId ?? "";
     const expectedGeneration = options.expectedGeneration ?? 0;
     if (
@@ -807,6 +994,7 @@ export async function mutateStateAndClearPopupDraft(
     }
 
     const currentDraft = await loadPopupDraftUnlocked(area, options);
+    await assertExpectedDataEpochUnlocked(area, options);
     const canClear = samePopupDraftCursor(
       currentDraft,
       expectedOwnerSessionId,
@@ -880,6 +1068,7 @@ export async function loadEditorDraft(
 }
 
 async function writeEditorDraftUnlocked(value, area, options) {
+  await assertExistingExpectedDataEpochUnlocked(area, options);
   const {
     sessionId,
     expectedOwnerSessionId = "",
@@ -906,6 +1095,7 @@ async function writeEditorDraftUnlocked(value, area, options) {
 
   const current = await loadEditorDraftUnlocked(area, normalizeOptions);
   const draft = value === null ? null : normalizeEditorDraft(value, normalizeOptions);
+  await assertExpectedDataEpochUnlocked(area, options);
   const cursorMatches = sameEditorDraftCursor(
     current,
     expectedOwnerSessionId,
@@ -974,6 +1164,7 @@ export async function mutateStateAndClearEditorDraft(
 
   return withStateLock(async () => {
     const area = getStorage(storage);
+    await assertExistingExpectedDataEpochUnlocked(area, options);
     const expectedOwnerSessionId = options.expectedOwnerSessionId ?? "";
     const expectedGeneration = options.expectedGeneration ?? 0;
     if (
@@ -992,6 +1183,7 @@ export async function mutateStateAndClearEditorDraft(
     }
 
     const currentDraft = await loadEditorDraftUnlocked(area, options);
+    await assertExpectedDataEpochUnlocked(area, options);
     const canClear = sameEditorDraftCursor(
       currentDraft,
       expectedOwnerSessionId,
@@ -1036,10 +1228,11 @@ function emptyRecoveryNotice() {
 
 export async function loadRecoveryNotice(
   storage = chrome.storage.local,
-  { lockManager = globalThis.navigator?.locks } = {},
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
 ) {
   const area = getStorage(storage);
   return withStateLock(async () => {
+    await loadDataEpochUnlocked(area, options);
     const stored = await area.get(STORAGE_KEYS.recovery);
     return normalizeRecovery(stored[STORAGE_KEYS.recovery]) || emptyRecoveryNotice();
   }, lockManager);
@@ -1056,10 +1249,11 @@ export async function loadRecoveryInfo(storage = chrome.storage.local, options =
 export async function acknowledgeRecovery(
   expectedValue,
   storage = chrome.storage.local,
-  { lockManager = globalThis.navigator?.locks } = {},
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
 ) {
   const area = getStorage(storage);
   return withStateLock(async () => {
+    await assertExpectedDataEpochUnlocked(area, options);
     const stored = await area.get(STORAGE_KEYS.recovery);
     const current = normalizeRecovery(stored[STORAGE_KEYS.recovery]);
     if (!current) {

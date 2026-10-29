@@ -8,17 +8,23 @@ import {
   createNote,
   LIMITS,
   normalizeSource,
+  SCHEMA_VERSION,
 } from "../src/model.js";
 import {
   acknowledgeRecovery,
   assertStateFits,
   clearDraft,
+  enqueuePendingCapture,
+  loadDataEpoch,
   loadDraft,
   loadRecoveryInfo,
   loadRecoveryNotice,
   loadState,
   mutateState,
+  resetAllData,
   saveDraft,
+  saveEditorDraft,
+  savePopupDraft,
   saveState,
   STORAGE_KEYS,
 } from "../src/storage.js";
@@ -37,6 +43,18 @@ function deferred() {
 function noteInput(body = "Graph theory") {
   return {
     title: "Lecture",
+    body,
+    course: "CS 101",
+    source: { title: "Course page", url: "https://example.com/lecture" },
+  };
+}
+
+function editorDraft(body = "Unfinished graph note") {
+  return {
+    noteId: null,
+    baseRevision: 4,
+    baseNote: null,
+    title: "Draft lecture",
     body,
     course: "CS 101",
     source: { title: "Course page", url: "https://example.com/lecture" },
@@ -330,4 +348,243 @@ test("accepts exact byte limits and rejects one byte more", () => {
   assert.throws(() => assertStateFits(stateOverLimit), { code: "storage-size" });
   assert.deepEqual(parseBackup(backupAtLimit, { now: NOW }).notes, []);
   assert.throws(() => parseBackup(backupOverLimit, { now: NOW }), { code: "import-size" });
+});
+
+test("accepts every supported backup schema version", () => {
+  for (let schemaVersion = 1; schemaVersion <= SCHEMA_VERSION; schemaVersion += 1) {
+    const restored = parseBackup(JSON.stringify({
+      format: "lecturenote-backup",
+      schemaVersion,
+      notes: [],
+      ...(schemaVersion >= 2 ? { trash: [] } : {}),
+    }), { now: NOW });
+
+    assert.equal(restored.schemaVersion, schemaVersion);
+    assert.deepEqual(restored.notes, []);
+    assert.deepEqual(restored.trash, []);
+  }
+  assert.throws(
+    () => parseBackup(`{"format":"lecturenote-backup","schemaVersion":1.5,"notes":[]}`),
+    { code: "schema-version" },
+  );
+});
+
+test("creates one persistent data reset token", async () => {
+  const storage = memoryStorage();
+  const first = await loadDataEpoch(storage, {
+    epochFactory: () => "epoch-first",
+    lockManager: null,
+  });
+  const second = await loadDataEpoch(storage, {
+    epochFactory: () => {
+      throw new Error("The stored token should be reused");
+    },
+    lockManager: null,
+  });
+
+  assert.equal(first, "epoch-first");
+  assert.equal(second, "epoch-first");
+  assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "epoch-first");
+});
+
+test("resets all stored data and advances draft tombstones", async () => {
+  const note = createNote(noteInput(), { idFactory: () => "saved-note", now: NOW });
+  const trashed = createNote(noteInput("Deleted note"), {
+    idFactory: () => "deleted-note",
+    now: NOW,
+  });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      revision: 4,
+      notes: [note],
+      trash: [{ note: trashed, deletedAt: NOW, originalIndex: 1 }],
+      settings: { theme: "dark", sort: "title-asc" },
+    },
+    [STORAGE_KEYS.dataEpoch]: "epoch-before",
+    [STORAGE_KEYS.draft]: {
+      version: 1,
+      ownerSessionId: "popup-before",
+      generation: 7,
+      contentGeneration: 9,
+      draft: { body: "Popup work", sessionId: "popup-before", updatedAt: NOW },
+    },
+    [STORAGE_KEYS.editorDraft]: {
+      version: 1,
+      ownerSessionId: "editor-before",
+      generation: 5,
+      contentGeneration: 6,
+      draft: editorDraft(),
+    },
+    [STORAGE_KEYS.pendingCaptures]: { version: 1, captures: [] },
+    [STORAGE_KEYS.recovery]: { createdAt: NOW, rejectedNotes: 1, rejectedDrafts: 1 },
+    [STORAGE_KEYS.helpSeen]: true,
+    [STORAGE_KEYS.legacyResult]: "Old generated note",
+    [STORAGE_KEYS.legacySelection]: "Old selection",
+  });
+
+  const reset = await resetAllData(storage, {
+    lockManager: null,
+    epochFactory: () => "epoch-after",
+  });
+
+  assert.equal(reset.epoch, "epoch-after");
+  assert.equal(reset.state.revision, 5);
+  assert.deepEqual(reset.state.notes, []);
+  assert.deepEqual(reset.state.trash, []);
+  assert.deepEqual(reset.state.settings, { theme: "system", sort: "updated-desc" });
+  assert.deepEqual(storage.values[STORAGE_KEYS.draft], {
+    version: 1,
+    ownerSessionId: "reset_epoch-after",
+    generation: 8,
+    contentGeneration: 10,
+    draft: null,
+  });
+  assert.deepEqual(storage.values[STORAGE_KEYS.editorDraft], {
+    version: 1,
+    ownerSessionId: "reset_epoch-after",
+    generation: 6,
+    contentGeneration: 7,
+    draft: null,
+  });
+  assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "epoch-after");
+  for (const key of [
+    STORAGE_KEYS.resetCleanup,
+    STORAGE_KEYS.pendingCaptures,
+    STORAGE_KEYS.recovery,
+    STORAGE_KEYS.helpSeen,
+    STORAGE_KEYS.legacyResult,
+    STORAGE_KEYS.legacySelection,
+  ]) {
+    assert.equal(key in storage.values, false);
+  }
+});
+
+test("rejects stale library and draft writers after a reset", async () => {
+  const originalState = {
+    ...createEmptyState(),
+    revision: 4,
+    notes: [createNote(noteInput(), { idFactory: () => "saved-note", now: NOW })],
+  };
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: originalState,
+    [STORAGE_KEYS.dataEpoch]: "epoch-before",
+  });
+  await resetAllData(storage, {
+    lockManager: null,
+    epochFactory: () => "epoch-after",
+  });
+  const resetValues = structuredClone(storage.values);
+  let mutationCalled = false;
+
+  await assert.rejects(
+    () =>
+      saveState(
+        { ...originalState, revision: 5 },
+        storage,
+        { expectedEpoch: "epoch-before", expectedRevision: 4, lockManager: null, now: NOW },
+      ),
+    { code: "data-reset" },
+  );
+  await assert.rejects(
+    () =>
+      mutateState(
+        (state) => {
+          mutationCalled = true;
+          return state;
+        },
+        storage,
+        { expectedEpoch: "epoch-before", lockManager: null, now: NOW },
+      ),
+    { code: "data-reset" },
+  );
+  await assert.rejects(
+    () =>
+      savePopupDraft(
+        { body: "Stale popup", sessionId: "popup-before" },
+        storage,
+        {
+          sessionId: "popup-before",
+          expectedOwnerSessionId: "",
+          expectedGeneration: 0,
+          expectedEpoch: "epoch-before",
+          contentGeneration: 1,
+          lockManager: null,
+          now: NOW,
+        },
+      ),
+    { code: "data-reset" },
+  );
+  await assert.rejects(
+    () =>
+      saveEditorDraft(editorDraft(), storage, {
+        sessionId: "editor-before",
+        expectedOwnerSessionId: "",
+        expectedGeneration: 0,
+        expectedEpoch: "epoch-before",
+        lockManager: null,
+        now: NOW,
+      }),
+    { code: "data-reset" },
+  );
+  await assert.rejects(
+    () =>
+      enqueuePendingCapture(
+        { id: "stale-capture", text: "Stale selection" },
+        storage,
+        { expectedEpoch: "epoch-before", lockManager: null, now: NOW },
+      ),
+    { code: "data-reset" },
+  );
+
+  assert.equal(mutationCalled, false);
+  assert.deepEqual(storage.values, resetValues);
+});
+
+test("finishes reset cleanup after an interrupted removal", async () => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: {
+      ...createEmptyState(),
+      revision: 2,
+      notes: [createNote(noteInput(), { idFactory: () => "saved-note", now: NOW })],
+    },
+    [STORAGE_KEYS.dataEpoch]: "epoch-before",
+    [STORAGE_KEYS.pendingCaptures]: { version: 1, captures: [] },
+    [STORAGE_KEYS.recovery]: { createdAt: NOW, rejectedNotes: 1, rejectedDrafts: 0 },
+    [STORAGE_KEYS.helpSeen]: true,
+  });
+  const remove = storage.remove.bind(storage);
+  let interruptCleanup = true;
+  storage.remove = async (keys) => {
+    if (interruptCleanup && Array.isArray(keys) && keys.includes(STORAGE_KEYS.pendingCaptures)) {
+      interruptCleanup = false;
+      delete storage.values[STORAGE_KEYS.recovery];
+      throw new Error("Cleanup interrupted");
+    }
+    await remove(keys);
+  };
+
+  await assert.rejects(
+    () =>
+      resetAllData(storage, {
+        lockManager: null,
+        epochFactory: () => "epoch-after",
+      }),
+    /Cleanup interrupted/u,
+  );
+
+  assert.equal(storage.values[STORAGE_KEYS.state].revision, 3);
+  assert.deepEqual(storage.values[STORAGE_KEYS.state].notes, []);
+  assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "epoch-after");
+  assert.equal(storage.values[STORAGE_KEYS.resetCleanup], "epoch-after");
+  assert.equal(STORAGE_KEYS.pendingCaptures in storage.values, true);
+  assert.equal(STORAGE_KEYS.recovery in storage.values, false);
+
+  const resumedEpoch = await loadDataEpoch(storage, { lockManager: null });
+
+  assert.equal(resumedEpoch, "epoch-after");
+  assert.equal(STORAGE_KEYS.resetCleanup in storage.values, false);
+  assert.equal(STORAGE_KEYS.pendingCaptures in storage.values, false);
+  assert.equal(STORAGE_KEYS.helpSeen in storage.values, false);
+  assert.deepEqual(storage.values[STORAGE_KEYS.state].notes, []);
 });

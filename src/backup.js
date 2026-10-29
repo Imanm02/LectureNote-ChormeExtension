@@ -68,7 +68,11 @@ export function parseBackup(
   if (!isRecord(value) || value.format !== "lecturenote-backup") {
     throw new ValidationError("This is not a Lecture Notes backup.", "import-format");
   }
-  if (![1, SCHEMA_VERSION].includes(value.schemaVersion)) {
+  if (
+    !Number.isInteger(value.schemaVersion) ||
+    value.schemaVersion < 1 ||
+    value.schemaVersion > SCHEMA_VERSION
+  ) {
     throw new ValidationError("This backup version is not supported.", "schema-version");
   }
   if (value.schemaVersion >= 2 && !Array.isArray(value.trash)) {
