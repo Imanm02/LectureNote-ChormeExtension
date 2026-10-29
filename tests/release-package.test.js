@@ -17,6 +17,7 @@ import {
   checksumFileContents,
   crc32,
   getExtensionPackageFiles,
+  normalizePackageFile,
   projectRoot,
   readStoredZip,
   sha256,
@@ -36,11 +37,57 @@ test("release package is deterministic and contains only allowed files", () => {
   const entries = readStoredZip(first.archive);
   assert.deepEqual([...entries.keys()], first.files);
   for (const [name, data] of entries) {
-    assert.deepEqual(data, readFileSync(join(projectRoot, name)), `${name} differs from the source file`);
+    assert.deepEqual(
+      data,
+      normalizePackageFile(name, readFileSync(join(projectRoot, name))),
+      `${name} differs from the normalized source file`,
+    );
     assert.doesNotMatch(name, /^(?:tests|scripts|node_modules|docs|dist)\//u);
     assert.notEqual(name, "package.json");
     assert.notEqual(name, "package-lock.json");
   }
+});
+
+test("release package is independent of checkout line endings", () => {
+  const root = mkdtempSync(join(tmpdir(), "lecture-notes-package-eol-"));
+  const lfRoot = join(root, "lf");
+  const crlfRoot = join(root, "crlf");
+  const files = new Map([
+    ["package.json", '{\n  "version": "1.0.0"\n}\n'],
+    [
+      "manifest.json",
+      '{\n  "manifest_version": 3,\n  "name": "Package test",\n  "version": "1.0.0",\n  "background": { "service_worker": "src/background.js" }\n}\n',
+    ],
+    ["LICENSE", "First line\nSecond line\n"],
+    ["src/background.js", "export const ready = true;\n"],
+  ]);
+
+  try {
+    for (const directory of [lfRoot, crlfRoot]) {
+      mkdirSync(join(directory, "src"), { recursive: true });
+    }
+    for (const [name, source] of files) {
+      writeFileSync(join(lfRoot, name), source);
+      writeFileSync(join(crlfRoot, name), source.replaceAll("\n", "\r\n"));
+    }
+
+    const lfPackage = buildExtensionPackage(lfRoot);
+    const crlfPackage = buildExtensionPackage(crlfRoot);
+
+    assert.deepEqual(crlfPackage.archive, lfPackage.archive);
+    assert.equal(crlfPackage.checksum, lfPackage.checksum);
+    for (const data of readStoredZip(crlfPackage.archive).values()) {
+      assert.equal(data.includes("\r"), false);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("release normalization leaves binary files unchanged", () => {
+  const data = Buffer.from([0x00, 0x0d, 0x0a, 0xff]);
+
+  assert.deepEqual(normalizePackageFile("Images/icon16.png", data), data);
 });
 
 test("release package includes the extension pages and privacy notice", () => {

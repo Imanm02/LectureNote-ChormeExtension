@@ -16,6 +16,17 @@ const ZIP_DATE_1980_01_01 = 0x0021;
 const ZIP_VERSION = 20;
 const MAX_ZIP_32 = 0xffffffff;
 const MAX_ZIP_16 = 0xffff;
+const TEXT_PACKAGE_NAMES = new Set(["LICENSE"]);
+const TEXT_PACKAGE_EXTENSIONS = new Set([
+  ".css",
+  ".html",
+  ".js",
+  ".json",
+  ".md",
+  ".svg",
+  ".txt",
+  ".xml",
+]);
 
 const crcTable = Array.from({ length: 256 }, (_, index) => {
   let value = index;
@@ -319,12 +330,33 @@ export function sha256(data) {
   return createHash("sha256").update(data).digest("hex");
 }
 
+export function normalizePackageFile(name, data) {
+  const source = Buffer.from(data);
+  if (
+    !TEXT_PACKAGE_NAMES.has(name) &&
+    !TEXT_PACKAGE_EXTENSIONS.has(extname(name).toLowerCase())
+  ) {
+    return source;
+  }
+
+  const text = source.toString("utf8");
+  assert.deepEqual(
+    Buffer.from(text, "utf8"),
+    source,
+    `Package text file is not valid UTF-8: ${name}`,
+  );
+  return Buffer.from(text.replaceAll("\r\n", "\n").replaceAll("\r", "\n"), "utf8");
+}
+
 export function buildExtensionPackage(root = projectRoot) {
   const packageJson = readJson(root, "package.json");
   const manifest = readJson(root, "manifest.json");
   assertVersionAgreement(packageJson, manifest);
   const files = getExtensionPackageFiles(root);
-  const entries = files.map((name) => ({ name, data: readFileSync(join(root, name)) }));
+  const entries = files.map((name) => ({
+    name,
+    data: normalizePackageFile(name, readFileSync(join(root, name))),
+  }));
   const archive = buildStoredZip(entries);
   const archiveName = `lecture-notes-${packageJson.version}.zip`;
   return {
