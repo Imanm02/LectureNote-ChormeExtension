@@ -11,6 +11,7 @@
     "package:extension": "node scripts/package-extension.mjs",
     "preflight": "npm audit --audit-level=moderate && npm run lint && npm run test:coverage && npm run check:extension",
     "release:check": "npm run preflight && npm run test:browser && npm run package:extension && npm run check:package && npm run test:browser:package",
+    "store:screenshots": "node scripts/store-screenshots.mjs",
     "test": "node --test",
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:browser:package": "node scripts/package-browser-smoke.mjs",
