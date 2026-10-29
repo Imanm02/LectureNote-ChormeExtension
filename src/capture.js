@@ -33,11 +33,93 @@ export function readPageSelection(maximumLength) {
   if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
     boundedText = boundedText.slice(0, -1);
   }
+
+  let isFocused = activeElement?.tagName !== "IFRAME" && activeElement?.tagName !== "FRAME";
+  let frameDepth = 0;
+  try {
+    let frameWindow = window;
+    while (frameWindow !== frameWindow.top) {
+      frameDepth += 1;
+      const frameElement = frameWindow.frameElement;
+      if (isFocused) {
+        const frameRoot = frameElement?.getRootNode();
+        const rootActiveElement = frameRoot?.activeElement;
+        isFocused = Boolean(frameElement && rootActiveElement === frameElement);
+      }
+      frameWindow = frameWindow.parent;
+    }
+  } catch {
+    isFocused = document.hasFocus();
+  }
+
   return {
     text: boundedText,
     title: document.title || "",
     url: location.href,
     wasTruncated,
+    isFocused,
+    frameDepth,
+  };
+}
+
+function normalizeInjectionResults(results, tab) {
+  if (!Array.isArray(results)) {
+    throw new CaptureError("The page did not return selection details.");
+  }
+
+  const frames = results.flatMap((entry, index) => {
+    const result = entry?.result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      return [];
+    }
+
+    return [
+      {
+        frameId:
+          Number.isInteger(entry.frameId) && entry.frameId >= 0
+            ? entry.frameId
+            : index === 0
+              ? 0
+              : Number.MAX_SAFE_INTEGER,
+        index,
+        text: typeof result.text === "string" ? result.text : "",
+        title: typeof result.title === "string" ? result.title : null,
+        url: typeof result.url === "string" ? result.url : null,
+        wasTruncated: result.wasTruncated === true,
+        isFocused: result.isFocused === true,
+        hasFocusMetadata: typeof result.isFocused === "boolean",
+        frameDepth:
+          Number.isSafeInteger(result.frameDepth) && result.frameDepth >= 0
+            ? result.frameDepth
+            : 0,
+      },
+    ];
+  });
+
+  if (frames.length === 0) {
+    throw new CaptureError("The page did not return selection details.");
+  }
+
+  const topFrame = frames.find((frame) => frame.frameId === 0);
+  const framesWithSelection = frames.filter((frame) => frame.text.length > 0);
+  const hasFocusMetadata = frames.some((frame) => frame.hasFocusMetadata);
+  const selectedFrame = (hasFocusMetadata
+    ? framesWithSelection.filter((frame) => frame.isFocused)
+    : framesWithSelection
+  )
+    .sort(
+      (left, right) =>
+        Number(right.isFocused) - Number(left.isFocused) ||
+        right.frameDepth - left.frameDepth ||
+        left.frameId - right.frameId ||
+        left.index - right.index,
+    )[0];
+
+  return {
+    text: selectedFrame?.text || "",
+    title: topFrame?.title ?? (typeof tab.title === "string" ? tab.title : ""),
+    url: topFrame?.url ?? (typeof tab.url === "string" ? tab.url : ""),
+    wasTruncated: selectedFrame?.wasTruncated === true,
   };
 }
 
@@ -56,20 +138,11 @@ export async function captureActivePage(chromeApi = chrome, maximumLength = LIMI
 
   try {
     const results = await chromeApi.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId: tab.id, allFrames: true },
       func: readPageSelection,
       args: [maximumLength],
     });
-    const result = results[0]?.result;
-    if (!result || typeof result !== "object") {
-      throw new CaptureError("The page did not return selection details.");
-    }
-    return {
-      text: typeof result.text === "string" ? result.text : "",
-      title: typeof result.title === "string" ? result.title : "",
-      url: typeof result.url === "string" ? result.url : "",
-      wasTruncated: result.wasTruncated === true,
-    };
+    return normalizeInjectionResults(results, tab);
   } catch (error) {
     if (error instanceof CaptureError) {
       throw error;

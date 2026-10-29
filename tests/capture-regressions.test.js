@@ -48,3 +48,54 @@ test("does not leave an unpaired surrogate when capture is truncated", () => {
   assert.equal(result.text.includes("\ud83d"), false);
   dom.window.close();
 });
+
+test("marks the selected embedded frame as the focus owner", () => {
+  const dom = new JSDOM("<!doctype html><title>Lecture</title><iframe id='player'></iframe>", {
+    url: "https://example.com/lecture",
+    pretendToBeVisual: true,
+    runScripts: "outside-only",
+  });
+  const frame = dom.window.document.getElementById("player");
+  const frameWindow = frame.contentWindow;
+  frameWindow.document.body.innerHTML = "<p id='caption'>Embedded فارسی text</p>";
+  const range = frameWindow.document.createRange();
+  range.selectNodeContents(frameWindow.document.getElementById("caption"));
+  const selection = frameWindow.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  frame.focus();
+
+  const topResult = readSelection(dom, 100);
+  const frameResult = frameWindow.eval(`(${readPageSelection.toString()})(100)`);
+
+  assert.equal(topResult.isFocused, false);
+  assert.equal(frameResult.isFocused, true);
+  assert.equal(topResult.frameDepth, 0);
+  assert.equal(frameResult.frameDepth, 1);
+  assert.equal(frameResult.text, "Embedded فارسی text");
+  dom.window.close();
+});
+
+test("does not capture a password selected inside an embedded frame", () => {
+  const dom = new JSDOM("<!doctype html><iframe id='player'></iframe>", {
+    url: "https://example.com/lecture",
+    pretendToBeVisual: true,
+    runScripts: "outside-only",
+  });
+  const frame = dom.window.document.getElementById("player");
+  const frameWindow = frame.contentWindow;
+  frameWindow.document.body.innerHTML =
+    "<input id='password' type='password' value='embedded-private-value'>";
+  const password = frameWindow.document.getElementById("password");
+  password.focus();
+  password.setSelectionRange(0, password.value.length);
+  frame.focus();
+  password.focus();
+  frameWindow.getSelection = () => ({ toString: () => "exposed-password" });
+
+  const result = frameWindow.eval(`(${readPageSelection.toString()})(100)`);
+
+  assert.equal(result.text, "");
+  assert.equal(result.wasTruncated, false);
+  dom.window.close();
+});
