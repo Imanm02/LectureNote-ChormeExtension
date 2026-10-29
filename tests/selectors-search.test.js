@@ -61,6 +61,39 @@ test("treats Arabic and Persian yeh and kaf forms as equivalent", () => {
   );
 });
 
+test("treats Persian text with and without a zero-width non-joiner as equivalent", () => {
+  const notes = [
+    note("joined", {
+      title: "او می‌رود",
+      body: "نوشته فارسی",
+    }),
+    note("plain", {
+      title: "او میرود",
+      body: "متن دیگر",
+      updatedAt: LATER,
+    }),
+  ];
+
+  assert.deepEqual(
+    selectNotes(notes, { query: "میرود" }).map((entry) => entry.id),
+    ["plain", "joined"],
+  );
+  assert.deepEqual(
+    selectNotes(notes, { query: "می‌رود" }).map((entry) => entry.id),
+    ["plain", "joined"],
+  );
+});
+
+test("keeps visible punctuation significant while normalizing Persian joins", () => {
+  const notes = [note("hyphenated", { body: "data-base" })];
+
+  assert.deepEqual(selectNotes(notes, { query: "database" }), []);
+  assert.deepEqual(
+    selectNotes(notes, { query: "data-base" }).map((entry) => entry.id),
+    ["hyphenated"],
+  );
+});
+
 test("ignores combining marks while searching", () => {
   const notes = [
     note("accented", {

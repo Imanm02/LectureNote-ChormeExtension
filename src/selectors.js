@@ -4,6 +4,7 @@ function searchText(value) {
   return String(value)
     .normalize("NFKD")
     .replace(/\p{M}+/gu, "")
+    .replace(/\u200c/gu, "")
     .replace(/[\u0649\u064a]/gu, "\u06cc")
     .replace(/\u0643/gu, "\u06a9")
     .toLowerCase();
