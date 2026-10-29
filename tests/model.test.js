@@ -1138,12 +1138,36 @@ test("updates settings through the revision contract", () => {
 
 test("creates readable Markdown while escaping active markup", () => {
   const note = createNote(
-    sample({ title: "<script>*test*</script>", body: "Plain <b>body</b>" }),
+    sample({
+      title: "<script>*test*</script>",
+      body: [
+        "Plain <b>body</b>",
+        "# Heading",
+        "- list item",
+        "1. ordered item",
+        "---",
+        "Setext heading",
+        "===",
+        "left | right",
+        "~~strike~~",
+        "    indented code",
+        "\ttabbed code",
+      ].join("\n"),
+    }),
     { idFactory: () => "note-1", now: START },
   );
   const markdown = notesToMarkdown([note]);
 
   assert.match(markdown, /## &lt;script&gt;\\\*test\\\*&lt;\/script&gt;/u);
   assert.match(markdown, /Plain &lt;b&gt;body&lt;\/b&gt;/u);
+  assert.match(markdown, /^\\# Heading$/mu);
+  assert.match(markdown, /^\\- list item$/mu);
+  assert.match(markdown, /^1\\\. ordered item$/mu);
+  assert.match(markdown, /^\\-\\-\\-$/mu);
+  assert.match(markdown, /^\\===$/mu);
+  assert.match(markdown, /^left \\\| right$/mu);
+  assert.match(markdown, /^\\~\\~strike\\~\\~$/mu);
+  assert.match(markdown, /^&#32; {3}indented code$/mu);
+  assert.match(markdown, /^&#9;tabbed code$/mu);
   assert.doesNotMatch(markdown, /<script>|<b>/u);
 });
