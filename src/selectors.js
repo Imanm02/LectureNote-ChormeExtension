@@ -1,4 +1,4 @@
-import { SORT_VALUES } from "./model.js";
+import { normalizeCourseKey, SORT_VALUES } from "./model.js";
 
 function searchText(value) {
   return String(value)
@@ -16,9 +16,9 @@ function compareIdentifiers(left, right) {
 
 export function selectNotes(notes, { query = "", course = "", sort = "updated-desc" } = {}) {
   const queryTokens = searchText(query).trim().split(/\s+/u).filter(Boolean);
-  const normalizedCourse = searchText(String(course).trim());
+  const normalizedCourse = normalizeCourseKey(String(course).trim());
   const selected = notes.filter((note) => {
-    const courseMatches = !normalizedCourse || searchText(note.course) === normalizedCourse;
+    const courseMatches = !normalizedCourse || normalizeCourseKey(note.course) === normalizedCourse;
     if (!courseMatches) {
       return false;
     }
@@ -60,7 +60,7 @@ export function listCourses(notes) {
     if (!note.course) {
       continue;
     }
-    const key = searchText(note.course);
+    const key = normalizeCourseKey(note.course);
     if (!values.has(key)) {
       values.set(key, note.course);
     }

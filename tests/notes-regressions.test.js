@@ -117,6 +117,8 @@ test("keeps state actions disabled after load failure and supports retry", async
     "emptyNewNoteButton",
     "searchInput",
     "courseFilter",
+    "manageCoursesButton",
+    "clearFiltersButton",
     "sortSelect",
     "themeSelect",
     "exportJsonButton",
@@ -962,6 +964,200 @@ test("sets and clears one course for selected notes in one revision", async (t) 
   );
 });
 
+test("merges a course across active notes and Trash with canonical spelling", async (t) => {
+  const source = note("source", "Source body", { title: "Source note", course: "Physics" });
+  const target = note("target", "Target body", { title: "Target note", course: "Math" });
+  const deleted = note("deleted", "Deleted body", { title: "Deleted note", course: "physics" });
+  const initialState = {
+    ...createEmptyState(),
+    revision: 4,
+    notes: [source, target],
+    trash: [{ note: deleted, deletedAt: START, originalIndex: 1 }],
+  };
+  const setup = await setupLibrary(
+    t,
+    [],
+    memoryStorage({ [STORAGE_KEYS.state]: initialState }),
+  );
+  const { controller, documentValue } = setup;
+  const courseFilter = documentValue.getElementById("courseFilter");
+  courseFilter.value = "Physics";
+  courseFilter.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  assert.equal(documentValue.getElementById("activeFilters").hidden, false);
+
+  documentValue.getElementById("manageCoursesButton").click();
+  assert.equal(documentValue.getElementById("manageCoursesDialog").open, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("manageCourseSelect"));
+  assert.equal(documentValue.getElementById("manageCourseSelect").value, "Physics");
+  assert.match(
+    documentValue.getElementById("manageCoursesMessage").textContent,
+    /1 active note and 1 Trash entry/u,
+  );
+
+  const input = documentValue.getElementById("manageCourseInput");
+  input.value = "math";
+  input.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  assert.match(documentValue.getElementById("manageCoursesPreview").textContent, /merge.*Math/iu);
+  submit(documentValue, "manageCoursesForm");
+  await waitFor(() => controller.getState().revision === 5);
+
+  assert.deepEqual(
+    controller.getState().notes.map((entry) => [entry.id, entry.course]),
+    [["source", "Math"], ["target", "Math"]],
+  );
+  assert.equal(controller.getState().trash[0].note.course, "Math");
+  assert.equal(controller.getState().notes.length, 2);
+  assert.equal(documentValue.getElementById("manageCoursesDialog").open, false);
+  assert.equal(courseFilter.value, "Math");
+  assert.match(documentValue.getElementById("activeFilterSummary").textContent, /Course: “Math”/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("manageCoursesButton"));
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /Updated 2 course labels/u);
+});
+
+test("clears a managed course from active notes and Trash", async (t) => {
+  const active = note("active", "Active body", { course: "Physics" });
+  const deleted = note("deleted", "Deleted body", { course: "physics" });
+  const setup = await setupLibrary(
+    t,
+    [],
+    memoryStorage({
+      [STORAGE_KEYS.state]: {
+        ...createEmptyState(),
+        notes: [active],
+        trash: [{ note: deleted, deletedAt: START, originalIndex: 0 }],
+      },
+    }),
+  );
+  const { controller, documentValue } = setup;
+  const courseFilter = documentValue.getElementById("courseFilter");
+  courseFilter.value = "Physics";
+  courseFilter.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+
+  documentValue.getElementById("manageCoursesButton").click();
+  documentValue.getElementById("clearManagedCourseButton").click();
+  await waitFor(() => controller.getState().revision === 1);
+
+  assert.equal(controller.getState().notes[0].course, "");
+  assert.equal(controller.getState().trash[0].note.course, "");
+  assert.equal(courseFilter.value, "");
+  assert.equal(documentValue.getElementById("activeFilters").hidden, true);
+  assert.equal(documentValue.getElementById("manageCoursesButton").disabled, true);
+  assert.equal(documentValue.activeElement, courseFilter);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /Cleared 2 course labels/u);
+});
+
+test("rejects a stale managed-course review but preserves unrelated changes", async (t) => {
+  const source = note("source", "Source body", { course: "Physics" });
+  const other = note("other", "Other body", { course: "History" });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [source, other] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+
+  documentValue.getElementById("manageCoursesButton").click();
+  const sourceSelect = documentValue.getElementById("manageCourseSelect");
+  sourceSelect.value = "Physics";
+  sourceSelect.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  storage.values[STORAGE_KEYS.state] = {
+    ...structuredClone(storage.values[STORAGE_KEYS.state]),
+    revision: 1,
+    notes: [
+      { ...source, body: "Changed elsewhere", updatedAt: "2026-09-20T11:00:00.000Z" },
+      other,
+    ],
+  };
+  const input = documentValue.getElementById("manageCourseInput");
+  input.value = "Mechanics";
+  input.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "manageCoursesForm");
+  await waitFor(() => documentValue.getElementById("manageCoursesDialog").open === false);
+
+  assert.equal(controller.getState().notes[0].body, "Changed elsewhere");
+  assert.equal(controller.getState().notes[0].course, "Physics");
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /changed in another window/u);
+
+  documentValue.getElementById("manageCoursesButton").click();
+  sourceSelect.value = "Physics";
+  sourceSelect.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  storage.values[STORAGE_KEYS.state] = {
+    ...structuredClone(storage.values[STORAGE_KEYS.state]),
+    revision: 2,
+    notes: [
+      storage.values[STORAGE_KEYS.state].notes[0],
+      { ...other, body: "Unrelated change", updatedAt: "2026-09-20T12:00:00.000Z" },
+    ],
+  };
+  input.value = "Mechanics";
+  input.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "manageCoursesForm");
+  await waitFor(() => controller.getState().revision === 3);
+
+  assert.equal(controller.getState().notes[0].course, "Mechanics");
+  assert.equal(controller.getState().notes[1].body, "Unrelated change");
+});
+
+test("closes course management when matching records change externally", async (t) => {
+  const source = note("source", "Source body", { course: "Physics" });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [source] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, controller, documentValue } = setup;
+  documentValue.getElementById("manageCoursesButton").click();
+  const previous = controller.getState();
+  const external = {
+    ...structuredClone(previous),
+    revision: previous.revision + 1,
+    notes: [...previous.notes, note("new", "New body", { course: "physics" })],
+  };
+  storage.values[STORAGE_KEYS.state] = external;
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.state]: { oldValue: previous, newValue: external },
+  });
+
+  assert.equal(documentValue.getElementById("manageCoursesDialog").open, false);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("manageCoursesButton"));
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /review it again/u);
+  assert.equal(controller.getState().notes.length, 2);
+});
+
+test("closes course management when the reviewed merge target changes", async (t) => {
+  const source = note("source", "Source body", { course: "Physics" });
+  const target = note("target", "Target body", { course: "Math" });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [source, target] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, controller, documentValue } = setup;
+
+  documentValue.getElementById("manageCoursesButton").click();
+  const select = documentValue.getElementById("manageCourseSelect");
+  select.value = "Physics";
+  select.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  const input = documentValue.getElementById("manageCourseInput");
+  input.value = "math";
+  input.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  assert.match(documentValue.getElementById("manageCoursesPreview").textContent, /merge.*Math/iu);
+
+  const previous = controller.getState();
+  const external = {
+    ...structuredClone(previous),
+    revision: previous.revision + 1,
+    notes: [source, { ...target, course: "Algebra", updatedAt: "2026-09-20T11:00:00.000Z" }],
+  };
+  storage.values[STORAGE_KEYS.state] = external;
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.state]: { oldValue: previous, newValue: external },
+  });
+
+  assert.equal(documentValue.getElementById("manageCoursesDialog").open, false);
+  assert.equal(controller.getState().notes[0].course, "Physics");
+  assert.equal(controller.getState().notes[1].course, "Algebra");
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /review it again/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("manageCoursesButton"));
+});
+
 test("keeps selection focus stable when a bulk course change prunes results", async (t) => {
   const setup = await setupLibrary(t, [
     note("physics", "First body", { title: "First", course: "Quantum Mechanics" }),
@@ -1639,6 +1835,35 @@ test("closes a reset review when another window resets the data", async (t) => {
   assert.deepEqual(storage.values[STORAGE_KEYS.state], resetState);
 });
 
+test("closes course management when another window resets the data", async (t) => {
+  const original = note("saved", "Saved body", { course: "Physics" });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "course-dialog-before",
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, controller, documentValue } = setup;
+  documentValue.getElementById("manageCoursesButton").click();
+  assert.equal(documentValue.getElementById("manageCoursesDialog").open, true);
+
+  const resetState = createEmptyState();
+  storage.values[STORAGE_KEYS.dataEpoch] = "course-dialog-after";
+  storage.values[STORAGE_KEYS.state] = resetState;
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.dataEpoch]: {
+      oldValue: "course-dialog-before",
+      newValue: "course-dialog-after",
+    },
+    [STORAGE_KEYS.state]: { oldValue: controller.getState(), newValue: resetState },
+  });
+
+  assert.equal(documentValue.getElementById("manageCoursesDialog").open, false);
+  assert.equal(documentValue.getElementById("manageCoursesButton").disabled, true);
+  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
+  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+});
+
 test("discards an import file that finishes reading after reset", async (t) => {
   const storage = memoryStorage({
     [STORAGE_KEYS.dataEpoch]: "import-reset-before",
@@ -1876,6 +2101,42 @@ test("suggests saved courses and labels the active date sort", async (t) => {
 
   assert.match(documentValue.querySelector(".note-time").textContent, /^Created /u);
   assert.match(documentValue.querySelector(".note-time").title, /^Created /u);
+});
+
+test("keeps active filters visible with results and clears them together", async (t) => {
+  const setup = await setupLibrary(t, [
+    note("matrix", "Matrix methods", { title: "Matrix lecture", course: "Physics" }),
+    note("history", "Ancient history", { title: "History lecture", course: "History" }),
+  ]);
+  const { documentValue } = setup;
+  const course = documentValue.getElementById("courseFilter");
+  course.value = "Physics";
+  course.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  const search = documentValue.getElementById("searchInput");
+  search.value = "matrix";
+  search.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  await waitFor(() => documentValue.querySelectorAll("#activeFilterSummary bdi").length === 2);
+  assert.equal(documentValue.getElementById("resultSummary").textContent, "1 matching note (2 total)");
+
+  const activeFilters = documentValue.getElementById("activeFilters");
+  assert.equal(activeFilters.hidden, false);
+  assert.deepEqual(
+    [...documentValue.querySelectorAll("#activeFilterSummary bdi")].map((value) => value.textContent),
+    ["matrix", "Physics"],
+  );
+  assert.equal(documentValue.getElementById("clearFiltersButton").disabled, false);
+
+  search.value = "not present";
+  search.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  await waitFor(() => documentValue.getElementById("noResultsState").hidden === false);
+  assert.equal(activeFilters.hidden, false);
+  documentValue.getElementById("clearFiltersButton").click();
+
+  assert.equal(search.value, "");
+  assert.equal(course.value, "");
+  assert.equal(activeFilters.hidden, true);
+  assert.equal(documentValue.querySelectorAll(".note-card").length, 2);
+  assert.equal(documentValue.activeElement, search);
 });
 
 test("exports only the current filtered view as Markdown", async (t) => {

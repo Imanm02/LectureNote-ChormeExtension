@@ -664,8 +664,8 @@ function timestampNotBeforeNotes(timestamp, notes) {
   );
 }
 
-function normalizedCourseKey(value) {
-  return value
+export function normalizeCourseKey(value) {
+  return String(value)
     .normalize("NFKD")
     .replace(/\p{M}+/gu, "")
     .replace(/\u200c/gu, "")
@@ -793,11 +793,18 @@ export function renameCourse(stateValue, courseValue, replacementValue, options 
   const now = operationTimestamp(options);
   const state = normalizeState(stateValue, { ...options, now });
   const course = normalizeSingleLine(courseValue, "Course", LIMITS.course, { required: true });
-  const replacement = normalizeSingleLine(replacementValue, "Course", LIMITS.course);
-  const courseKey = normalizedCourseKey(course);
-  const matchingNotes = state.notes.filter((note) => normalizedCourseKey(note.course) === courseKey);
+  const requestedReplacement = normalizeSingleLine(replacementValue, "Course", LIMITS.course);
+  const courseKey = normalizeCourseKey(course);
+  const requestedReplacementKey = normalizeCourseKey(requestedReplacement);
+  const existingReplacement = requestedReplacementKey && requestedReplacementKey !== courseKey
+    ? [...state.notes, ...state.trash.map((entry) => entry.note)].find(
+        (note) => normalizeCourseKey(note.course) === requestedReplacementKey,
+      )
+    : null;
+  const replacement = existingReplacement?.course || requestedReplacement;
+  const matchingNotes = state.notes.filter((note) => normalizeCourseKey(note.course) === courseKey);
   const matchingEntries = state.trash.filter(
-    (entry) => normalizedCourseKey(entry.note.course) === courseKey,
+    (entry) => normalizeCourseKey(entry.note.course) === courseKey,
   );
   if (matchingNotes.length + matchingEntries.length === 0) {
     throw new ValidationError("That course no longer exists.", "course-missing");

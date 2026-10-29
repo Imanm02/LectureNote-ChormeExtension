@@ -30,12 +30,13 @@
           <span class="label-row"><span>Search notes</span><span class="key-hint" aria-hidden="true">/</span></span>
           <input id="searchInput" type="search" autocomplete="off" placeholder="Title, text, course, or source" disabled>
         </label>
-        <label class="field" for="courseFilter">
-          <span>Course</span>
+        <div class="field course-filter-field">
+          <label for="courseFilter">Course</label>
           <select id="courseFilter" disabled>
             <option value="">All courses</option>
           </select>
-        </label>
+          <button id="manageCoursesButton" class="button button-quiet compact" type="button" disabled>Manage courses</button>
+        </div>
         <label class="field" for="sortSelect">
           <span>Sort</span>
           <select id="sortSelect" disabled>
@@ -53,6 +54,11 @@
             <option value="dark">Dark</option>
           </select>
         </label>
+      </section>
+
+      <section id="activeFilters" class="active-filters" aria-label="Active filters" hidden>
+        <p id="activeFilterSummary"></p>
+        <button id="clearFiltersButton" class="button button-secondary compact" type="button" disabled>Clear filters</button>
       </section>
 
       <nav class="library-view-switch" aria-label="Library sections">
@@ -156,8 +162,7 @@
 
       <section id="noResultsState" class="empty-state" hidden>
         <h2>No matching notes</h2>
-        <p>Try a different search or course filter.</p>
-        <button id="clearFiltersButton" class="button button-secondary" type="button">Clear filters</button>
+        <p>Try a different search or course filter, or clear the active filters above.</p>
       </section>
 
       <section id="notesList" class="notes-grid" aria-label="Saved notes"></section>
@@ -393,6 +398,34 @@
         <footer class="dialog-actions">
           <button id="cancelBulkConfirmButton" class="button button-secondary" type="button">Cancel</button>
           <button id="confirmBulkActionButton" class="button button-danger" type="submit">Continue</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog id="manageCoursesDialog" class="dialog compact-dialog" aria-labelledby="manageCoursesHeading" aria-describedby="manageCoursesMessage manageCoursesPreview manageCoursesStatus">
+      <form id="manageCoursesForm" class="dialog-form" novalidate>
+        <div class="dialog-content editor-fields">
+          <div>
+            <p class="eyebrow">Course labels</p>
+            <h2 id="manageCoursesHeading">Manage courses</h2>
+            <p id="manageCoursesMessage">Choose a course to review its use in active notes and Trash.</p>
+          </div>
+          <label class="field" for="manageCourseSelect">
+            <span>Course to change</span>
+            <select id="manageCourseSelect" required></select>
+          </label>
+          <label class="field" for="manageCourseInput">
+            <span>New course name</span>
+            <input id="manageCourseInput" type="text" maxlength="80" autocomplete="off" list="manageCourseSuggestions" dir="auto">
+          </label>
+          <datalist id="manageCourseSuggestions"></datalist>
+          <p id="manageCoursesPreview" class="field-hint">Enter a new name, or clear the course label.</p>
+          <p id="manageCoursesStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions stacked-actions">
+          <button id="cancelManageCoursesButton" class="button button-quiet" type="button">Cancel</button>
+          <button id="clearManagedCourseButton" class="button button-secondary" type="button">Clear course</button>
+          <button id="saveManagedCourseButton" class="button button-primary" type="submit">Save course</button>
         </footer>
       </form>
     </dialog>

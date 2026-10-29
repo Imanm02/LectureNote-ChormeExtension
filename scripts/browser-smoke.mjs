@@ -440,6 +440,7 @@ try {
   await library.locator(".note-card").nth(1).waitFor({ state: "detached" });
   assert.equal(await library.locator(".note-card").count(), 1);
   assert.equal(await library.locator("#resultSummary").textContent(), "1 matching note (2 total)");
+  assert.equal(await library.locator("#activeFilters").isVisible(), true);
 
   const markdownDownloadPromise = library.waitForEvent("download");
   await library.getByRole("button", { name: "Export view as Markdown" }).click();
@@ -450,9 +451,25 @@ try {
   assert.match(markdown, /ماتریس/u);
   assert.doesNotMatch(markdown, /Graph basics/u);
 
-  await library.locator("#searchInput").fill("");
+  await library.getByRole("button", { name: "Clear filters" }).click();
+  await library.locator("#activeFilters").waitFor({ state: "hidden" });
   await library.getByRole("heading", { name: "Graph basics" }).waitFor();
   await library.locator(".note-card").nth(1).waitFor();
+
+  await library.getByRole("button", { name: "Manage courses" }).click();
+  await library.locator("#manageCourseSelect").selectOption("CS 101");
+  assert.match(
+    await library.locator("#manageCoursesMessage").textContent(),
+    /1 active note and 0 Trash entries/u,
+  );
+  await library.locator("#manageCourseInput").fill("Computer Science");
+  await library.locator("#manageCoursesForm").getByRole("button", { name: "Save course" }).click();
+  await library.locator("#libraryStatus").filter({ hasText: "Updated 1 course label" }).waitFor();
+  await library.locator("#courseFilter").selectOption("Computer Science");
+  await library.locator("#activeFilterSummary").filter({ hasText: "Computer Science" }).waitFor();
+  assert.equal(await library.locator(".note-card").count(), 1);
+  await library.getByRole("button", { name: "Clear filters" }).click();
+  await library.getByRole("heading", { name: "ماتریس" }).waitFor();
 
   const graphCard = library.locator(".note-card", { hasText: "Graph basics" });
   await graphCard.getByRole("button", { name: "Edit" }).click();
@@ -607,7 +624,7 @@ try {
   const shortcutResult = shortcutCaptureVerified
     ? " Action shortcut capture also passed."
     : " Headless Chromium did not expose the action popup.";
-  console.log(`Browser smoke test passed: selection handling, popup and editor draft recovery, persistence, CRUD, search, Trash-aware backup and restore, theme, undo, and local data reset.${shortcutResult}`);
+  console.log(`Browser smoke test passed: selection handling, popup and editor draft recovery, persistence, CRUD, search, active filters, course management, Trash-aware backup and restore, theme, undo, and local data reset.${shortcutResult}`);
 } finally {
   await context?.close().catch(() => undefined);
   await closeFixtureServer(fixtureServer).catch(() => undefined);

@@ -14,8 +14,10 @@ import {
   measureLibraryUsage,
   moveNoteToTrash,
   moveNotesToTrash,
+  normalizeCourseKey,
   permanentlyDeleteTrashedNote,
   permanentlyDeleteTrashedNotes,
+  renameCourse,
   restoreTrashedNote,
   restoreTrashedNotes,
   updateNote,
@@ -62,6 +64,7 @@ function libraryElements(documentValue) {
     emptyNewNote: requiredElement(documentValue, "emptyNewNoteButton"),
     search: requiredElement(documentValue, "searchInput"),
     course: requiredElement(documentValue, "courseFilter"),
+    manageCourses: requiredElement(documentValue, "manageCoursesButton"),
     courseSuggestions: requiredElement(documentValue, "editorCourseSuggestions"),
     sort: requiredElement(documentValue, "sortSelect"),
     theme: requiredElement(documentValue, "themeSelect"),
@@ -93,6 +96,8 @@ function libraryElements(documentValue) {
     storageUsageWarning: requiredElement(documentValue, "storageUsageWarning"),
     includeSourceOnShare: requiredElement(documentValue, "includeSourceOnShare"),
     clearLocalData: requiredElement(documentValue, "clearLocalDataButton"),
+    activeFilters: requiredElement(documentValue, "activeFilters"),
+    activeFilterSummary: requiredElement(documentValue, "activeFilterSummary"),
     summary: requiredElement(documentValue, "resultSummary"),
     status: requiredElement(documentValue, "libraryStatus"),
     retryLoad: requiredElement(documentValue, "retryLoadButton"),
@@ -188,6 +193,17 @@ function libraryElements(documentValue) {
     bulkConfirmStatus: requiredElement(documentValue, "bulkConfirmStatus"),
     cancelBulkConfirm: requiredElement(documentValue, "cancelBulkConfirmButton"),
     confirmBulkAction: requiredElement(documentValue, "confirmBulkActionButton"),
+    manageCoursesDialog: requiredElement(documentValue, "manageCoursesDialog"),
+    manageCoursesForm: requiredElement(documentValue, "manageCoursesForm"),
+    manageCourseSelect: requiredElement(documentValue, "manageCourseSelect"),
+    manageCourseInput: requiredElement(documentValue, "manageCourseInput"),
+    manageCourseSuggestions: requiredElement(documentValue, "manageCourseSuggestions"),
+    manageCoursesMessage: requiredElement(documentValue, "manageCoursesMessage"),
+    manageCoursesPreview: requiredElement(documentValue, "manageCoursesPreview"),
+    manageCoursesStatus: requiredElement(documentValue, "manageCoursesStatus"),
+    cancelManageCourses: requiredElement(documentValue, "cancelManageCoursesButton"),
+    clearManagedCourse: requiredElement(documentValue, "clearManagedCourseButton"),
+    saveManagedCourse: requiredElement(documentValue, "saveManagedCourseButton"),
     resetDialog: requiredElement(documentValue, "resetDialog"),
     resetForm: requiredElement(documentValue, "resetForm"),
     resetMessage: requiredElement(documentValue, "resetMessage"),
@@ -315,6 +331,9 @@ export async function initLibrary({
   let selectionReturnFocus = null;
   let pendingBulkCourse = null;
   let pendingBulkAction = null;
+  let pendingManagedCourse = null;
+  let pendingManagedTarget = null;
+  let manageCourseBusy = false;
   let resetSnapshot = null;
   let resetInFlight = false;
   let resetExportInFlight = false;
@@ -322,6 +341,7 @@ export async function initLibrary({
   let resetOutcomeUnknown = false;
   let resetReturnFocus = null;
   let courseSignature = "";
+  let managedCourseSignature = "";
   let ready = false;
   let hashHandled = false;
   let destroyed = false;
@@ -524,6 +544,7 @@ export async function initLibrary({
       elements.emptyNewNote,
       elements.search,
       elements.course,
+      elements.manageCourses,
       elements.sort,
       elements.theme,
       elements.notesView,
@@ -542,6 +563,7 @@ export async function initLibrary({
       elements.importButton,
       elements.includeSourceOnShare,
       elements.clearLocalData,
+      elements.clearFilters,
       elements.showMore,
       elements.resumeEditorDraft,
       elements.discardEditorDraft,
@@ -550,6 +572,13 @@ export async function initLibrary({
       control.disabled = !available;
     }
     elements.emptyTrash.disabled = !available || !state || state.trash.length === 0;
+    const courseCount = state
+      ? listCourses([...state.notes, ...state.trash.map((entry) => entry.note)]).length
+      : 0;
+    elements.manageCourses.disabled = !available || courseCount === 0;
+    elements.clearFilters.disabled = !available || !(
+      elements.search.value.trim() || elements.course.value
+    );
     const viewTotal = !state ? 0 : viewMode === "trash" ? state.trash.length : state.notes.length;
     elements.selectionMode.disabled = !available || viewTotal === 0;
     elements.list.inert = !available;
@@ -714,6 +743,203 @@ export async function initLibrary({
     elements.course.value = [...elements.course.options].some((option) => option.value === selected)
       ? selected
       : "";
+  }
+
+  function allCourseNotes(stateValue = state) {
+    if (!stateValue) {
+      return [];
+    }
+    return [...stateValue.notes, ...stateValue.trash.map((entry) => entry.note)];
+  }
+
+  function matchingCourseReview(stateValue, course) {
+    const courseKey = normalizeCourseKey(course);
+    const notes = stateValue.notes.filter(
+      (note) => normalizeCourseKey(note.course) === courseKey,
+    );
+    const trash = stateValue.trash.filter(
+      (entry) => normalizeCourseKey(entry.note.course) === courseKey,
+    );
+    return {
+      course,
+      courseKey,
+      notes,
+      trash,
+      signature: JSON.stringify({ notes, trash }),
+    };
+  }
+
+  function assertMatchingCourseReview(stateValue, review) {
+    const current = matchingCourseReview(stateValue, review.course);
+    if (current.signature !== review.signature) {
+      throw new ValidationError(
+        "That course changed in another window. Review it again before saving.",
+        "course-conflict",
+      );
+    }
+  }
+
+  function renderManagedCourseOptions() {
+    const courses = listCourses(allCourseNotes());
+    const signature = JSON.stringify(courses);
+    elements.manageCourses.disabled = !ready || courses.length === 0;
+    if (signature === managedCourseSignature) {
+      return courses;
+    }
+    managedCourseSignature = signature;
+    const selectedKey = normalizeCourseKey(elements.manageCourseSelect.value);
+    const placeholder = documentValue.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = courses.length === 0 ? "No courses available" : "Choose a course";
+    elements.manageCourseSelect.replaceChildren(placeholder);
+    elements.manageCourseSuggestions.replaceChildren();
+    for (const course of courses) {
+      const option = documentValue.createElement("option");
+      option.value = course;
+      option.textContent = course;
+      elements.manageCourseSelect.append(option);
+
+      const suggestion = documentValue.createElement("option");
+      suggestion.value = course;
+      elements.manageCourseSuggestions.append(suggestion);
+    }
+    const selected = courses.find((course) => normalizeCourseKey(course) === selectedKey) || "";
+    elements.manageCourseSelect.value = selected;
+    return courses;
+  }
+
+  function appendIsolatedText(element, prefix, value, suffix = "") {
+    const isolated = documentValue.createElement("bdi");
+    isolated.dir = "auto";
+    isolated.textContent = value;
+    element.append(prefix, isolated, suffix);
+  }
+
+  function renderActiveFilters() {
+    const query = elements.search.value.trim();
+    const course = elements.course.value;
+    const hasFilters = Boolean(query || course);
+    elements.activeFilters.hidden = !hasFilters;
+    elements.clearFilters.disabled = !ready || !hasFilters;
+    elements.activeFilterSummary.replaceChildren();
+    if (!hasFilters) {
+      return;
+    }
+    if (query) {
+      appendIsolatedText(elements.activeFilterSummary, "Search: “", query, "”");
+    }
+    if (query && course) {
+      elements.activeFilterSummary.append("; ");
+    }
+    if (course) {
+      appendIsolatedText(elements.activeFilterSummary, "Course: “", course, "”");
+    }
+  }
+
+  function renderManagedCourseCounts(review) {
+    const activeCount = review.notes.length;
+    const trashCount = review.trash.length;
+    elements.manageCoursesMessage.replaceChildren();
+    appendIsolatedText(elements.manageCoursesMessage, "Course “", review.course, "” is used by ");
+    elements.manageCoursesMessage.append(
+      `${numberFormatter.format(activeCount)} active ${noteWord(activeCount)} and ${numberFormatter.format(trashCount)} ${trashWord(trashCount)}. Changing it updates every matching label; notes stay separate.`,
+    );
+  }
+
+  function updateManagedCoursePreview() {
+    const replacement = elements.manageCourseInput.value;
+    pendingManagedTarget = null;
+    elements.manageCourseInput.removeAttribute("aria-invalid");
+    elements.saveManagedCourse.disabled = true;
+    if (!pendingManagedCourse) {
+      elements.manageCoursesPreview.textContent = "Choose a course before making changes.";
+      return;
+    }
+    if (!replacement.trim()) {
+      elements.manageCoursesPreview.textContent = "Enter a new name, or choose Clear course.";
+      return;
+    }
+    try {
+      const preview = renameCourse(state, pendingManagedCourse.course, replacement);
+      const target = matchingCourseReview(state, preview.replacement);
+      const merging = preview.replacement &&
+        normalizeCourseKey(preview.replacement) !== pendingManagedCourse.courseKey &&
+        target.notes.length + target.trash.length > 0;
+      if (
+        preview.replacement &&
+        normalizeCourseKey(preview.replacement) !== pendingManagedCourse.courseKey
+      ) {
+        pendingManagedTarget = {
+          ...target,
+          replacementKey: normalizeCourseKey(preview.replacement),
+        };
+      }
+      elements.manageCoursesPreview.replaceChildren();
+      appendIsolatedText(
+        elements.manageCoursesPreview,
+        merging ? "This will merge the label into “" : "This will rename the label to “",
+        preview.replacement,
+        merging ? "”. Existing notes stay separate." : "” on every matching note.",
+      );
+      elements.saveManagedCourse.disabled = manageCourseBusy;
+    } catch (error) {
+      elements.manageCoursesPreview.textContent = errorMessage(error);
+      if (!(error instanceof ValidationError) || error.code !== "course-unchanged") {
+        elements.manageCourseInput.setAttribute("aria-invalid", "true");
+      }
+    }
+  }
+
+  function reviewManagedCourse() {
+    const course = elements.manageCourseSelect.value;
+    if (!course || !state) {
+      pendingManagedCourse = null;
+      pendingManagedTarget = null;
+      elements.manageCourseInput.value = "";
+      elements.manageCourseInput.disabled = true;
+      elements.clearManagedCourse.disabled = true;
+      elements.saveManagedCourse.disabled = true;
+      elements.manageCoursesMessage.textContent = "Choose a course to review its use in active notes and Trash.";
+      elements.manageCoursesPreview.textContent = "Enter a new name, or clear the course label.";
+      return;
+    }
+    pendingManagedCourse = matchingCourseReview(state, course);
+    pendingManagedTarget = null;
+    renderManagedCourseCounts(pendingManagedCourse);
+    elements.manageCourseInput.disabled = manageCourseBusy;
+    elements.manageCourseInput.value = course;
+    elements.clearManagedCourse.disabled = manageCourseBusy;
+    setStatus(elements.manageCoursesStatus, "", "info");
+    updateManagedCoursePreview();
+  }
+
+  function refreshManagedCourseReview() {
+    if (
+      manageCourseBusy ||
+      !elements.manageCoursesDialog.open ||
+      !pendingManagedCourse ||
+      !state
+    ) {
+      return;
+    }
+    const current = matchingCourseReview(state, pendingManagedCourse.course);
+    const currentTarget = pendingManagedTarget
+      ? matchingCourseReview(state, pendingManagedTarget.course)
+      : null;
+    if (
+      current.signature === pendingManagedCourse.signature &&
+      (!currentTarget || currentTarget.signature === pendingManagedTarget.signature)
+    ) {
+      return;
+    }
+    pendingManagedCourse = null;
+    pendingManagedTarget = null;
+    closeDialog(elements.manageCoursesDialog);
+    setStatus(
+      elements.status,
+      "That course changed in another window. Open Manage courses and review it again.",
+      "warning",
+    );
   }
 
   function createNoteCard(note) {
@@ -883,6 +1109,8 @@ export async function initLibrary({
       selectionReturnFocus = null;
     }
     renderCourseOptions();
+    renderManagedCourseOptions();
+    refreshManagedCourseReview();
     elements.sort.value = state.settings.sort;
     elements.sort.options[0].textContent = viewMode === "trash" ? "Recently deleted" : "Recently updated";
     elements.theme.value = state.settings.theme;
@@ -899,6 +1127,7 @@ export async function initLibrary({
     const total = viewMode === "trash" ? state.trash.length : state.notes.length;
     const hasNotes = total > 0;
     const hasFilters = Boolean(elements.search.value.trim() || elements.course.value);
+    renderActiveFilters();
     elements.notesView.setAttribute("aria-pressed", String(viewMode === "notes"));
     elements.trashView.setAttribute("aria-pressed", String(viewMode === "trash"));
     elements.notesView.classList.toggle("button-secondary", viewMode === "notes");
@@ -2203,6 +2432,145 @@ export async function initLibrary({
     }
   }
 
+  function setManageCourseBusy(busy) {
+    manageCourseBusy = busy;
+    elements.manageCoursesForm.setAttribute("aria-busy", String(busy));
+    elements.manageCourseSelect.disabled = busy;
+    elements.manageCourseInput.disabled = busy || !pendingManagedCourse;
+    elements.cancelManageCourses.disabled = busy;
+    elements.clearManagedCourse.disabled = busy || !pendingManagedCourse;
+    elements.saveManagedCourse.disabled = true;
+    if (!busy) {
+      updateManagedCoursePreview();
+    }
+  }
+
+  function openManageCoursesDialog() {
+    if (!ready || !state) {
+      return;
+    }
+    const courses = renderManagedCourseOptions();
+    if (courses.length === 0) {
+      return;
+    }
+    const filteredCourseKey = normalizeCourseKey(elements.course.value);
+    const initialCourse = courses.find(
+      (course) => normalizeCourseKey(course) === filteredCourseKey,
+    ) || courses[0];
+    elements.manageCourseSelect.value = initialCourse;
+    setStatus(elements.manageCoursesStatus, "", "info");
+    showDialog(elements.manageCoursesDialog);
+    reviewManagedCourse();
+    elements.manageCourseSelect.focus();
+  }
+
+  async function refreshAfterManagedCourseConflict(error) {
+    try {
+      state = await readStateForPage();
+      pendingManagedCourse = null;
+      closeDialog(elements.manageCoursesDialog);
+      render();
+      setStatus(elements.status, errorMessage(error), "warning");
+      if (!elements.manageCourses.disabled) {
+        elements.manageCourses.focus();
+      } else {
+        elements.course.focus();
+      }
+    } catch (readError) {
+      pendingManagedCourse = null;
+      closeDialog(elements.manageCoursesDialog);
+      reportActionError(readError);
+      if (isDataResetError(readError)) {
+        elements.retryLoad.focus();
+      }
+    }
+  }
+
+  async function applyManagedCourse(replacement) {
+    if (!pendingManagedCourse || !state || manageCourseBusy) {
+      return;
+    }
+    const review = pendingManagedCourse;
+    let preview;
+    let targetReview = null;
+    try {
+      preview = renameCourse(state, review.course, replacement);
+      if (
+        preview.replacement &&
+        normalizeCourseKey(preview.replacement) !== review.courseKey
+      ) {
+        const replacementKey = normalizeCourseKey(preview.replacement);
+        targetReview = pendingManagedTarget?.replacementKey === replacementKey
+          ? pendingManagedTarget
+          : matchingCourseReview(state, preview.replacement);
+      }
+    } catch (error) {
+      reportActionError(error, elements.manageCoursesStatus);
+      elements.manageCourseInput.focus();
+      return;
+    }
+
+    setManageCourseBusy(true);
+    setStatus(elements.manageCoursesStatus, "", "info");
+    const filterFollowsCourse = normalizeCourseKey(elements.course.value) === review.courseKey;
+    try {
+      const result = await mutateState(
+        (current) => {
+          assertMatchingCourseReview(current, review);
+          if (targetReview) {
+            assertMatchingCourseReview(current, targetReview);
+          }
+          return renameCourse(current, review.course, replacement);
+        },
+        storage,
+        expectedEpochOptions(),
+      );
+      state = result.state;
+      pendingManagedCourse = null;
+      pendingManagedTarget = null;
+      closeDialog(elements.manageCoursesDialog);
+      if (filterFollowsCourse) {
+        elements.course.value = result.replacement;
+      }
+      render();
+      const scope = `${numberFormatter.format(result.activeChanged)} active ${noteWord(result.activeChanged)} and ${numberFormatter.format(result.trashChanged)} ${trashWord(result.trashChanged)}`;
+      if (result.replacement) {
+        setStatusWithValue(
+          elements.status,
+          `Updated ${numberFormatter.format(result.changed)} course ${result.changed === 1 ? "label" : "labels"} to “`,
+          result.replacement,
+          `” (${scope}).`,
+          "success",
+        );
+      } else {
+        setStatus(
+          elements.status,
+          `Cleared ${numberFormatter.format(result.changed)} course ${result.changed === 1 ? "label" : "labels"} (${scope}).`,
+          "success",
+        );
+      }
+      (!elements.manageCourses.disabled ? elements.manageCourses : elements.course).focus();
+    } catch (error) {
+      if (isDataResetError(error)) {
+        pendingManagedCourse = null;
+        pendingManagedTarget = null;
+        closeDialog(elements.manageCoursesDialog);
+        reportActionError(error);
+        elements.retryLoad.focus();
+      } else if (
+        error instanceof ValidationError &&
+        ["course-conflict", "course-missing", "state-conflict"].includes(error.code)
+      ) {
+        await refreshAfterManagedCourseConflict(error);
+      } else {
+        reportActionError(error, elements.manageCoursesStatus);
+        elements.manageCourseInput.focus();
+      }
+    } finally {
+      setManageCourseBusy(false);
+    }
+  }
+
   function openBulkCourseDialog() {
     try {
       const snapshot = selectedRecordSnapshot();
@@ -2727,6 +3095,7 @@ export async function initLibrary({
   elements.clearLocalData.addEventListener("click", (event) =>
     openResetDialog(event.currentTarget),
   );
+  elements.manageCourses.addEventListener("click", openManageCoursesDialog);
   elements.search.addEventListener("input", () => {
     if (searchTimer !== null) {
       timerApi.clearTimeout(searchTimer);
@@ -3005,6 +3374,43 @@ export async function initLibrary({
   });
   elements.bulkCourseDialog.addEventListener("cancel", (event) => {
     if (elements.applyBulkCourse.disabled) {
+      event.preventDefault();
+    }
+  });
+
+  elements.manageCoursesForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const replacement = elements.manageCourseInput.value;
+    if (!replacement.trim()) {
+      setStatus(
+        elements.manageCoursesStatus,
+        "Enter a new course name, or choose Clear course.",
+        "warning",
+      );
+      elements.manageCourseInput.focus();
+      return;
+    }
+    void applyManagedCourse(replacement);
+  });
+  elements.manageCourseSelect.addEventListener("change", reviewManagedCourse);
+  elements.manageCourseInput.addEventListener("input", () => {
+    setStatus(elements.manageCoursesStatus, "", "info");
+    updateManagedCoursePreview();
+  });
+  elements.clearManagedCourse.addEventListener("click", () => void applyManagedCourse(""));
+  elements.cancelManageCourses.addEventListener("click", () =>
+    closeDialog(elements.manageCoursesDialog),
+  );
+  elements.manageCoursesDialog.addEventListener("close", () => {
+    pendingManagedCourse = null;
+    pendingManagedTarget = null;
+    setManageCourseBusy(false);
+    if (ready) {
+      (!elements.manageCourses.disabled ? elements.manageCourses : elements.course).focus();
+    }
+  });
+  elements.manageCoursesDialog.addEventListener("cancel", (event) => {
+    if (manageCourseBusy) {
       event.preventDefault();
     }
   });
@@ -3289,12 +3695,18 @@ export async function initLibrary({
       changes[STORAGE_KEYS.dataEpoch].newValue !== dataEpoch
     ) {
       const resetDialogWasOpen = elements.resetDialog.open;
+      const manageCourseDialogWasOpen = elements.manageCoursesDialog.open;
       if (resetDialogWasOpen) {
         resetReturnFocus = null;
         closeDialog(elements.resetDialog);
       }
+      if (manageCourseDialogWasOpen) {
+        pendingManagedCourse = null;
+        pendingManagedTarget = null;
+        closeDialog(elements.manageCoursesDialog);
+      }
       markDataResetConflict();
-      if (resetDialogWasOpen) {
+      if (resetDialogWasOpen || manageCourseDialogWasOpen) {
         elements.retryLoad.focus();
       }
       return;

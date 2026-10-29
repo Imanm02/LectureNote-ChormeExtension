@@ -236,6 +236,26 @@ test("merges course names and can clear the merged course", () => {
   assert.equal(cleared.state.revision, state.revision + 2);
 });
 
+test("uses stored target spelling for course merges and permits case-only renames", () => {
+  const source = createNote(sample({ title: "Source", body: "Source", course: "Physics" }), {
+    idFactory: () => "source",
+    now: START,
+  });
+  const target = createNote(sample({ title: "Target", body: "Target", course: "Data Science" }), {
+    idFactory: () => "target",
+    now: START,
+  });
+  const state = { ...createEmptyState(), notes: [source, target] };
+
+  const merged = renameCourse(state, "Physics", "data science", { now: LATER });
+  assert.equal(merged.replacement, "Data Science");
+  assert.deepEqual(merged.state.notes.map((note) => note.course), ["Data Science", "Data Science"]);
+
+  const renamed = renameCourse(merged.state, "data science", "DATA SCIENCE", { now: LATER });
+  assert.equal(renamed.replacement, "DATA SCIENCE");
+  assert.deepEqual(renamed.state.notes.map((note) => note.course), ["DATA SCIENCE", "DATA SCIENCE"]);
+});
+
 test("matches Persian course names with or without a zero-width non-joiner", () => {
   const stored = createNote(sample({ course: "روش‌های عددی" }), {
     idFactory: () => "persian-course",
