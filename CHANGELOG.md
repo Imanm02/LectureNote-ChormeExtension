@@ -6,6 +6,30 @@ This file records user-facing changes to Lecture Notes.
 
 No user-facing changes yet.
 
+## 2.1.1 - 2026-10-29
+
+### Changed
+
+- Made extension ZIP output identical across checkouts with different text line endings.
+- Added stable Chrome action-popup checks for the source extension and extracted release package.
+- Extended the local release gate to test real focused-frame toolbar capture in stable Chrome.
+
+### Fixed
+
+- Prevented title, source, capture, and imported text limits from splitting Unicode surrogate pairs.
+- Rejected unpaired surrogate halves during text normalization.
+- Detected duplicate notes across equivalent Persian and Arabic course spelling.
+- Escaped line-start and table syntax so plain note text stays literal in Markdown exports.
+- Opened a safe error surface when a context-menu capture cannot be queued.
+
+### Validation
+
+- Added static checks for duplicate IDs, broken ARIA references, unlabeled controls, unnamed buttons, and unsafe new-tab links.
+- Passed 335 automated tests with 87.15% line coverage, 80.96% branch coverage, and 89.76% function coverage.
+- Passed the dependency audit, ESLint, manifest validation, Chromium product smoke tests, stable Chrome action tests, package validation, and both packaged browser tests.
+- Validated the deterministic 23-file `lecture-notes-2.1.1.zip` package.
+- Recorded SHA-256 `b208bd2b4b13f8f78c6907373feb3bbeb163cfbf3daef10f936b2a0d5a8ceca2`.
+
 ## 2.1.0 - 2026-10-29
 
 ### Added

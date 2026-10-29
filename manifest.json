@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Lecture Notes",
   "short_name": "Lecture Notes",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "minimum_chrome_version": "116",
   "description": "Capture selected text and keep searchable lecture notes in local Chrome storage.",
   "permissions": ["activeTab", "contextMenus", "scripting", "sidePanel", "storage"],
