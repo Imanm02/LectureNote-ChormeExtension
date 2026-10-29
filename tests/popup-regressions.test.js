@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { LIMITS, createEmptyState, createNote } from "../src/model.js";
 import { initPopup } from "../src/popup.js";
-import { STORAGE_KEYS } from "../src/storage.js";
+import { loadDraft, STORAGE_KEYS } from "../src/storage.js";
 import { chromeMock, loadPage, memoryStorage, waitFor } from "./helpers.js";
 
 function input(windowValue, element) {
@@ -97,8 +97,8 @@ test("cancels a pending draft write after save", async () => {
   dom.window.dispatchEvent(new dom.window.Event("pagehide"));
   await controller.flushDraft();
 
-  assert.equal(draftWrites, 0);
-  assert.equal(STORAGE_KEYS.draft in storage.values, false);
+  assert.equal(draftWrites, 1);
+  assert.equal(await loadDraft(storage), null);
   controller.destroy();
   dom.window.close();
 });
@@ -122,7 +122,7 @@ test("clears an in-flight draft write after save", async () => {
   dom.window.dispatchEvent(new dom.window.Event("pagehide"));
   await controller.flushDraft();
 
-  assert.equal(STORAGE_KEYS.draft in blocked.storage.values, false);
+  assert.equal(await loadDraft(blocked.storage), null);
   controller.destroy();
   dom.window.close();
 });
@@ -152,8 +152,8 @@ test("cancels a pending draft write after discard", async () => {
   dom.window.dispatchEvent(new dom.window.Event("pagehide"));
   await controller.flushDraft();
 
-  assert.equal(draftWrites, 0);
-  assert.equal(STORAGE_KEYS.draft in storage.values, false);
+  assert.equal(draftWrites, 1);
+  assert.equal(await loadDraft(storage), null);
   controller.destroy();
   dom.window.close();
 });
@@ -177,18 +177,113 @@ test("clears an in-flight draft write after discard", async () => {
   dom.window.dispatchEvent(new dom.window.Event("pagehide"));
   await controller.flushDraft();
 
-  assert.equal(STORAGE_KEYS.draft in blocked.storage.values, false);
+  assert.equal(await loadDraft(blocked.storage), null);
   controller.destroy();
   dom.window.close();
 });
 
-test("keeps the clear-draft warning after a note is saved", async () => {
+test("falls back to direct storage when background handoff reports an error", async () => {
   const dom = loadPage("popup.html");
   const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
-  storage.remove = async (keys) => {
-    if ((Array.isArray(keys) ? keys : [keys]).includes(STORAGE_KEYS.draft)) {
-      throw new Error("Storage remove failed");
+  const chromeApi = chromeMock(storage);
+  chromeApi.runtime = {
+    async sendMessage() {
+      return { ok: false, error: "Background storage failed" };
+    },
+  };
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi,
+  });
+  const body = dom.window.document.getElementById("bodyInput");
+  body.value = "Keep this closing popup draft";
+  input(dom.window, body);
+
+  dom.window.dispatchEvent(new dom.window.Event("pagehide"));
+  await controller.flushDraft();
+
+  assert.equal((await loadDraft(storage)).body, "Keep this closing popup draft");
+  controller.destroy();
+  dom.window.close();
+});
+
+test("hands off a dirty draft when the popup becomes hidden", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const controller = await initPopup({
+    documentValue: dom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+  const body = dom.window.document.getElementById("bodyInput");
+  body.value = "Save before the popup closes";
+  input(dom.window, body);
+  Object.defineProperty(dom.window.document, "visibilityState", {
+    configurable: true,
+    value: "hidden",
+  });
+
+  dom.window.document.dispatchEvent(new dom.window.Event("visibilitychange"));
+  await controller.flushDraft();
+
+  assert.equal((await loadDraft(storage)).body, "Save before the popup closes");
+  controller.destroy();
+  dom.window.close();
+});
+
+test("keeps a newer draft when two popups edit at the same time", async () => {
+  const firstDom = loadPage("popup.html");
+  const secondDom = loadPage("popup.html");
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const first = await initPopup({
+    documentValue: firstDom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+  const second = await initPopup({
+    documentValue: secondDom.window.document,
+    chromeApi: chromeMock(storage),
+  });
+  const firstBody = firstDom.window.document.getElementById("bodyInput");
+  const secondBody = secondDom.window.document.getElementById("bodyInput");
+
+  firstBody.value = "Draft from the first popup";
+  input(firstDom.window, firstBody);
+  await first.flushDraft();
+  secondBody.value = "Draft from the stale popup";
+  input(secondDom.window, secondBody);
+  await second.flushDraft();
+
+  assert.equal((await loadDraft(storage)).body, "Draft from the first popup");
+  assert.match(
+    secondDom.window.document.getElementById("status").textContent,
+    /another popup saved a newer draft/iu,
+  );
+
+  submit(secondDom.window, secondDom.window.document.getElementById("noteForm"));
+  await waitFor(() => second.getState().notes.length === 1);
+  assert.equal((await loadDraft(storage)).body, "Draft from the first popup");
+  assert.equal(
+    secondDom.window.document.getElementById("status").textContent,
+    "Note saved. A newer draft from another popup was kept.",
+  );
+
+  first.destroy();
+  second.destroy();
+  firstDom.window.close();
+  secondDom.window.close();
+});
+
+test("does not save a note when its atomic draft cleanup fails", async () => {
+  const dom = loadPage("popup.html");
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const baseSet = storage.set.bind(storage);
+  storage.set = async (update) => {
+    if (
+      Object.hasOwn(update, STORAGE_KEYS.state) &&
+      Object.hasOwn(update, STORAGE_KEYS.draft)
+    ) {
+      throw new Error("Storage write failed");
     }
+    await baseSet(update);
   };
   const controller = await initPopup({
     documentValue: dom.window.document,
@@ -196,13 +291,11 @@ test("keeps the clear-draft warning after a note is saved", async () => {
   });
 
   submit(dom.window, dom.window.document.getElementById("noteForm"));
-  await waitFor(() => controller.getState().notes.length === 1);
-  await waitFor(() => dom.window.document.getElementById("status").dataset.kind === "warning");
+  await waitFor(() => dom.window.document.getElementById("status").dataset.kind === "error");
 
-  assert.equal(
-    dom.window.document.getElementById("status").textContent,
-    "Note saved, but the draft could not be cleared: Storage remove failed",
-  );
+  assert.equal(controller.getState().notes.length, 0);
+  assert.equal(storage.values[STORAGE_KEYS.state].notes.length, 0);
+  assert.equal(dom.window.document.getElementById("status").textContent, "Storage write failed");
   controller.destroy();
   dom.window.close();
 });
@@ -228,7 +321,7 @@ test("clears a recovered owned draft when it is saved immediately", async () => 
   await waitFor(() => controller.getState().notes.length === 1);
   await waitFor(() => dom.window.document.getElementById("status").textContent.startsWith("Note saved."));
 
-  assert.equal(STORAGE_KEYS.draft in storage.values, false);
+  assert.equal(await loadDraft(storage), null);
   controller.destroy();
   dom.window.close();
 });
@@ -254,7 +347,7 @@ test("clears a recovered owned draft when it is discarded immediately", async ()
   dom.window.document.getElementById("discardButton").click();
   await waitFor(() => dom.window.document.getElementById("status").textContent.startsWith("The draft was reset"));
 
-  assert.equal(STORAGE_KEYS.draft in storage.values, false);
+  assert.equal(await loadDraft(storage), null);
   controller.destroy();
   dom.window.close();
 });

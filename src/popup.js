@@ -2,12 +2,12 @@ import { captureActivePage, CaptureError } from "./capture.js";
 import { addNote, LIMITS, normalizeSource, ValidationError } from "./model.js";
 import { MESSAGE_TYPES } from "./messages.js";
 import {
-  clearDraft,
-  loadDraft,
+  clearPopupDraft,
+  loadPopupDraft,
   loadRecoveryInfo,
   loadState,
-  mutateState,
-  saveDraft,
+  mutateStateAndClearPopupDraft,
+  savePopupDraft,
   STORAGE_KEYS,
 } from "./storage.js";
 import { listCourses, selectNotes } from "./selectors.js";
@@ -65,10 +65,15 @@ export async function initPopup({
   let pageCapture = null;
   let draftTimer = null;
   let draftQueue = Promise.resolve();
+  let draftHandoff = Promise.resolve();
   let draftGeneration = 0;
   let draftDirty = false;
   let hasDiscardableDraft = false;
-  let storedDraftSessionId = "";
+  let draftCursor = {
+    ownerSessionId: "",
+    generation: 0,
+    contentGeneration: 0,
+  };
   let ready = false;
   let destroyed = false;
 
@@ -169,6 +174,14 @@ export async function initPopup({
     return operation;
   }
 
+  function updateDraftCursor(record) {
+    draftCursor = {
+      ownerSessionId: record.ownerSessionId,
+      generation: record.generation,
+      contentGeneration: record.contentGeneration,
+    };
+  }
+
   async function persistDraft() {
     if (destroyed || !ready || !draftDirty) {
       return;
@@ -180,8 +193,22 @@ export async function initPopup({
         if (destroyed || !draftDirty || generation !== draftGeneration) {
           return;
         }
-        const saved = await saveDraft(draft, storage);
-        storedDraftSessionId = saved?.sessionId || "";
+        const result = await savePopupDraft(draft, storage, {
+          sessionId: draftSessionId,
+          expectedOwnerSessionId: draftCursor.ownerSessionId,
+          expectedGeneration: draftCursor.generation,
+          contentGeneration: generation,
+        });
+        if (!result.saved) {
+          throw new ValidationError(
+            "Another popup saved a newer draft. This popup did not overwrite it.",
+            "popup-draft-conflict",
+          );
+        }
+        updateDraftCursor(result.record);
+        if (draftDirty && generation === draftGeneration) {
+          draftDirty = false;
+        }
       });
     } catch (error) {
       if (draftDirty && generation === draftGeneration) {
@@ -271,41 +298,40 @@ export async function initPopup({
     elements.duplicate.hidden = true;
     elements.body.removeAttribute("aria-invalid");
     setBusy(true);
+    cancelDraftTimer();
     try {
-      const result = await mutateState(
-        (current) =>
-          addNote(
-            current,
-            {
-              title: elements.title.value,
-              body: elements.body.value,
-              course: elements.course.value,
-              source: currentSource,
-            },
-            { allowDuplicate },
-          ),
-        storage,
+      const result = await enqueueDraftOperation(() =>
+        mutateStateAndClearPopupDraft(
+          (current) =>
+            addNote(
+              current,
+              {
+                title: elements.title.value,
+                body: elements.body.value,
+                course: elements.course.value,
+                source: currentSource,
+              },
+              { allowDuplicate },
+            ),
+          storage,
+          {
+            sessionId: draftSessionId,
+            expectedOwnerSessionId: draftCursor.ownerSessionId,
+            expectedGeneration: draftCursor.generation,
+            contentGeneration: Math.max(
+              draftGeneration + 1,
+              draftCursor.contentGeneration + 1,
+            ),
+          },
+        ),
       );
       state = result.state;
-      cancelDraftTimer();
       draftDirty = false;
-      draftGeneration += 1;
-      let draftWarning = "";
-      try {
-        const cleared = await enqueueDraftOperation(() =>
-          clearDraft(storage, {
-            expectedSessionId: storedDraftSessionId || draftSessionId,
-            allowUnowned: true,
-          }),
-        );
-        if (cleared) {
-          storedDraftSessionId = "";
-        } else {
-          draftWarning = "Note saved. A newer draft from another popup was kept.";
-        }
-      } catch (error) {
-        draftWarning = `Note saved, but the draft could not be cleared: ${errorMessage(error)}`;
-      }
+      updateDraftCursor(result.popupDraftRecord);
+      draftGeneration = Math.max(draftGeneration + 1, draftCursor.contentGeneration);
+      const draftWarning = result.popupDraftCleared
+        ? ""
+        : "Note saved. A newer draft from another popup was kept.";
       prepareNextNote(savedCourse);
       renderRecentNotes();
       const successMessage = currentSource.url || currentSource.title
@@ -314,6 +340,9 @@ export async function initPopup({
       setStatus(elements.status, draftWarning || successMessage, draftWarning ? "warning" : "success");
       focusTarget = elements.body;
     } catch (error) {
+      if (draftDirty) {
+        scheduleDraftSave();
+      }
       if (error instanceof ValidationError && error.code === "duplicate") {
         elements.duplicate.hidden = false;
         setStatus(elements.status, "Review the duplicate warning before saving.", "warning");
@@ -384,15 +413,18 @@ export async function initPopup({
     draftDirty = false;
     draftGeneration += 1;
     try {
-      const cleared = await enqueueDraftOperation(() =>
-        clearDraft(storage, {
-          expectedSessionId: storedDraftSessionId || draftSessionId,
-          allowUnowned: true,
+      const result = await enqueueDraftOperation(() =>
+        clearPopupDraft(storage, {
+          sessionId: draftSessionId,
+          expectedOwnerSessionId: draftCursor.ownerSessionId,
+          expectedGeneration: draftCursor.generation,
+          contentGeneration: Math.max(
+            draftGeneration,
+            draftCursor.contentGeneration + 1,
+          ),
         }),
       );
-      if (cleared) {
-        storedDraftSessionId = "";
-      }
+      updateDraftCursor(result.record);
       hasDiscardableDraft = false;
       elements.form.reset();
       if (pageCapture) {
@@ -401,7 +433,7 @@ export async function initPopup({
         showSource({});
         updateBodyCount();
       }
-      if (!cleared) {
+      if (!result.saved) {
         setStatus(elements.status, "The local draft was reset. A newer draft from another popup was kept.", "warning");
       } else if (pageCapture) {
         captureStatus(pageCapture, "reset");
@@ -440,18 +472,20 @@ export async function initPopup({
     const capturePromise = captureActivePage(chromeApi).catch((error) => error);
     state = await loadState(storage);
     applyTheme(state.settings.theme, documentValue);
-    const [draft, capture, recovery] = await Promise.all([
-      loadDraft(storage),
+    const [draftRecord, capture, recovery] = await Promise.all([
+      loadPopupDraft(storage),
       capturePromise,
       loadRecoveryInfo(storage),
     ]);
+    const draft = draftRecord.draft;
+    updateDraftCursor(draftRecord);
+    draftGeneration = Math.max(draftGeneration, draftRecord.contentGeneration);
     renderRecentNotes();
 
     if (!(capture instanceof Error)) {
       pageCapture = capture;
     }
     if (draft) {
-      storedDraftSessionId = draft.sessionId;
       fillFromDraft(draft);
       hasDiscardableDraft = true;
       elements.useSelection.hidden = !pageCapture?.text;
@@ -486,23 +520,72 @@ export async function initPopup({
     }
   }
 
-  const pageHideHandler = () => {
+  function handoffDraft() {
     cancelDraftTimer();
     if (!ready || !draftDirty) {
       return;
     }
     const draft = formDraft();
+    const contentGeneration = draftGeneration;
+    const expectedOwnerSessionId = draftCursor.ownerSessionId;
+    const expectedGeneration = draftCursor.generation;
     draftDirty = false;
-    draftGeneration += 1;
+    const saveDirectly = async () => {
+      const result = await savePopupDraft(draft, storage, {
+        sessionId: draftSessionId,
+        expectedOwnerSessionId,
+        expectedGeneration,
+        contentGeneration,
+      });
+      if (
+        result.saved &&
+        result.record.contentGeneration >= draftCursor.contentGeneration
+      ) {
+        updateDraftCursor(result.record);
+      }
+    };
+    let operation;
     if (typeof chromeApi.runtime?.sendMessage === "function") {
-      void chromeApi.runtime
-        .sendMessage({ type: MESSAGE_TYPES.saveDraft, draft })
-        .catch(() => enqueueDraftOperation(() => saveDraft(draft, storage)));
+      operation = chromeApi.runtime
+        .sendMessage({
+          type: MESSAGE_TYPES.saveDraft,
+          draft,
+          sessionId: draftSessionId,
+          expectedOwnerSessionId,
+          expectedGeneration,
+          contentGeneration,
+        })
+        .then((response) => {
+          if (!response?.ok) {
+            throw new Error(response?.error || "The background page did not save the draft.");
+          }
+          if (
+            response.saved &&
+            response.cursor?.contentGeneration >= draftCursor.contentGeneration
+          ) {
+            updateDraftCursor(response.cursor);
+          }
+        })
+        .catch(saveDirectly);
     } else {
-      void enqueueDraftOperation(() => saveDraft(draft, storage));
+      operation = saveDirectly();
+    }
+    const guardedOperation = operation.catch((error) => {
+      if (!destroyed) {
+        setStatus(elements.status, `Draft not saved: ${errorMessage(error)}`, "error");
+      }
+    });
+    draftHandoff = Promise.all([draftHandoff, guardedOperation]).then(() => undefined);
+  }
+
+  const pageHideHandler = () => handoffDraft();
+  const visibilityChangeHandler = () => {
+    if (documentValue.visibilityState === "hidden") {
+      handoffDraft();
     }
   };
   documentValue.defaultView?.addEventListener("pagehide", pageHideHandler);
+  documentValue.addEventListener("visibilitychange", visibilityChangeHandler);
 
   return {
     getState: () => state,
@@ -510,12 +593,14 @@ export async function initPopup({
       cancelDraftTimer();
       await persistDraft();
       await draftQueue;
+      await draftHandoff;
     },
     destroy() {
       destroyed = true;
       cancelDraftTimer();
       chromeApi.storage.onChanged?.removeListener(storageChangeHandler);
       documentValue.defaultView?.removeEventListener("pagehide", pageHideHandler);
+      documentValue.removeEventListener("visibilitychange", visibilityChangeHandler);
     },
   };
 }

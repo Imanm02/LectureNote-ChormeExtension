@@ -20,6 +20,7 @@ export const STORAGE_KEYS = Object.freeze({
 });
 
 const STATE_LOCK = "lecture-note-state";
+const POPUP_DRAFT_VERSION = 1;
 const EDITOR_DRAFT_VERSION = 1;
 let localMutationQueue = Promise.resolve();
 
@@ -67,6 +68,85 @@ function assertEditorDraftFits(value) {
       "editor-draft-size",
     );
   }
+}
+
+function emptyPopupDraftRecord() {
+  return {
+    version: POPUP_DRAFT_VERSION,
+    ownerSessionId: "",
+    generation: 0,
+    contentGeneration: 0,
+    draft: null,
+  };
+}
+
+function normalizePopupDraftRecord(value, options = {}) {
+  if (value === undefined || value === null) {
+    return emptyPopupDraftRecord();
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new ValidationError("The saved popup draft record is invalid.", "popup-draft-record");
+  }
+
+  if ("version" in value && "draft" in value && value.version !== POPUP_DRAFT_VERSION) {
+    throw new ValidationError(
+      "The saved popup draft version is not supported.",
+      "popup-draft-version",
+    );
+  }
+
+  if (value.version !== POPUP_DRAFT_VERSION || !("draft" in value)) {
+    const draft = normalizeDraft(value, options);
+    const ownerSessionId = draft?.sessionId || "";
+    return {
+      version: POPUP_DRAFT_VERSION,
+      ownerSessionId,
+      generation: ownerSessionId ? 1 : 0,
+      contentGeneration: 0,
+      draft,
+    };
+  }
+
+  const ownerSessionId = typeof value.ownerSessionId === "string" ? value.ownerSessionId : "";
+  const generation = Number.isSafeInteger(value.generation) && value.generation >= 0
+    ? value.generation
+    : -1;
+  const contentGeneration =
+    Number.isSafeInteger(value.contentGeneration) && value.contentGeneration >= 0
+      ? value.contentGeneration
+      : -1;
+  if (
+    generation < 0 ||
+    contentGeneration < 0 ||
+    (generation === 0 && (ownerSessionId || contentGeneration !== 0)) ||
+    (generation > 0 && !isValidIdentifier(ownerSessionId))
+  ) {
+    throw new ValidationError("The saved popup draft owner is invalid.", "popup-draft-owner");
+  }
+
+  const draft = value.draft === null ? null : normalizeDraft(value.draft, options);
+  return {
+    version: POPUP_DRAFT_VERSION,
+    ownerSessionId,
+    generation,
+    contentGeneration,
+    draft,
+  };
+}
+
+function samePopupDraftCursor(record, ownerSessionId, generation) {
+  return record.ownerSessionId === ownerSessionId && record.generation === generation;
+}
+
+function samePopupDraftContent(left, right) {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  const { updatedAt: leftUpdatedAt, ...leftContent } = left;
+  const { updatedAt: rightUpdatedAt, ...rightContent } = right;
+  void leftUpdatedAt;
+  void rightUpdatedAt;
+  return sameData(leftContent, rightContent);
 }
 
 function emptyEditorDraftRecord() {
@@ -207,20 +287,31 @@ async function loadStateUnlocked(area, options) {
   }
 
   let draft = null;
+  let preservePopupDraft = false;
   if (stored[STORAGE_KEYS.draft] !== undefined) {
     try {
-      draft = normalizeDraft(stored[STORAGE_KEYS.draft], options);
-      if (!sameData(stored[STORAGE_KEYS.draft], draft)) {
-        updates[STORAGE_KEYS.draft] = draft;
+      const draftRecord = normalizePopupDraftRecord(stored[STORAGE_KEYS.draft], options);
+      draft = draftRecord.draft;
+      if (!sameData(stored[STORAGE_KEYS.draft], draftRecord)) {
+        updates[STORAGE_KEYS.draft] = draftRecord;
       }
-    } catch {
-      recovery = appendRecovery(recovery || stored[STORAGE_KEYS.recovery], {
-        createdAt: now,
-        rejectedDrafts: 1,
-      });
+    } catch (error) {
+      if (
+        error instanceof ValidationError &&
+        error.code === "popup-draft-version" &&
+        Number.isSafeInteger(stored[STORAGE_KEYS.draft]?.version) &&
+        stored[STORAGE_KEYS.draft].version > POPUP_DRAFT_VERSION
+      ) {
+        preservePopupDraft = true;
+      } else {
+        recovery = appendRecovery(recovery || stored[STORAGE_KEYS.recovery], {
+          createdAt: now,
+          rejectedDrafts: 1,
+        });
+        updates[STORAGE_KEYS.draft] = emptyPopupDraftRecord();
+        updates[STORAGE_KEYS.recovery] = recovery;
+      }
       draft = null;
-      updates[STORAGE_KEYS.draft] = null;
-      updates[STORAGE_KEYS.recovery] = recovery;
     }
   }
 
@@ -255,10 +346,18 @@ async function loadStateUnlocked(area, options) {
   }
 
   const legacySelection = stored[STORAGE_KEYS.legacySelection];
-  if (!draft && typeof legacySelection === "string" && legacySelection.trim()) {
+  if (
+    !preservePopupDraft &&
+    !draft &&
+    typeof legacySelection === "string" &&
+    legacySelection.trim()
+  ) {
     const truncated = legacySelection.length > LIMITS.body;
     draft = normalizeDraft({ body: safeTextPrefix(legacySelection, LIMITS.body) }, options);
-    updates[STORAGE_KEYS.draft] = draft;
+    updates[STORAGE_KEYS.draft] = {
+      ...emptyPopupDraftRecord(),
+      draft,
+    };
     if (truncated) {
       recovery = appendRecovery(recovery || stored[STORAGE_KEYS.recovery], {
         createdAt: now,
@@ -276,7 +375,9 @@ async function loadStateUnlocked(area, options) {
   }
 
   const legacyKeys = [STORAGE_KEYS.legacyResult, STORAGE_KEYS.legacySelection].filter(
-    (key) => stored[key] !== undefined,
+    (key) =>
+      stored[key] !== undefined &&
+      !(preservePopupDraft && key === STORAGE_KEYS.legacySelection),
   );
   if (legacyKeys.length > 0) {
     if (typeof area.remove !== "function") {
@@ -354,10 +455,30 @@ export async function mutateState(
   }, lockManager);
 }
 
-export async function loadDraft(storage = chrome.storage.local, options = {}) {
-  const area = getStorage(storage);
+async function loadPopupDraftUnlocked(area, options = {}) {
   const stored = await area.get(STORAGE_KEYS.draft);
-  return normalizeDraft(stored[STORAGE_KEYS.draft], options);
+  const rawRecord = stored[STORAGE_KEYS.draft];
+  const record = normalizePopupDraftRecord(rawRecord, options);
+  if (rawRecord !== undefined && !sameData(rawRecord, record)) {
+    await area.set({ [STORAGE_KEYS.draft]: record });
+  }
+  return record;
+}
+
+export async function loadPopupDraft(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => loadPopupDraftUnlocked(area, options), lockManager);
+}
+
+export async function loadDraft(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const record = await loadPopupDraft(storage, { lockManager, ...options });
+  return record.draft;
 }
 
 async function clearDraftUnlocked(area, { expectedSessionId, allowUnowned = false } = {}) {
@@ -366,12 +487,9 @@ async function clearDraftUnlocked(area, { expectedSessionId, allowUnowned = fals
   }
   if (expectedSessionId) {
     const stored = await area.get(STORAGE_KEYS.draft);
-    const current = stored[STORAGE_KEYS.draft];
-    if (current !== undefined && current !== null) {
-      const currentSessionId =
-        current && typeof current === "object" && typeof current.sessionId === "string"
-          ? current.sessionId
-          : "";
+    const current = normalizePopupDraftRecord(stored[STORAGE_KEYS.draft]);
+    if (current.draft) {
+      const currentSessionId = current.ownerSessionId || current.draft.sessionId;
       if (currentSessionId !== expectedSessionId && !(allowUnowned && !currentSessionId)) {
         return false;
       }
@@ -393,7 +511,17 @@ export async function saveDraft(
       await clearDraftUnlocked(area);
       return null;
     }
-    await area.set({ [STORAGE_KEYS.draft]: draft });
+    const current = await loadPopupDraftUnlocked(area, options);
+    const ownerSessionId = draft.sessionId;
+    await area.set({
+      [STORAGE_KEYS.draft]: {
+        version: POPUP_DRAFT_VERSION,
+        ownerSessionId,
+        generation: ownerSessionId ? current.generation + 1 : 0,
+        contentGeneration: ownerSessionId ? current.contentGeneration + 1 : 0,
+        draft,
+      },
+    });
     return draft;
   }, lockManager);
 }
@@ -404,6 +532,146 @@ export async function clearDraft(
 ) {
   const area = getStorage(storage);
   return withStateLock(() => clearDraftUnlocked(area, options), lockManager);
+}
+
+async function writePopupDraftUnlocked(value, area, options) {
+  const {
+    sessionId,
+    expectedOwnerSessionId = "",
+    expectedGeneration = 0,
+    contentGeneration,
+    ...normalizeOptions
+  } = options;
+  if (!isValidIdentifier(sessionId)) {
+    throw new ValidationError("The popup draft session is invalid.", "popup-draft-session");
+  }
+  if (
+    typeof expectedOwnerSessionId !== "string" ||
+    !Number.isSafeInteger(expectedGeneration) ||
+    expectedGeneration < 0
+  ) {
+    throw new ValidationError("The popup draft cursor is invalid.", "popup-draft-cursor");
+  }
+  if (!Number.isSafeInteger(contentGeneration) || contentGeneration < 0) {
+    throw new ValidationError(
+      "The popup draft content generation is invalid.",
+      "popup-draft-content-generation",
+    );
+  }
+
+  const current = await loadPopupDraftUnlocked(area, normalizeOptions);
+  const draft = value === null ? null : normalizeDraft(value, normalizeOptions);
+  const cursorMatches = samePopupDraftCursor(
+    current,
+    expectedOwnerSessionId,
+    expectedGeneration,
+  );
+  const sameSession = current.ownerSessionId === sessionId;
+  if (
+    sameSession &&
+    contentGeneration === current.contentGeneration &&
+    samePopupDraftContent(current.draft, draft)
+  ) {
+    return { saved: true, record: current };
+  }
+  const supersedesSameSession = sameSession && contentGeneration > current.contentGeneration;
+  if (!cursorMatches && !supersedesSameSession) {
+    return { saved: false, record: current };
+  }
+  if (sameSession && contentGeneration <= current.contentGeneration) {
+    return { saved: false, record: current };
+  }
+
+  const record = {
+    version: POPUP_DRAFT_VERSION,
+    ownerSessionId: sessionId,
+    generation: current.generation + 1,
+    contentGeneration,
+    draft,
+  };
+  await area.set({ [STORAGE_KEYS.draft]: record });
+  return { saved: true, record };
+}
+
+export async function savePopupDraft(
+  value,
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => writePopupDraftUnlocked(value, area, options), lockManager);
+}
+
+export async function clearPopupDraft(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(() => writePopupDraftUnlocked(null, area, options), lockManager);
+}
+
+export async function mutateStateAndClearPopupDraft(
+  mutation,
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  if (typeof mutation !== "function") {
+    throw new TypeError("A state mutation function is required.");
+  }
+
+  return withStateLock(async () => {
+    const area = getStorage(storage);
+    const expectedOwnerSessionId = options.expectedOwnerSessionId ?? "";
+    const expectedGeneration = options.expectedGeneration ?? 0;
+    if (
+      !isValidIdentifier(options.sessionId) ||
+      typeof expectedOwnerSessionId !== "string" ||
+      !Number.isSafeInteger(expectedGeneration) ||
+      expectedGeneration < 0 ||
+      !Number.isSafeInteger(options.contentGeneration) ||
+      options.contentGeneration < 0
+    ) {
+      throw new ValidationError("The popup draft cursor is invalid.", "popup-draft-cursor");
+    }
+
+    const current = await loadStateUnlocked(area, options);
+    const result = await mutation(current);
+    const nextState = normalizeState(result?.state || result, options);
+    assertStateFits(nextState);
+    if (nextState.revision !== current.revision + 1) {
+      throw new ValidationError("The note update has an invalid revision.", "revision-invalid");
+    }
+
+    const currentDraft = await loadPopupDraftUnlocked(area, options);
+    const canClear = samePopupDraftCursor(
+      currentDraft,
+      expectedOwnerSessionId,
+      expectedGeneration,
+    );
+    const updates = { [STORAGE_KEYS.state]: nextState };
+    let popupDraftRecord = currentDraft;
+    if (canClear) {
+      popupDraftRecord = {
+        version: POPUP_DRAFT_VERSION,
+        ownerSessionId: options.sessionId,
+        generation: currentDraft.generation + 1,
+        contentGeneration: Math.max(
+          currentDraft.contentGeneration + 1,
+          options.contentGeneration,
+        ),
+        draft: null,
+      };
+      updates[STORAGE_KEYS.draft] = popupDraftRecord;
+    }
+
+    await area.set(updates);
+    return {
+      ...(result && typeof result === "object" && "state" in result ? result : {}),
+      state: nextState,
+      popupDraftCleared: canClear,
+      popupDraftRecord,
+    };
+  }, lockManager);
 }
 
 async function loadEditorDraftUnlocked(area, options = {}) {

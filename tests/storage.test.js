@@ -4,14 +4,18 @@ import test from "node:test";
 import {
   clearEditorDraft,
   clearDraft,
+  clearPopupDraft,
   loadEditorDraft,
   loadDraft,
+  loadPopupDraft,
   loadRecoveryInfo,
   loadState,
   mutateState,
   mutateStateAndClearEditorDraft,
+  mutateStateAndClearPopupDraft,
   saveEditorDraft,
   saveDraft,
+  savePopupDraft,
   saveState,
   STORAGE_KEYS,
 } from "../src/storage.js";
@@ -297,6 +301,269 @@ test("keeps popup and editor drafts in separate records", async () => {
   assert.equal((await loadDraft(storage)).body, "Popup draft");
   assert.equal((await loadEditorDraft(storage)).draft.body, "Unfinished graph note");
   assert.equal((await loadEditorDraft(storage)).draft.source.url, "https://");
+});
+
+test("migrates a legacy popup draft into an owned record", async () => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.draft]: {
+      sessionId: "popup-legacy",
+      body: "Resume this draft",
+      source: {},
+    },
+  });
+
+  const record = await loadPopupDraft(storage, { lockManager: null, now: NOW });
+
+  assert.equal(record.ownerSessionId, "popup-legacy");
+  assert.equal(record.generation, 1);
+  assert.equal(record.contentGeneration, 0);
+  assert.equal(record.draft.body, "Resume this draft");
+  assert.equal(storage.values[STORAGE_KEYS.draft].version, 1);
+  assert.equal(storage.values[STORAGE_KEYS.draft].draft.body, "Resume this draft");
+});
+
+test("rejects stale popup writes, clears, and delayed resurrection", async () => {
+  const storage = memoryStorage();
+  const first = await savePopupDraft(
+    { body: "First", sessionId: "popup-one" },
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      now: NOW,
+    },
+  );
+  const competing = await savePopupDraft(
+    { body: "Other popup", sessionId: "popup-two" },
+    storage,
+    {
+      sessionId: "popup-two",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      now: NOW,
+    },
+  );
+  const second = await savePopupDraft(
+    { body: "Second", sessionId: "popup-one" },
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 2,
+      now: NOW,
+    },
+  );
+  const delayedFirst = await savePopupDraft(
+    { body: "Late first write", sessionId: "popup-one" },
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: first.record.ownerSessionId,
+      expectedGeneration: first.record.generation,
+      contentGeneration: 1,
+      now: NOW,
+    },
+  );
+  const cleared = await clearPopupDraft(storage, {
+    sessionId: "popup-one",
+    expectedOwnerSessionId: second.record.ownerSessionId,
+    expectedGeneration: second.record.generation,
+    contentGeneration: 3,
+  });
+  const resurrected = await savePopupDraft(
+    { body: "Delayed page close", sessionId: "popup-one" },
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: second.record.ownerSessionId,
+      expectedGeneration: second.record.generation,
+      contentGeneration: 2,
+      now: NOW,
+    },
+  );
+
+  assert.equal(first.saved, true);
+  assert.equal(competing.saved, false);
+  assert.equal(second.saved, true);
+  assert.equal(delayedFirst.saved, false);
+  assert.equal(cleared.saved, true);
+  assert.equal(cleared.record.draft, null);
+  assert.equal(resurrected.saved, false);
+  assert.equal(await loadDraft(storage), null);
+});
+
+test("saves a note and clears its popup draft in one update", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const savedDraft = await savePopupDraft(
+    { body: "Popup draft", sessionId: "popup-one" },
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      now: NOW,
+    },
+  );
+  const originalSet = storage.set.bind(storage);
+  const updates = [];
+  storage.set = async (update) => {
+    updates.push(Object.keys(update));
+    await originalSet(update);
+  };
+
+  const result = await mutateStateAndClearPopupDraft(
+    (state) => addNote(state, sample("Saved body"), { idFactory: () => "saved-popup-note", now: NOW }),
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: savedDraft.record.ownerSessionId,
+      expectedGeneration: savedDraft.record.generation,
+      contentGeneration: 2,
+      now: NOW,
+    },
+  );
+
+  assert.equal(result.popupDraftCleared, true);
+  assert.equal(result.state.notes[0].id, "saved-popup-note");
+  assert.equal(await loadDraft(storage), null);
+  assert.deepEqual(updates, [[STORAGE_KEYS.state, STORAGE_KEYS.draft]]);
+});
+
+test("keeps another popup's draft while saving a note", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const first = await savePopupDraft(
+    { body: "First popup", sessionId: "popup-one" },
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      now: NOW,
+    },
+  );
+  await savePopupDraft(
+    { body: "Newer popup", sessionId: "popup-two" },
+    storage,
+    {
+      sessionId: "popup-two",
+      expectedOwnerSessionId: first.record.ownerSessionId,
+      expectedGeneration: first.record.generation,
+      contentGeneration: 2,
+      now: NOW,
+    },
+  );
+
+  const result = await mutateStateAndClearPopupDraft(
+    (state) => addNote(state, sample("Saved locally"), { idFactory: () => "saved-note", now: NOW }),
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: first.record.ownerSessionId,
+      expectedGeneration: first.record.generation,
+      contentGeneration: 2,
+      now: NOW,
+    },
+  );
+
+  assert.equal(result.popupDraftCleared, false);
+  assert.equal(result.state.notes.length, 1);
+  assert.equal((await loadDraft(storage)).body, "Newer popup");
+});
+
+test("preserves popup drafts from a newer storage version", async () => {
+  const futureRecord = {
+    version: 2,
+    ownerSessionId: "future-popup",
+    generation: 4,
+    contentGeneration: 7,
+    draft: { body: "Future popup draft" },
+  };
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.draft]: futureRecord,
+  });
+  const before = structuredClone(storage.values);
+
+  assert.deepEqual((await loadState(storage, { now: NOW })).notes, []);
+  await assert.rejects(() => loadPopupDraft(storage), { code: "popup-draft-version" });
+  await assert.rejects(
+    () =>
+      savePopupDraft(
+        { body: "Do not replace", sessionId: "older-popup" },
+        storage,
+        {
+          sessionId: "older-popup",
+          expectedOwnerSessionId: "",
+          expectedGeneration: 0,
+          contentGeneration: 1,
+        },
+      ),
+    { code: "popup-draft-version" },
+  );
+  await assert.rejects(
+    () =>
+      mutateStateAndClearPopupDraft(
+        (state) => addNote(state, sample("Do not save"), { idFactory: () => "not-saved", now: NOW }),
+        storage,
+        {
+          sessionId: "older-popup",
+          expectedOwnerSessionId: "",
+          expectedGeneration: 0,
+          contentGeneration: 1,
+          now: NOW,
+        },
+      ),
+    { code: "popup-draft-version" },
+  );
+
+  assert.deepEqual(storage.values, before);
+});
+
+test("does not save a note when the combined popup draft write fails", async () => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const savedDraft = await savePopupDraft(
+    { body: "Keep this draft", sessionId: "popup-one" },
+    storage,
+    {
+      sessionId: "popup-one",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      now: NOW,
+    },
+  );
+  const before = structuredClone(storage.values);
+  const originalSet = storage.set.bind(storage);
+  storage.set = async (update) => {
+    if (Object.hasOwn(update, STORAGE_KEYS.state) && Object.hasOwn(update, STORAGE_KEYS.draft)) {
+      throw new Error("Combined popup write failed");
+    }
+    await originalSet(update);
+  };
+
+  await assert.rejects(
+    () =>
+      mutateStateAndClearPopupDraft(
+        (state) => addNote(state, sample("Do not save"), { idFactory: () => "not-saved", now: NOW }),
+        storage,
+        {
+          sessionId: "popup-one",
+          expectedOwnerSessionId: savedDraft.record.ownerSessionId,
+          expectedGeneration: savedDraft.record.generation,
+          contentGeneration: 2,
+          now: NOW,
+        },
+      ),
+    /Combined popup write failed/u,
+  );
+
+  assert.deepEqual(storage.values, before);
 });
 
 test("rejects stale editor writes and delayed resurrection", async () => {

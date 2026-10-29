@@ -1,5 +1,5 @@
 import { MESSAGE_TYPES } from "./messages.js";
-import { saveDraft, saveEditorDraft } from "./storage.js";
+import { saveEditorDraft, savePopupDraft } from "./storage.js";
 
 export function isAuthorizedDraftMessage(message, sender, runtimeId) {
   return (
@@ -31,8 +31,22 @@ export async function handleDraftMessage(message, sender, storage, runtimeId) {
       },
     };
   }
-  await saveDraft(message.draft, storage);
-  return { handled: true, saved: true };
+  const result = await savePopupDraft(message.draft, storage, {
+    sessionId: message.sessionId,
+    expectedOwnerSessionId: message.expectedOwnerSessionId,
+    expectedGeneration: message.expectedGeneration,
+    contentGeneration: message.contentGeneration,
+  });
+  return {
+    handled: true,
+    saved: result.saved,
+    cursor: {
+      ownerSessionId: result.record.ownerSessionId,
+      generation: result.record.generation,
+      contentGeneration: result.record.contentGeneration,
+      hasDraft: Boolean(result.record.draft),
+    },
+  };
 }
 
 if (typeof chrome !== "undefined") {

@@ -13,13 +13,26 @@ test("stores a draft handed off by an extension page", async () => {
   const storage = memoryStorage();
   const message = {
     type: MESSAGE_TYPES.saveDraft,
+    sessionId: "popup-session",
+    expectedOwnerSessionId: "",
+    expectedGeneration: 0,
+    contentGeneration: 1,
     draft: { body: "Keep this popup draft", sessionId: "popup-session" },
   };
 
   assert.equal(isAuthorizedDraftMessage(message, { id: RUNTIME_ID }, RUNTIME_ID), true);
   assert.deepEqual(
     await handleDraftMessage(message, { id: RUNTIME_ID }, storage, RUNTIME_ID),
-    { handled: true, saved: true },
+    {
+      handled: true,
+      saved: true,
+      cursor: {
+        ownerSessionId: "popup-session",
+        generation: 1,
+        contentGeneration: 1,
+        hasDraft: true,
+      },
+    },
   );
   assert.equal((await loadDraft(storage)).body, "Keep this popup draft");
 });
@@ -45,6 +58,10 @@ test("rejects an oversized handed-off draft", async () => {
       handleDraftMessage(
         {
           type: MESSAGE_TYPES.saveDraft,
+          sessionId: "popup-session",
+          expectedOwnerSessionId: "",
+          expectedGeneration: 0,
+          contentGeneration: 1,
           draft: { body: "x".repeat(LIMITS.body + 1), sessionId: "popup-session" },
         },
         { id: RUNTIME_ID },
@@ -56,10 +73,57 @@ test("rejects an oversized handed-off draft", async () => {
   assert.equal(await loadDraft(storage), null);
 });
 
+test("does not let a stale popup handoff replace another popup's draft", async () => {
+  const storage = memoryStorage();
+  const first = await handleDraftMessage(
+    {
+      type: MESSAGE_TYPES.saveDraft,
+      sessionId: "popup-one",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      draft: { body: "Keep this draft", sessionId: "popup-one" },
+    },
+    { id: RUNTIME_ID },
+    storage,
+    RUNTIME_ID,
+  );
+  const stale = await handleDraftMessage(
+    {
+      type: MESSAGE_TYPES.saveDraft,
+      sessionId: "popup-two",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      draft: { body: "Do not overwrite", sessionId: "popup-two" },
+    },
+    { id: RUNTIME_ID },
+    storage,
+    RUNTIME_ID,
+  );
+
+  assert.equal(first.saved, true);
+  assert.equal(stale.saved, false);
+  assert.deepEqual(stale.cursor, {
+    ownerSessionId: "popup-one",
+    generation: 1,
+    contentGeneration: 1,
+    hasDraft: true,
+  });
+  assert.equal((await loadDraft(storage)).body, "Keep this draft");
+});
+
 test("stores editor drafts without replacing popup drafts", async () => {
   const storage = memoryStorage();
   await handleDraftMessage(
-    { type: MESSAGE_TYPES.saveDraft, draft: { body: "Popup draft" } },
+    {
+      type: MESSAGE_TYPES.saveDraft,
+      sessionId: "popup-session",
+      expectedOwnerSessionId: "",
+      expectedGeneration: 0,
+      contentGeneration: 1,
+      draft: { body: "Popup draft", sessionId: "popup-session" },
+    },
     { id: RUNTIME_ID },
     storage,
     RUNTIME_ID,

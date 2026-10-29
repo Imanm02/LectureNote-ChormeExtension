@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { initPopup } from "../src/popup.js";
 import { createEmptyState } from "../src/model.js";
-import { STORAGE_KEYS } from "../src/storage.js";
+import { loadDraft, STORAGE_KEYS } from "../src/storage.js";
 import { chromeMock, loadPage, memoryStorage, waitFor } from "./helpers.js";
 
 test("prefills the popup from the current selection", async () => {
@@ -75,7 +75,7 @@ test("restores an unfinished draft without overwriting it", async () => {
   dom.window.document.getElementById("useSelectionButton").click();
   assert.equal(dom.window.document.getElementById("bodyInput").value, "New selection");
   await controller.flushDraft();
-  assert.equal(storage.values[STORAGE_KEYS.draft].body, "New selection");
+  assert.equal((await loadDraft(storage)).body, "New selection");
   controller.destroy();
   dom.window.close();
 });
