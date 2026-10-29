@@ -27,10 +27,11 @@ npm run release:check
 ```
 
 - [ ] Install Playwright Chromium first with `npx playwright install chromium` when needed.
-- [ ] Confirm the release gate passes the dependency audit, lint, coverage floors, extension validator, browser smoke test, package creation, and package validator.
-- [ ] Confirm the release gate extracts the generated ZIP and passes the packaged-extension browser smoke test against that extracted directory.
+- [ ] Install or update stable Chrome before running its action-popup test.
+- [ ] Confirm the release gate passes the dependency audit, lint, coverage floors, extension validator, browser smoke tests, package creation, and package validator.
+- [ ] Confirm the stable Chrome test triggers the real toolbar popup and verifies focused-frame selection capture, source context, saving, and local storage against the source extension.
+- [ ] Confirm the release gate extracts the generated ZIP and passes both packaged-extension browser tests against that extracted directory.
 - [ ] Record the test counts and coverage summary in the release notes.
-- [ ] Treat a skipped toolbar-action check as a required manual Chrome test.
 - [ ] Resolve warnings that could change the shipped extension or its development dependencies.
 
 ## Build the extension package
@@ -46,6 +47,7 @@ Run the package steps separately after a packaging-only change when needed:
 npm run package:extension
 npm run check:package
 npm run test:browser:package
+npm run test:browser:chrome:package
 ```
 
 The ZIP root contains `manifest.json`. The package allowlist includes:

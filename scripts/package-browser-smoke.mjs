@@ -80,9 +80,10 @@ export async function withExtractedStoredZip(
   }
 }
 
-export async function runBrowserSmokeProcess(extensionRoot) {
-  const browserSmokePath = join(projectRoot, "scripts", "browser-smoke.mjs");
-  const child = spawn(process.execPath, [browserSmokePath, extensionRoot], {
+export async function runSmokeScriptProcess(scriptName, extensionRoot, description) {
+  assert.match(scriptName, /^[a-z0-9-]+\.mjs$/u, "Smoke script name is invalid");
+  const smokePath = join(projectRoot, "scripts", scriptName);
+  const child = spawn(process.execPath, [smokePath, extensionRoot], {
     cwd: projectRoot,
     env: process.env,
     stdio: "inherit",
@@ -91,13 +92,30 @@ export async function runBrowserSmokeProcess(extensionRoot) {
     child.once("error", rejectResult);
     child.once("exit", (code, signal) => resolveResult({ code, signal }));
   });
-  assert.equal(result.signal, null, `Packaged browser smoke stopped on signal ${result.signal}`);
-  assert.equal(result.code, 0, `Packaged browser smoke exited with code ${result.code}`);
+  assert.equal(result.signal, null, `${description} stopped on signal ${result.signal}`);
+  assert.equal(result.code, 0, `${description} exited with code ${result.code}`);
+}
+
+export async function runBrowserSmokeProcess(extensionRoot) {
+  await runSmokeScriptProcess(
+    "browser-smoke.mjs",
+    extensionRoot,
+    "Packaged Playwright Chromium smoke",
+  );
+}
+
+export async function runStableChromeSmokeProcess(extensionRoot) {
+  await runSmokeScriptProcess(
+    "stable-chrome-smoke.mjs",
+    extensionRoot,
+    "Packaged stable Chrome smoke",
+  );
 }
 
 export async function runPackagedBrowserSmoke({
   archivePath,
   runSmoke = runBrowserSmokeProcess,
+  description = "browser",
   temporaryDirectory,
 } = {}) {
   const release = buildExtensionPackage();
@@ -109,7 +127,7 @@ export async function runPackagedBrowserSmoke({
     runSmoke,
     temporaryDirectory ? { temporaryDirectory } : undefined,
   );
-  console.log(`Packaged browser smoke passed for ${basename(storedArchivePath)}.`);
+  console.log(`Packaged ${description} smoke passed for ${basename(storedArchivePath)}.`);
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : null;

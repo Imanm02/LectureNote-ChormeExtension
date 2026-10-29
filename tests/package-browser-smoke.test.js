@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   resolvePackageEntryPath,
+  runSmokeScriptProcess,
   withExtractedStoredZip,
 } from "../scripts/package-browser-smoke.mjs";
 import { buildStoredZip } from "../scripts/release-package.mjs";
@@ -117,4 +118,11 @@ test("packaged browser helper cleans up after unsafe archive extraction", async 
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
+});
+
+test("packaged browser helper rejects unsafe smoke script names", async () => {
+  await assert.rejects(
+    runSmokeScriptProcess("../outside.mjs", process.cwd(), "Invalid smoke"),
+    /Smoke script name is invalid/u,
+  );
 });

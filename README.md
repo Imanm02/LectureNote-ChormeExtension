@@ -145,6 +145,8 @@ npx playwright install chromium
 npm run test:browser
 ```
 
+The stable Chrome action test also requires a current Chrome installation. It uses a new temporary profile, loads the unpacked extension through Chrome DevTools Protocol, and removes the profile afterward. It never opens the regular Chrome profile.
+
 Available checks:
 
 | Command | Purpose |
@@ -155,15 +157,15 @@ Available checks:
 | `npm run check:extension` | Validate the manifest, permissions, packaged resources, syntax, unsafe sinks, network calls, and credential patterns |
 | `npm run validate` | Run lint, tests, and extension validation |
 | `npm run test:browser` | Load the source extension in Playwright Chromium and exercise its main flows |
+| `npm run test:browser:chrome` | Trigger the real toolbar action in stable Chrome and verify focused-frame capture and storage |
 | `npm run package:extension` | Create the release ZIP and SHA-256 checksum in `dist/` |
 | `npm run check:package` | Inspect the ZIP allowlist and validate the packaged extension |
 | `npm run test:browser:package` | Extract the release ZIP and smoke-test the packaged extension |
+| `npm run test:browser:chrome:package` | Extract the ZIP and test its toolbar action in stable Chrome |
 | `npm run store:screenshots` | Build the exact ZIP and create four 1280 by 800 Store screenshots from it |
-| `npm run release:check` | Run the local release gate from audit through packaged browser smoke testing |
+| `npm run release:check` | Run the local release gate against the source and package in Chromium and stable Chrome |
 
-The release gate creates `dist/lecture-notes-<version>.zip` and its SHA-256 file. The generated `dist/` directory is not committed. This repository does not use GitHub Actions, so release checks run on a trusted local machine.
-
-Headless Chromium may not expose the toolbar popup after the `_execute_action` command. The smoke test reports that case, then tests the popup directly and runs the packaged selection reader in a real page. Complete the skipped toolbar-action check manually in Chrome before release.
+The release gate creates `dist/lecture-notes-<version>.zip` and its SHA-256 file. The generated `dist/` directory is not committed. This repository does not use GitHub Actions, so release checks run on a trusted local machine. The Chromium run exercises the wider product flow. The stable Chrome run triggers the real toolbar popup, captures a selection from a focused embedded frame, saves it, and checks local storage for both the source and extracted package.
 
 ## Data limits
 
