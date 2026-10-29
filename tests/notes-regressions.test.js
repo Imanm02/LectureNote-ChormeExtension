@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { serializeBackup } from "../src/backup.js";
-import { createEmptyState, createNote, moveNoteToTrash } from "../src/model.js";
+import { addNote, createEmptyState, createNote, moveNoteToTrash } from "../src/model.js";
 import { initLibrary } from "../src/notes.js";
 import {
   clearEditorDraft,
@@ -470,6 +470,197 @@ test("clears a prior undo record after replacing the library", async (t) => {
   assert.deepEqual(controller.getState().notes.map((entry) => entry.id), ["imported"]);
 });
 
+test("previews restore effects before merging a colliding note", async (t) => {
+  const current = {
+    ...createEmptyState(),
+    notes: [note("same-id", "Current body")],
+    settings: { theme: "light", sort: "created-desc" },
+  };
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: current });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+  const imported = {
+    ...createEmptyState(),
+    notes: [note("same-id", "Imported body")],
+    settings: { theme: "dark", sort: "title-asc" },
+  };
+  const backupText = serializeBackup(imported, { now: START });
+  const importInput = documentValue.getElementById("importFileInput");
+  Object.defineProperty(importInput, "files", {
+    configurable: true,
+    value: [{
+      size: new TextEncoder().encode(backupText).byteLength,
+      async text() {
+        return backupText;
+      },
+    }],
+  });
+
+  importInput.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  await waitFor(() => documentValue.getElementById("importDialog").open);
+
+  assert.equal(documentValue.getElementById("importSchemaVersion").textContent, "2");
+  assert.equal(documentValue.getElementById("importExportedAt").title, START);
+  assert.match(documentValue.getElementById("importMessage").textContent, /1 active note and 0 Trash entries/u);
+  assert.match(documentValue.getElementById("mergePreviewMessage").textContent, /1 colliding note ID will be changed/u);
+  assert.match(documentValue.getElementById("mergePreviewMessage").textContent, /result will have 2 active notes/u);
+  assert.match(documentValue.getElementById("replacePreviewMessage").textContent, /remove 1 current active note/u);
+  assert.match(
+    documentValue.getElementById("replaceSettingsMessage").textContent,
+    /change the theme from Light to Dark and sorting from Newest created to Title/u,
+  );
+  assert.equal(documentValue.getElementById("mergeImportButton").disabled, false);
+
+  documentValue.getElementById("mergeImportButton").click();
+  await waitFor(() => controller.getState().notes.length === 2);
+
+  assert.deepEqual(
+    controller.getState().notes.map((entry) => entry.id),
+    ["same-id_import_1", "same-id"],
+  );
+  assert.deepEqual(controller.getState().settings, current.settings);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /Restored 1 active note/u);
+});
+
+test("does not replace notes saved after the confirmation opened", async (t) => {
+  const current = { ...createEmptyState(), notes: [note("current", "Current body")] };
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: current });
+  const setup = await setupLibrary(t, [], storage);
+  const { controller, documentValue } = setup;
+  const imported = {
+    ...createEmptyState(),
+    notes: [note("imported", "Imported body")],
+  };
+  const backupText = serializeBackup(imported, { now: START });
+  const importInput = documentValue.getElementById("importFileInput");
+  Object.defineProperty(importInput, "files", {
+    configurable: true,
+    value: [{
+      size: new TextEncoder().encode(backupText).byteLength,
+      async text() {
+        return backupText;
+      },
+    }],
+  });
+
+  importInput.dispatchEvent(new documentValue.defaultView.Event("change", { bubbles: true }));
+  await waitFor(() => documentValue.getElementById("importDialog").open);
+  documentValue.getElementById("replaceImportButton").click();
+  assert.equal(documentValue.getElementById("replaceDialog").open, true);
+
+  storage.values[STORAGE_KEYS.state] = addNote(
+    storage.values[STORAGE_KEYS.state],
+    {
+      title: "New in another window",
+      body: "This note must survive the stale confirmation.",
+      course: "CS 101",
+      source: {},
+    },
+    { idFactory: () => "external", now: START },
+  ).state;
+  submit(documentValue, "replaceForm");
+  await waitFor(() => documentValue.getElementById("importDialog").open);
+
+  assert.equal(documentValue.getElementById("replaceDialog").open, false);
+  assert.deepEqual(
+    controller.getState().notes.map((entry) => entry.id),
+    ["external", "current"],
+  );
+  assert.deepEqual(
+    storage.values[STORAGE_KEYS.state].notes.map((entry) => entry.id),
+    ["external", "current"],
+  );
+  assert.match(documentValue.getElementById("importStatus").textContent, /changed in another window/u);
+  assert.match(documentValue.getElementById("replacePreviewMessage").textContent, /remove 2 current active notes/u);
+
+  documentValue.getElementById("replaceImportButton").click();
+  submit(documentValue, "replaceForm");
+  await waitFor(() => controller.getState().notes[0]?.id === "imported");
+  assert.deepEqual(controller.getState().notes.map((entry) => entry.id), ["imported"]);
+});
+
+test("shows exact recovery counts and clears them after acknowledgment", async (t) => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.recovery]: {
+      createdAt: START,
+      rejectedNotes: 2,
+      rejectedDrafts: 3,
+    },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { documentValue } = setup;
+
+  assert.equal(documentValue.getElementById("recoveryNotice").hidden, false);
+  assert.match(
+    documentValue.getElementById("recoveryMessage").textContent,
+    /discarded 2 invalid notes and 3 invalid drafts/u,
+  );
+
+  documentValue.getElementById("acknowledgeRecoveryButton").click();
+  await waitFor(() => storage.values[STORAGE_KEYS.recovery] === undefined);
+
+  assert.equal(documentValue.getElementById("recoveryNotice").hidden, true);
+  assert.equal(documentValue.getElementById("libraryStatus").textContent, "Recovery notice acknowledged.");
+});
+
+test("keeps newer recovery counts when an old notice is acknowledged", async (t) => {
+  const storage = memoryStorage({
+    [STORAGE_KEYS.state]: createEmptyState(),
+    [STORAGE_KEYS.recovery]: {
+      createdAt: START,
+      rejectedNotes: 1,
+      rejectedDrafts: 0,
+    },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { documentValue } = setup;
+  storage.values[STORAGE_KEYS.recovery] = {
+    createdAt: "2026-09-20T11:00:00.000Z",
+    rejectedNotes: 2,
+    rejectedDrafts: 1,
+  };
+
+  documentValue.getElementById("acknowledgeRecoveryButton").click();
+  await waitFor(() => /More recovery information/u.test(
+    documentValue.getElementById("recoveryStatus").textContent,
+  ));
+
+  assert.deepEqual(storage.values[STORAGE_KEYS.recovery], {
+    createdAt: "2026-09-20T11:00:00.000Z",
+    rejectedNotes: 2,
+    rejectedDrafts: 1,
+  });
+  assert.match(documentValue.getElementById("recoveryMessage").textContent, /2 invalid notes and 1 invalid draft/u);
+  assert.equal(documentValue.getElementById("recoveryNotice").hidden, false);
+  assert.equal(documentValue.activeElement.id, "acknowledgeRecoveryButton");
+});
+
+test("shows storage use and warns near a configured count limit", async (t) => {
+  const notes = Array.from({ length: 1_600 }, (_, index) =>
+    note(`usage-${index}`, `Body ${index}`),
+  );
+  const setup = await setupLibrary(t, notes);
+  const { documentValue } = setup;
+
+  assert.equal(documentValue.getElementById("storageUsage").dataset.level, "warning");
+  assert.match(
+    documentValue.getElementById("storageUsageText").textContent,
+    /1,600 of 2,000 active notes/u,
+  );
+  assert.equal(documentValue.getElementById("storageUsageWarning").hidden, false);
+  assert.match(documentValue.getElementById("storageUsageWarning").textContent, /nearing/u);
+  assert.equal(Number(documentValue.getElementById("storageUsageMeter").max), 7_000_000);
+});
+
+test("reports small library sizes without rounding them to zero", async (t) => {
+  const setup = await setupLibrary(t, []);
+  const text = setup.documentValue.getElementById("storageUsageText").textContent;
+
+  assert.match(text, /^\d+ B of 7 MB used\./u);
+  assert.doesNotMatch(text, /^0 MB/u);
+});
+
 test("clears undo after an external library replacement", async (t) => {
   const setup = await setupLibrary(t, [note("first", "Saved body")]);
   const { chromeApi, controller, documentValue, storage } = setup;
@@ -639,8 +830,9 @@ test("exports only the current filtered view as Markdown", async (t) => {
 });
 
 test("shows copy feedback on the selected note", async (t) => {
-  const scheduled = [];
+  const scheduled = new Map();
   const copied = [];
+  let nextTimer = 0;
   const setup = await setupLibrary(
     t,
     [note("copy", "Copy body")],
@@ -648,10 +840,13 @@ test("shows copy feedback on the selected note", async (t) => {
     {
       navigatorValue: { clipboard: { async writeText(value) { copied.push(value); } } },
       timerApi: {
-        clearTimeout() {},
+        clearTimeout(identifier) {
+          scheduled.delete(identifier);
+        },
         setTimeout(callback) {
-          scheduled.push(callback);
-          return scheduled.length;
+          nextTimer += 1;
+          scheduled.set(nextTimer, callback);
+          return nextTimer;
         },
       },
     },
@@ -660,9 +855,12 @@ test("shows copy feedback on the selected note", async (t) => {
   const button = documentValue.querySelector("[data-action='copy']");
   button.click();
   await waitFor(() => button.textContent === "Copied");
+  button.click();
+  await waitFor(() => copied.length === 2);
 
   assert.match(copied[0], /Copy body/u);
-  scheduled.shift()();
+  assert.equal(scheduled.size, 1);
+  [...scheduled.values()][0]();
   assert.equal(button.textContent, "Copy");
 });
 

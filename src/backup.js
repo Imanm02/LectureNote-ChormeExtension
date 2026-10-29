@@ -88,10 +88,12 @@ export function parseBackup(
     notes: normalized.notes,
     trash: normalized.trash,
     settings: normalized.settings,
+    schemaVersion: value.schemaVersion,
+    exportedAt: validTimestamp(value.exportedAt, null),
   };
 }
 
-export function mergeImportedBackup(stateValue, importedValue, options = {}) {
+function prepareImportedMerge(stateValue, importedValue, options = {}) {
   const state = normalizeState(stateValue, options);
   if (!isRecord(importedValue) || !Array.isArray(importedValue.notes)) {
     throw new ValidationError("Imported notes must be a list.", "import-notes-type");
@@ -155,9 +157,6 @@ export function mergeImportedBackup(stateValue, importedValue, options = {}) {
     if (!note) {
       continue;
     }
-    if (state.notes.length + addedNotes.length >= LIMITS.notes) {
-      throw new ValidationError("The imported notes would exceed the library limit.", "notes-limit");
-    }
     addedNotes.push(note);
   }
 
@@ -166,23 +165,82 @@ export function mergeImportedBackup(stateValue, importedValue, options = {}) {
     if (!note) {
       continue;
     }
-    if (state.trash.length + addedTrash.length >= LIMITS.trash) {
-      throw new ValidationError("The imported Trash entries would exceed the Trash limit.", "trash-limit");
-    }
     addedTrash.push({ ...candidateEntry, note });
   }
 
   return {
-    state: {
-      ...state,
-      revision: addedNotes.length + addedTrash.length > 0 ? state.revision + 1 : state.revision,
-      notes: [...addedNotes, ...state.notes],
-      trash: [...addedTrash, ...state.trash],
-    },
-    added: addedNotes.length,
-    trashAdded: addedTrash.length,
+    state,
+    imported,
+    importedTrash,
+    addedNotes,
+    addedTrash,
     skipped,
     rekeyed,
+  };
+}
+
+export function mergeImportedBackup(stateValue, importedValue, options = {}) {
+  const plan = prepareImportedMerge(stateValue, importedValue, options);
+  if (plan.state.notes.length + plan.addedNotes.length > LIMITS.notes) {
+    throw new ValidationError("The imported notes would exceed the library limit.", "notes-limit");
+  }
+  if (plan.state.trash.length + plan.addedTrash.length > LIMITS.trash) {
+    throw new ValidationError("The imported Trash entries would exceed the Trash limit.", "trash-limit");
+  }
+
+  return {
+    state: {
+      ...plan.state,
+      revision:
+        plan.addedNotes.length + plan.addedTrash.length > 0
+          ? plan.state.revision + 1
+          : plan.state.revision,
+      notes: [...plan.addedNotes, ...plan.state.notes],
+      trash: [...plan.addedTrash, ...plan.state.trash],
+    },
+    added: plan.addedNotes.length,
+    trashAdded: plan.addedTrash.length,
+    skipped: plan.skipped,
+    rekeyed: plan.rekeyed,
+  };
+}
+
+export function previewImportedBackup(stateValue, importedValue, options = {}) {
+  const plan = prepareImportedMerge(stateValue, importedValue, options);
+  const replacement = replaceImportedNotes(plan.state, importedValue, options);
+  const resultingNotes = plan.state.notes.length + plan.addedNotes.length;
+  const resultingTrash = plan.state.trash.length + plan.addedTrash.length;
+
+  return {
+    backup: {
+      schemaVersion: Number.isSafeInteger(importedValue.schemaVersion)
+        ? importedValue.schemaVersion
+        : null,
+      exportedAt:
+        typeof importedValue.exportedAt === "string" ? importedValue.exportedAt : null,
+      notes: plan.imported.length,
+      trash: plan.importedTrash.length,
+    },
+    merge: {
+      added: plan.addedNotes.length,
+      trashAdded: plan.addedTrash.length,
+      skipped: plan.skipped,
+      rekeyed: plan.rekeyed,
+      resultingNotes,
+      resultingTrash,
+      withinCountLimits:
+        resultingNotes <= LIMITS.notes && resultingTrash <= LIMITS.trash,
+    },
+    replace: {
+      removedNotes: plan.state.notes.length,
+      removedTrash: plan.state.trash.length,
+      resultingNotes: replacement.notes.length,
+      resultingTrash: replacement.trash.length,
+      currentSettings: { ...plan.state.settings },
+      settings: { ...replacement.settings },
+      settingsChanged:
+        JSON.stringify(plan.state.settings) !== JSON.stringify(replacement.settings),
+    },
   };
 }
 

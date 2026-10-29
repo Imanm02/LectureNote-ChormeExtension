@@ -7,6 +7,7 @@ import {
   createNote,
   emptyTrash,
   LIMITS,
+  measureLibraryUsage,
   moveNoteToTrash,
   normalizeDraft,
   normalizeEditorDraft,
@@ -25,6 +26,7 @@ import {
   mergeImportedNotes,
   notesToMarkdown,
   parseBackup,
+  previewImportedBackup,
   replaceImportedNotes,
   serializeBackup,
 } from "../src/backup.js";
@@ -306,6 +308,8 @@ test("exports and restores a versioned backup", () => {
   const restored = parseBackup(text, { idFactory: () => "unused", now: LATER });
 
   assert.equal(createBackup(state, { now: LATER }).format, "lecturenote-backup");
+  assert.equal(restored.schemaVersion, 2);
+  assert.equal(restored.exportedAt, LATER);
   assert.deepEqual(restored.notes, []);
   assert.deepEqual(restored.trash, state.trash);
 });
@@ -321,6 +325,121 @@ test("imports version 1 backups with an empty Trash", () => {
 
   assert.deepEqual(restored.notes, [note]);
   assert.deepEqual(restored.trash, []);
+  assert.equal(restored.schemaVersion, 1);
+  assert.equal(restored.exportedAt, null);
+});
+
+test("previews merge collisions with the same result as the real merge", () => {
+  const existing = createNote(sample(), { idFactory: () => "same-id", now: START });
+  const repeated = { ...existing };
+  const collision = createNote(sample({ body: "Different text" }), {
+    idFactory: () => "same-id",
+    now: LATER,
+  });
+  const current = {
+    ...createEmptyState(),
+    notes: [existing],
+    settings: { theme: "light", sort: "created-desc" },
+  };
+  const imported = {
+    notes: [repeated, collision],
+    trash: [],
+    settings: { theme: "dark", sort: "title-asc" },
+    schemaVersion: 2,
+    exportedAt: LATER,
+  };
+
+  const preview = previewImportedBackup(current, imported, {
+    idFactory: () => "replacement-id",
+    now: LATER,
+  });
+  const merged = mergeImportedBackup(current, imported, { now: LATER });
+
+  assert.deepEqual(
+    {
+      added: preview.merge.added,
+      trashAdded: preview.merge.trashAdded,
+      skipped: preview.merge.skipped,
+      rekeyed: preview.merge.rekeyed,
+      resultingNotes: preview.merge.resultingNotes,
+      resultingTrash: preview.merge.resultingTrash,
+    },
+    {
+      added: merged.added,
+      trashAdded: merged.trashAdded,
+      skipped: merged.skipped,
+      rekeyed: merged.rekeyed,
+      resultingNotes: merged.state.notes.length,
+      resultingTrash: merged.state.trash.length,
+    },
+  );
+  assert.equal(merged.state.notes[0].id, "same-id_import_1");
+  assert.equal(preview.replace.removedNotes, 1);
+  assert.equal(preview.replace.resultingNotes, 2);
+  assert.deepEqual(preview.replace.currentSettings, current.settings);
+  assert.deepEqual(preview.replace.settings, imported.settings);
+  assert.equal(preview.replace.settingsChanged, true);
+  assert.deepEqual(preview.backup, {
+    schemaVersion: 2,
+    exportedAt: LATER,
+    notes: 2,
+    trash: 0,
+  });
+});
+
+test("previews an over-limit merge while keeping Replace available", () => {
+  const base = createNote(sample(), { idFactory: () => "current-0", now: START });
+  const current = {
+    ...createEmptyState(),
+    notes: Array.from({ length: LIMITS.notes }, (_, index) => ({
+      ...base,
+      id: `current-${index}`,
+    })),
+  };
+  const imported = {
+    notes: [{ ...base, id: "extra", body: "An extra note" }],
+    trash: [],
+    settings: { theme: "system", sort: "updated-desc" },
+  };
+  const preview = previewImportedBackup(current, imported, { now: LATER });
+
+  assert.equal(preview.merge.added, 1);
+  assert.equal(preview.merge.resultingNotes, LIMITS.notes + 1);
+  assert.equal(preview.merge.withinCountLimits, false);
+  assert.equal(preview.replace.resultingNotes, 1);
+  assert.throws(() => mergeImportedBackup(current, imported, { now: LATER }), {
+    code: "notes-limit",
+  });
+});
+
+test("measures serialized storage and warns near configured limits", () => {
+  const base = createNote(sample(), { idFactory: () => "note-0", now: START });
+  const normalState = { ...createEmptyState(), notes: [base] };
+  const normal = measureLibraryUsage(normalState);
+
+  assert.equal(normal.bytes, new TextEncoder().encode(JSON.stringify(normalState)).byteLength);
+  assert.equal(normal.byteLimit, LIMITS.stateBytes);
+  assert.equal(normal.notes, 1);
+  assert.equal(normal.noteLimit, LIMITS.notes);
+  assert.equal(normal.level, "normal");
+
+  const warning = measureLibraryUsage({
+    ...createEmptyState(),
+    notes: Array.from({ length: 1_600 }, (_, index) => ({
+      ...base,
+      id: `note-${index}`,
+    })),
+  });
+  const critical = measureLibraryUsage({
+    ...createEmptyState(),
+    notes: Array.from({ length: 1_900 }, (_, index) => ({
+      ...base,
+      id: `note-${index}`,
+    })),
+  });
+
+  assert.equal(warning.level, "warning");
+  assert.equal(critical.level, "critical");
 });
 
 test("replaces imported notes and advances the revision", () => {

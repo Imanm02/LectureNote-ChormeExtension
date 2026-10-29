@@ -383,6 +383,28 @@ export function normalizeState(
   };
 }
 
+export function measureLibraryUsage(stateValue, options = {}) {
+  const state = normalizeState(stateValue, options);
+  const bytes = new TextEncoder().encode(JSON.stringify(state)).byteLength;
+  const ratios = [
+    bytes / LIMITS.stateBytes,
+    state.notes.length / LIMITS.notes,
+    state.trash.length / LIMITS.trash,
+  ];
+  const highestRatio = Math.max(...ratios);
+
+  return {
+    bytes,
+    byteLimit: LIMITS.stateBytes,
+    notes: state.notes.length,
+    noteLimit: LIMITS.notes,
+    trash: state.trash.length,
+    trashLimit: LIMITS.trash,
+    highestRatio,
+    level: highestRatio >= 0.95 ? "critical" : highestRatio >= 0.8 ? "warning" : "normal",
+  };
+}
+
 export function recoverState(value, options = {}) {
   if (!isRecord(value) || !Array.isArray(value.notes)) {
     throw new ValidationError("Saved note data cannot be recovered.", "state-unrecoverable");

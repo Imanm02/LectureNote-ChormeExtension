@@ -72,6 +72,15 @@
         <input id="importFileInput" type="file" accept="application/json,.json" hidden>
       </section>
 
+      <section id="storageUsage" class="storage-usage" aria-labelledby="storageUsageHeading">
+        <div class="storage-usage-copy">
+          <h2 id="storageUsageHeading">Local storage</h2>
+          <p id="storageUsageText">Calculating library size...</p>
+        </div>
+        <meter id="storageUsageMeter" min="0" max="7000000" value="0" aria-labelledby="storageUsageHeading storageUsageText">0 of 7 MB</meter>
+        <p id="storageUsageWarning" class="storage-usage-warning" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+      </section>
+
       <div class="library-feedback">
         <p id="resultSummary" class="result-summary" role="status" aria-live="polite" aria-atomic="true">Loading notes...</p>
         <div class="feedback-actions">
@@ -89,6 +98,17 @@
         <div class="draft-recovery-actions">
           <button id="resumeEditorDraftButton" class="button button-primary" type="button">Resume draft</button>
           <button id="discardEditorDraftButton" class="button button-quiet danger-text" type="button">Discard draft</button>
+        </div>
+      </section>
+
+      <section id="recoveryNotice" class="draft-recovery notice notice-warning" aria-labelledby="recoveryHeading" aria-describedby="recoveryMessage recoveryStatus" hidden>
+        <div>
+          <h2 id="recoveryHeading">Damaged data repaired</h2>
+          <p id="recoveryMessage" class="draft-recovery-message"></p>
+          <p id="recoveryStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <div class="draft-recovery-actions">
+          <button id="acknowledgeRecoveryButton" class="button button-secondary" type="button">Acknowledge</button>
         </div>
       </section>
 
@@ -113,7 +133,7 @@
         <header class="note-card-header">
           <div class="note-heading">
             <p class="note-course" dir="auto" hidden></p>
-            <h2 class="note-title" dir="auto"></h2>
+            <h2 class="note-title"><button class="note-title-button" type="button" data-action="view" dir="auto"></button></h2>
           </div>
           <time class="note-time"></time>
         </header>
@@ -135,6 +155,62 @@
         </footer>
       </article>
     </template>
+
+    <dialog id="detailDialog" class="dialog detail-dialog" aria-labelledby="detailHeading">
+      <div class="dialog-form">
+        <header class="dialog-header">
+          <div>
+            <p class="eyebrow">Note details</p>
+            <h2 id="detailHeading" dir="auto"></h2>
+          </div>
+          <button id="closeDetailButton" class="button button-quiet compact" type="button" aria-label="Close note details">Close</button>
+        </header>
+        <div class="dialog-content detail-content">
+          <dl class="detail-metadata">
+            <div id="detailCourseRow" hidden>
+              <dt>Course</dt>
+              <dd id="detailCourse" dir="auto"></dd>
+            </div>
+            <div id="detailSourceTitleRow" hidden>
+              <dt>Source title</dt>
+              <dd id="detailSourceTitle" dir="auto"></dd>
+            </div>
+            <div id="detailSourceUrlRow" hidden>
+              <dt>Source URL</dt>
+              <dd><a id="detailSourceUrl" target="_blank" rel="noreferrer" dir="auto"></a></dd>
+            </div>
+            <div>
+              <dt>Created</dt>
+              <dd><time id="detailCreated"></time></dd>
+            </div>
+            <div>
+              <dt>Updated</dt>
+              <dd><time id="detailUpdated"></time></dd>
+            </div>
+            <div id="detailDeletedRow" hidden>
+              <dt>Moved to Trash</dt>
+              <dd><time id="detailDeleted"></time></dd>
+            </div>
+          </dl>
+          <section class="detail-note" aria-labelledby="detailBodyHeading">
+            <h3 id="detailBodyHeading">Note text</h3>
+            <p id="detailBody" dir="auto"></p>
+          </section>
+          <p id="detailStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        </div>
+        <footer class="dialog-actions">
+          <button id="detailCopyButton" class="button button-secondary" type="button">Copy note</button>
+          <div id="detailActiveActions" class="detail-actions">
+            <button id="detailEditButton" class="button button-primary" type="button">Edit note</button>
+            <button id="detailDeleteButton" class="button button-quiet danger-text" type="button">Move to Trash</button>
+          </div>
+          <div id="detailTrashActions" class="detail-actions" hidden>
+            <button id="detailRestoreButton" class="button button-primary" type="button">Restore note</button>
+            <button id="detailPermanentDeleteButton" class="button button-quiet danger-text" type="button">Delete permanently</button>
+          </div>
+        </footer>
+      </div>
+    </dialog>
 
     <dialog id="editorDialog" class="dialog editor-dialog" aria-labelledby="editorHeading" aria-describedby="editorStatus">
       <form id="editorForm" class="dialog-form" novalidate>
@@ -243,13 +319,33 @@
       </form>
     </dialog>
 
-    <dialog id="importDialog" class="dialog compact-dialog" aria-labelledby="importHeading" aria-describedby="importMessage importExplanation importStatus">
+    <dialog id="importDialog" class="dialog import-dialog" aria-labelledby="importHeading" aria-describedby="importMessage importExplanation importStatus">
       <div class="dialog-form">
         <div class="dialog-content">
           <p class="eyebrow">Restore backup</p>
           <h2 id="importHeading">Choose how to restore</h2>
           <p id="importMessage"></p>
-          <p id="importExplanation">Merge keeps your current library. Replace removes current notes and Trash entries first.</p>
+          <dl class="import-metadata">
+            <div>
+              <dt>Backup created</dt>
+              <dd id="importExportedAt"></dd>
+            </div>
+            <div>
+              <dt>Schema version</dt>
+              <dd id="importSchemaVersion"></dd>
+            </div>
+          </dl>
+          <section class="import-option" aria-labelledby="mergePreviewHeading">
+            <h3 id="mergePreviewHeading">Merge preview</h3>
+            <p id="mergePreviewMessage"></p>
+            <p id="mergePreviewWarning" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+          </section>
+          <section class="import-option" aria-labelledby="replacePreviewHeading">
+            <h3 id="replacePreviewHeading">Replace preview</h3>
+            <p id="replacePreviewMessage"></p>
+            <p id="replaceSettingsMessage"></p>
+          </section>
+          <p id="importExplanation">Merge keeps current notes and settings. Replace removes current notes and Trash entries, then applies the backup settings.</p>
           <p id="importStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
         </div>
         <footer class="dialog-actions stacked-actions">

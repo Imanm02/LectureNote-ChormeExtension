@@ -123,3 +123,74 @@ test("edits, deletes, and restores a note through the library", async () => {
   controller.destroy();
   setup.dom.window.close();
 });
+
+test("opens a full read-only note before edit or Trash actions", async () => {
+  const fullBody = `Opening summary\n\n${"Detailed explanation ".repeat(45)}`;
+  const saved = {
+    ...note("detail", fullBody, {
+      title: "Full lecture note",
+      course: "Physics",
+      source: { title: "Lecture 4", url: "https://example.com/lecture/4" },
+    }),
+    updatedAt: "2026-09-20T11:30:00.000Z",
+  };
+  const setup = librarySetup([saved]);
+  const controller = await initLibrary({
+    documentValue: setup.dom.window.document,
+    chromeApi: chromeMock(setup.storage),
+    navigatorValue: setup.navigatorValue,
+    urlApi: setup.urlApi,
+  });
+  const documentValue = setup.dom.window.document;
+
+  documentValue.querySelector(".note-excerpt").click();
+  assert.equal(documentValue.getElementById("detailDialog").open, true);
+  assert.equal(documentValue.getElementById("detailHeading").textContent, "Full lecture note");
+  assert.equal(documentValue.getElementById("detailBody").textContent, saved.body);
+  assert.equal(documentValue.getElementById("detailCourse").textContent, "Physics");
+  assert.equal(documentValue.getElementById("detailSourceTitle").textContent, "Lecture 4");
+  assert.equal(
+    documentValue.getElementById("detailSourceUrl").href,
+    "https://example.com/lecture/4",
+  );
+  assert.equal(documentValue.getElementById("detailCreated").dateTime, START);
+  assert.equal(
+    documentValue.getElementById("detailUpdated").dateTime,
+    "2026-09-20T11:30:00.000Z",
+  );
+
+  documentValue.getElementById("detailCopyButton").click();
+  await waitFor(() => setup.copied.length === 1);
+  assert.match(setup.copied[0], /Full lecture note[\s\S]*Detailed explanation/u);
+  assert.match(documentValue.getElementById("detailStatus").textContent, /Copied/u);
+
+  documentValue.getElementById("detailEditButton").click();
+  assert.equal(documentValue.getElementById("detailDialog").open, false);
+  assert.equal(documentValue.getElementById("editorDialog").open, true);
+  assert.equal(documentValue.getElementById("editorBody").value, saved.body);
+  documentValue.getElementById("cancelEditorButton").click();
+  await waitFor(() => !documentValue.getElementById("editorDialog").open);
+
+  documentValue.querySelector("[data-action='view']").click();
+  documentValue.getElementById("detailDeleteButton").click();
+  assert.equal(documentValue.getElementById("detailDialog").open, false);
+  assert.equal(documentValue.getElementById("deleteDialog").open, true);
+  documentValue.getElementById("deleteForm").dispatchEvent(
+    new setup.dom.window.Event("submit", { bubbles: true, cancelable: true }),
+  );
+  await waitFor(() => controller.getState().trash.length === 1);
+  assert.equal(controller.getState().notes.length, 0);
+
+  documentValue.getElementById("trashViewButton").click();
+  documentValue.querySelector("[data-action='view']").click();
+  assert.equal(documentValue.getElementById("detailActiveActions").hidden, true);
+  assert.equal(documentValue.getElementById("detailTrashActions").hidden, false);
+  assert.equal(documentValue.getElementById("detailDeletedRow").hidden, false);
+  documentValue.getElementById("detailRestoreButton").click();
+  await waitFor(() => controller.getState().notes.length === 1);
+  assert.equal(controller.getState().trash.length, 0);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("trashViewButton"));
+
+  controller.destroy();
+  setup.dom.window.close();
+});

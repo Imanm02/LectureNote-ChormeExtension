@@ -2,6 +2,7 @@ import {
   mergeImportedBackup,
   notesToMarkdown,
   parseBackup,
+  previewImportedBackup,
   replaceImportedNotes,
   serializeBackup,
 } from "./backup.js";
@@ -9,6 +10,7 @@ import {
   addNote,
   emptyTrash,
   LIMITS,
+  measureLibraryUsage,
   moveNoteToTrash,
   permanentlyDeleteTrashedNote,
   restoreTrashedNote,
@@ -19,10 +21,11 @@ import {
 import { MESSAGE_TYPES } from "./messages.js";
 import { listCourses, selectNotes } from "./selectors.js";
 import {
+  acknowledgeRecovery,
   assertStateFits,
   clearEditorDraft,
   loadEditorDraft,
-  loadRecoveryInfo,
+  loadRecoveryNotice,
   loadState,
   mutateState,
   mutateStateAndClearEditorDraft,
@@ -65,6 +68,10 @@ function libraryElements(documentValue) {
     exportMarkdown: requiredElement(documentValue, "exportMarkdownButton"),
     importButton: requiredElement(documentValue, "importButton"),
     importFile: requiredElement(documentValue, "importFileInput"),
+    storageUsage: requiredElement(documentValue, "storageUsage"),
+    storageUsageText: requiredElement(documentValue, "storageUsageText"),
+    storageUsageMeter: requiredElement(documentValue, "storageUsageMeter"),
+    storageUsageWarning: requiredElement(documentValue, "storageUsageWarning"),
     summary: requiredElement(documentValue, "resultSummary"),
     status: requiredElement(documentValue, "libraryStatus"),
     retryLoad: requiredElement(documentValue, "retryLoadButton"),
@@ -73,6 +80,10 @@ function libraryElements(documentValue) {
     editorDraftStatus: requiredElement(documentValue, "editorDraftStatus"),
     resumeEditorDraft: requiredElement(documentValue, "resumeEditorDraftButton"),
     discardEditorDraft: requiredElement(documentValue, "discardEditorDraftButton"),
+    recoveryNotice: requiredElement(documentValue, "recoveryNotice"),
+    recoveryMessage: requiredElement(documentValue, "recoveryMessage"),
+    recoveryStatus: requiredElement(documentValue, "recoveryStatus"),
+    acknowledgeRecovery: requiredElement(documentValue, "acknowledgeRecoveryButton"),
     empty: requiredElement(documentValue, "emptyState"),
     emptyHeading: requiredElement(documentValue, "emptyStateHeading"),
     emptyMessage: requiredElement(documentValue, "emptyStateMessage"),
@@ -81,6 +92,28 @@ function libraryElements(documentValue) {
     list: requiredElement(documentValue, "notesList"),
     showMore: requiredElement(documentValue, "showMoreButton"),
     template: requiredElement(documentValue, "noteCardTemplate"),
+    detailDialog: requiredElement(documentValue, "detailDialog"),
+    detailHeading: requiredElement(documentValue, "detailHeading"),
+    detailCourseRow: requiredElement(documentValue, "detailCourseRow"),
+    detailCourse: requiredElement(documentValue, "detailCourse"),
+    detailSourceTitleRow: requiredElement(documentValue, "detailSourceTitleRow"),
+    detailSourceTitle: requiredElement(documentValue, "detailSourceTitle"),
+    detailSourceUrlRow: requiredElement(documentValue, "detailSourceUrlRow"),
+    detailSourceUrl: requiredElement(documentValue, "detailSourceUrl"),
+    detailCreated: requiredElement(documentValue, "detailCreated"),
+    detailUpdated: requiredElement(documentValue, "detailUpdated"),
+    detailDeletedRow: requiredElement(documentValue, "detailDeletedRow"),
+    detailDeleted: requiredElement(documentValue, "detailDeleted"),
+    detailBody: requiredElement(documentValue, "detailBody"),
+    detailStatus: requiredElement(documentValue, "detailStatus"),
+    detailActiveActions: requiredElement(documentValue, "detailActiveActions"),
+    detailTrashActions: requiredElement(documentValue, "detailTrashActions"),
+    detailCopy: requiredElement(documentValue, "detailCopyButton"),
+    detailEdit: requiredElement(documentValue, "detailEditButton"),
+    detailDelete: requiredElement(documentValue, "detailDeleteButton"),
+    detailRestore: requiredElement(documentValue, "detailRestoreButton"),
+    detailPermanentDelete: requiredElement(documentValue, "detailPermanentDeleteButton"),
+    closeDetail: requiredElement(documentValue, "closeDetailButton"),
     editorDialog: requiredElement(documentValue, "editorDialog"),
     editorForm: requiredElement(documentValue, "editorForm"),
     editorHeading: requiredElement(documentValue, "editorHeading"),
@@ -119,6 +152,12 @@ function libraryElements(documentValue) {
     confirmEmptyTrash: requiredElement(documentValue, "confirmEmptyTrashButton"),
     importDialog: requiredElement(documentValue, "importDialog"),
     importMessage: requiredElement(documentValue, "importMessage"),
+    importExportedAt: requiredElement(documentValue, "importExportedAt"),
+    importSchemaVersion: requiredElement(documentValue, "importSchemaVersion"),
+    mergePreviewMessage: requiredElement(documentValue, "mergePreviewMessage"),
+    mergePreviewWarning: requiredElement(documentValue, "mergePreviewWarning"),
+    replacePreviewMessage: requiredElement(documentValue, "replacePreviewMessage"),
+    replaceSettingsMessage: requiredElement(documentValue, "replaceSettingsMessage"),
     importStatus: requiredElement(documentValue, "importStatus"),
     cancelImport: requiredElement(documentValue, "cancelImportButton"),
     mergeImport: requiredElement(documentValue, "mergeImportButton"),
@@ -202,12 +241,21 @@ export async function initLibrary({
   let editorDraftBlocked = false;
   let editorDraftSaveAnnounced = false;
   let editorDraftUnavailable = false;
+  let detailNoteId = null;
+  let detailReturnFocus = null;
   let pendingDelete = null;
   let deleteReturnFocus = null;
   let pendingPermanentDelete = null;
   let permanentDeleteReturnFocus = null;
   let emptyTrashSnapshot = null;
   let pendingImport = null;
+  let pendingImportPreview = null;
+  let pendingReplaceStateSnapshot = null;
+  let replaceInFlight = false;
+  let recoveryInfo = { createdAt: "", rejectedNotes: 0, rejectedDrafts: 0 };
+  let measuredUsageState = null;
+  let measuredUsage = null;
+  const copyResetTimers = new WeakMap();
   let undoRecord = null;
   let searchTimer = null;
   let visibleLimit = DISPLAY_BATCH;
@@ -219,6 +267,69 @@ export async function initLibrary({
 
   function noteWord(count) {
     return count === 1 ? "note" : "notes";
+  }
+
+  function trashWord(count) {
+    return count === 1 ? "Trash entry" : "Trash entries";
+  }
+
+  function formatStorageSize(bytes) {
+    if (bytes < 1_000) {
+      return `${numberFormatter.format(bytes)} B`;
+    }
+    if (bytes < 1_000_000) {
+      return `${numberFormatter.format(Number((bytes / 1_000).toFixed(1)))} KB`;
+    }
+    return `${numberFormatter.format(Number((bytes / 1_000_000).toFixed(2)))} MB`;
+  }
+
+  function themeLabel(value) {
+    return { system: "System", light: "Light", dark: "Dark" }[value] || value;
+  }
+
+  function sortLabel(value) {
+    return {
+      "updated-desc": "Recently updated",
+      "created-desc": "Newest created",
+      "created-asc": "Oldest created",
+      "title-asc": "Title",
+    }[value] || value;
+  }
+
+  function renderStorageUsage() {
+    if (!state) {
+      return;
+    }
+    if (measuredUsageState !== state) {
+      measuredUsageState = state;
+      measuredUsage = measureLibraryUsage(state);
+    }
+    const usage = measuredUsage;
+    elements.storageUsage.dataset.level = usage.level;
+    elements.storageUsageMeter.max = usage.byteLimit;
+    elements.storageUsageMeter.value = usage.bytes;
+    elements.storageUsageMeter.textContent = `${formatStorageSize(usage.bytes)} of ${formatStorageSize(usage.byteLimit)}`;
+    elements.storageUsageText.textContent = `${formatStorageSize(usage.bytes)} of ${formatStorageSize(usage.byteLimit)} used. ${numberFormatter.format(usage.notes)} of ${numberFormatter.format(usage.noteLimit)} active notes, ${numberFormatter.format(usage.trash)} of ${numberFormatter.format(usage.trashLimit)} Trash entries.`;
+    elements.storageUsageWarning.hidden = usage.level === "normal";
+    elements.storageUsageWarning.textContent = usage.level === "critical"
+      ? "The library is very close to a storage or note-count limit. Export a backup, then permanently remove notes you no longer need."
+      : usage.level === "warning"
+        ? "The library is nearing a storage or note-count limit. Export a backup before removing notes."
+        : "";
+  }
+
+  function renderRecoveryNotice() {
+    const rejectedNotes = recoveryInfo.rejectedNotes || 0;
+    const rejectedDrafts = recoveryInfo.rejectedDrafts || 0;
+    const hasRecovery = rejectedNotes > 0 || rejectedDrafts > 0;
+    elements.recoveryNotice.hidden = !hasRecovery;
+    elements.acknowledgeRecovery.disabled = !ready || !hasRecovery;
+    elements.recoveryMessage.textContent = hasRecovery
+      ? `The repair discarded ${numberFormatter.format(rejectedNotes)} invalid ${noteWord(rejectedNotes)} and ${numberFormatter.format(rejectedDrafts)} invalid ${rejectedDrafts === 1 ? "draft" : "drafts"}. Valid saved data was kept.`
+      : "";
+    if (!hasRecovery) {
+      setStatus(elements.recoveryStatus, "", "info");
+    }
   }
 
   function setStatusWithValue(element, prefix, value, suffix, kind = "info") {
@@ -246,6 +357,7 @@ export async function initLibrary({
       elements.showMore,
       elements.resumeEditorDraft,
       elements.discardEditorDraft,
+      elements.acknowledgeRecovery,
     ]) {
       control.disabled = !available;
     }
@@ -301,7 +413,7 @@ export async function initLibrary({
     const course = fragment.querySelector(".note-course");
     course.textContent = note.course;
     course.hidden = !note.course;
-    const title = fragment.querySelector(".note-title");
+    const title = fragment.querySelector(".note-title-button");
     title.textContent = note.title;
     const time = fragment.querySelector(".note-time");
     const trashEntry = viewMode === "trash"
@@ -333,6 +445,7 @@ export async function initLibrary({
     for (const button of fragment.querySelectorAll("button[data-action]")) {
       const action = button.dataset.action;
       const labels = {
+        view: "View details for",
         copy: "Copy",
         edit: "Edit",
         delete: "Move to Trash",
@@ -344,6 +457,84 @@ export async function initLibrary({
     }
 
     return fragment;
+  }
+
+  function findNoteRecord(identifier) {
+    const note = state?.notes.find((candidate) => candidate.id === identifier);
+    if (note) {
+      return { note, trashEntry: null };
+    }
+    const trashEntry = state?.trash.find((entry) => entry.note.id === identifier);
+    return trashEntry ? { note: trashEntry.note, trashEntry } : null;
+  }
+
+  function setDetailTime(element, value) {
+    element.dateTime = value;
+    element.textContent = formatDate(value);
+    element.title = value;
+  }
+
+  function renderDetail() {
+    if (!detailNoteId || !elements.detailDialog.open) {
+      return;
+    }
+    const record = findNoteRecord(detailNoteId);
+    if (!record) {
+      detailNoteId = null;
+      closeDialog(elements.detailDialog);
+      setStatus(elements.status, "This note is no longer in the library.", "warning");
+      return;
+    }
+
+    const { note, trashEntry } = record;
+    elements.detailHeading.textContent = note.title;
+    elements.detailCourse.textContent = note.course;
+    elements.detailCourseRow.hidden = !note.course;
+    elements.detailSourceTitle.textContent = note.source.title;
+    elements.detailSourceTitleRow.hidden = !note.source.title;
+    elements.detailSourceUrl.href = note.source.url || "";
+    elements.detailSourceUrl.textContent = note.source.url;
+    elements.detailSourceUrlRow.hidden = !note.source.url;
+    setDetailTime(elements.detailCreated, note.createdAt);
+    setDetailTime(elements.detailUpdated, note.updatedAt);
+    elements.detailDeletedRow.hidden = !trashEntry;
+    if (trashEntry) {
+      setDetailTime(elements.detailDeleted, trashEntry.deletedAt);
+    } else {
+      elements.detailDeleted.removeAttribute("datetime");
+      elements.detailDeleted.removeAttribute("title");
+      elements.detailDeleted.textContent = "";
+    }
+    elements.detailBody.textContent = note.body;
+    elements.detailActiveActions.hidden = Boolean(trashEntry);
+    elements.detailTrashActions.hidden = !trashEntry;
+    for (const [button, label] of [
+      [elements.detailCopy, "Copy note"],
+      [elements.detailEdit, "Edit note"],
+      [elements.detailDelete, "Move note to Trash"],
+      [elements.detailRestore, "Restore note"],
+      [elements.detailPermanentDelete, "Delete note permanently"],
+    ]) {
+      button.setAttribute("aria-label", `${label}: ${note.title}`);
+    }
+  }
+
+  function openDetail(note, trigger) {
+    const card = trigger?.closest?.("[data-note-id]");
+    detailReturnFocus = card?.querySelector("[data-action='view']") || trigger || elements.newNote;
+    detailNoteId = note.id;
+    setStatus(elements.detailStatus, "", "info");
+    showDialog(elements.detailDialog);
+    renderDetail();
+    elements.closeDetail.focus();
+  }
+
+  function closeDetailForAction() {
+    const target = refreshReturnFocus(detailReturnFocus);
+    detailReturnFocus = null;
+    detailNoteId = null;
+    closeDialog(elements.detailDialog);
+    return target;
   }
 
   function refreshReturnFocus(target) {
@@ -373,6 +564,7 @@ export async function initLibrary({
     const shownNotes = notes.slice(0, visibleLimit);
     elements.list.replaceChildren(...shownNotes.map(createNoteCard));
     editorReturnFocus = refreshReturnFocus(editorReturnFocus);
+    detailReturnFocus = refreshReturnFocus(detailReturnFocus);
     deleteReturnFocus = refreshReturnFocus(deleteReturnFocus);
     permanentDeleteReturnFocus = refreshReturnFocus(permanentDeleteReturnFocus);
 
@@ -415,6 +607,8 @@ export async function initLibrary({
         ? `${numberFormatter.format(total)} ${noteWord(total)} in Trash`
         : `${numberFormatter.format(total)} ${noteWord(total)}`;
     }
+    renderStorageUsage();
+    renderDetail();
     renderEditorDraftRecovery();
   }
 
@@ -1081,7 +1275,7 @@ export async function initLibrary({
       render();
       showUndo({ note: result.note, index: result.index, stateSnapshot: JSON.stringify(state) });
       setStatus(elements.status, "Note moved to Trash. You can restore it now or later from Trash.", "success");
-      const nextFocus = elements.list.querySelector("[data-action='edit']") || elements.newNote;
+      const nextFocus = elements.list.querySelector("[data-action='view']") || elements.newNote;
       nextFocus.focus();
     } catch (error) {
       setStatus(elements.deleteStatus, errorMessage(error), "error");
@@ -1109,7 +1303,7 @@ export async function initLibrary({
       setStatus(elements.status, "Note restored.", "success");
       [...elements.list.querySelectorAll("[data-note-id]")]
         .find((card) => card.dataset.noteId === record.note.id)
-        ?.querySelector("[data-action='edit']")
+        ?.querySelector("[data-action='view']")
         ?.focus();
     } catch (error) {
       setStatus(elements.status, errorMessage(error), "error");
@@ -1135,8 +1329,10 @@ export async function initLibrary({
       hideUndo();
       render();
       setStatusWithValue(elements.status, "Restored “", result.note.title, "”.", "success");
+      (elements.list.querySelector("[data-action='view']") || elements.trashView).focus();
     } catch (error) {
       setStatus(elements.status, errorMessage(error), "error");
+      refreshReturnFocus(button)?.focus?.();
     } finally {
       button.disabled = false;
     }
@@ -1232,18 +1428,26 @@ export async function initLibrary({
     }
   }
 
-  async function copyNote(note, button) {
+  async function copyNote(note, button, statusElement = elements.status) {
+    const idleLabel = button.dataset.copyIdleLabel || button.textContent;
+    button.dataset.copyIdleLabel = idleLabel;
     try {
       await navigatorValue.clipboard.writeText(noteToPlainText(note));
+      const pendingReset = copyResetTimers.get(button);
+      if (pendingReset !== undefined) {
+        timerApi.clearTimeout(pendingReset);
+      }
       button.textContent = "Copied";
-      timerApi.setTimeout(() => {
+      const resetTimer = timerApi.setTimeout(() => {
         if (button.isConnected) {
-          button.textContent = "Copy";
+          button.textContent = idleLabel;
         }
+        copyResetTimers.delete(button);
       }, 1_500);
-      setStatusWithValue(elements.status, "Copied “", note.title, "”.", "success");
+      copyResetTimers.set(button, resetTimer);
+      setStatusWithValue(statusElement, "Copied “", note.title, "”.", "success");
     } catch {
-      setStatus(elements.status, "Chrome could not copy the note. Select its text in the editor instead.", "error");
+      setStatus(statusElement, "Chrome could not copy the note. Select its text in the editor instead.", "error");
     }
   }
 
@@ -1284,6 +1488,67 @@ export async function initLibrary({
     }
   }
 
+  function renderReplaceConfirmation(preview) {
+    elements.replaceMessage.textContent = `This will remove ${numberFormatter.format(preview.replace.removedNotes)} active ${noteWord(preview.replace.removedNotes)} and ${numberFormatter.format(preview.replace.removedTrash)} current ${trashWord(preview.replace.removedTrash)}. It will restore ${numberFormatter.format(preview.replace.resultingNotes)} active ${noteWord(preview.replace.resultingNotes)} and ${numberFormatter.format(preview.replace.resultingTrash)} ${trashWord(preview.replace.resultingTrash)}, then apply the backup theme and sorting.`;
+  }
+
+  function reopenImportPreview(message) {
+    if (!pendingImport) {
+      return;
+    }
+    pendingReplaceStateSnapshot = null;
+    closeDialog(elements.replaceDialog);
+    renderImportPreview();
+    setStatus(elements.importStatus, message, "warning");
+    showDialog(elements.importDialog);
+    elements.replaceImport.focus();
+  }
+
+  function renderImportPreview() {
+    if (!state || !pendingImport) {
+      pendingImportPreview = null;
+      return;
+    }
+
+    const preview = previewImportedBackup(state, pendingImport);
+    pendingImportPreview = preview;
+    elements.importExportedAt.textContent = preview.backup.exportedAt
+      ? formatDate(preview.backup.exportedAt)
+      : "Not recorded";
+    elements.importExportedAt.title = preview.backup.exportedAt || "";
+    elements.importSchemaVersion.textContent = preview.backup.schemaVersion === null
+      ? "Not recorded"
+      : numberFormatter.format(preview.backup.schemaVersion);
+    elements.importMessage.textContent = `This backup contains ${numberFormatter.format(preview.backup.notes)} active ${noteWord(preview.backup.notes)} and ${numberFormatter.format(preview.backup.trash)} ${trashWord(preview.backup.trash)}.`;
+    const skipMessage = preview.merge.skipped === 0
+      ? "No entries will be skipped."
+      : `${numberFormatter.format(preview.merge.skipped)} ${preview.merge.skipped === 1 ? "entry" : "entries"} already present will be skipped.`;
+    const rekeyMessage = preview.merge.rekeyed === 0
+      ? "No note IDs need to change."
+      : `${numberFormatter.format(preview.merge.rekeyed)} colliding note ${preview.merge.rekeyed === 1 ? "ID" : "IDs"} will be changed.`;
+    elements.mergePreviewMessage.textContent = `Merge will add ${numberFormatter.format(preview.merge.added)} active ${noteWord(preview.merge.added)} and ${numberFormatter.format(preview.merge.trashAdded)} ${trashWord(preview.merge.trashAdded)}. ${skipMessage} ${rekeyMessage} The result will have ${numberFormatter.format(preview.merge.resultingNotes)} active ${noteWord(preview.merge.resultingNotes)} and ${numberFormatter.format(preview.merge.resultingTrash)} ${trashWord(preview.merge.resultingTrash)}.`;
+    elements.replacePreviewMessage.textContent = `Replace will remove ${numberFormatter.format(preview.replace.removedNotes)} current active ${noteWord(preview.replace.removedNotes)} and ${numberFormatter.format(preview.replace.removedTrash)} current ${trashWord(preview.replace.removedTrash)}. The result will have ${numberFormatter.format(preview.replace.resultingNotes)} active ${noteWord(preview.replace.resultingNotes)} and ${numberFormatter.format(preview.replace.resultingTrash)} ${trashWord(preview.replace.resultingTrash)}.`;
+    elements.replaceSettingsMessage.textContent = preview.replace.settingsChanged
+      ? `Replace will change the theme from ${themeLabel(preview.replace.currentSettings.theme)} to ${themeLabel(preview.replace.settings.theme)} and sorting from ${sortLabel(preview.replace.currentSettings.sort)} to ${sortLabel(preview.replace.settings.sort)}.`
+      : `Replace will keep the ${themeLabel(preview.replace.settings.theme)} theme and ${sortLabel(preview.replace.settings.sort)} sorting.`;
+    if (elements.replaceDialog.open) {
+      renderReplaceConfirmation(preview);
+    }
+
+    let mergeIssue = "";
+    if (!preview.merge.withinCountLimits) {
+      mergeIssue = "Merge is unavailable because the result would exceed a note-count limit. Replace is still available.";
+    } else {
+      try {
+        assertStateFits(mergeImportedBackup(state, pendingImport).state);
+      } catch (error) {
+        mergeIssue = `${errorMessage(error)} Replace is still available.`;
+      }
+    }
+    elements.mergeImport.disabled = Boolean(mergeIssue);
+    setStatus(elements.mergePreviewWarning, mergeIssue, mergeIssue ? "warning" : "info");
+  }
+
   async function readImportFile(file) {
     if (!file || !state) {
       return;
@@ -1298,14 +1563,15 @@ export async function initLibrary({
       const parsed = parseBackup(await file.text());
       assertStateFits(replaceImportedNotes(state, parsed));
       pendingImport = parsed;
-      const count = pendingImport.notes.length;
-      const trashCount = pendingImport.trash.length;
-      elements.importMessage.textContent = `The backup contains ${numberFormatter.format(count)} active ${noteWord(count)} and ${numberFormatter.format(trashCount)} ${trashCount === 1 ? "Trash entry" : "Trash entries"}.`;
+      pendingReplaceStateSnapshot = null;
+      renderImportPreview();
       setStatus(elements.importStatus, "", "info");
       showDialog(elements.importDialog);
       elements.cancelImport.focus();
     } catch (error) {
       pendingImport = null;
+      pendingImportPreview = null;
+      pendingReplaceStateSnapshot = null;
       setStatus(elements.status, errorMessage(error), "error");
     } finally {
       elements.importFile.value = "";
@@ -1314,6 +1580,10 @@ export async function initLibrary({
 
   async function mergeImport() {
     if (!pendingImport) {
+      return;
+    }
+    renderImportPreview();
+    if (elements.mergeImport.disabled) {
       return;
     }
     const importValue = pendingImport;
@@ -1327,6 +1597,8 @@ export async function initLibrary({
       );
       state = result.state;
       pendingImport = null;
+      pendingImportPreview = null;
+      pendingReplaceStateSnapshot = null;
       closeDialog(elements.importDialog);
       render();
       setStatus(
@@ -1339,25 +1611,41 @@ export async function initLibrary({
       timerApi.setTimeout(() => elements.mergeImport.focus(), 0);
     } finally {
       elements.cancelImport.disabled = false;
-      elements.mergeImport.disabled = false;
       elements.replaceImport.disabled = false;
+      if (pendingImport) {
+        renderImportPreview();
+      } else {
+        elements.mergeImport.disabled = false;
+      }
     }
   }
 
   async function replaceImport() {
-    if (!pendingImport) {
+    if (!pendingImport || pendingReplaceStateSnapshot === null) {
       return;
     }
     const importValue = pendingImport;
+    const confirmedStateSnapshot = pendingReplaceStateSnapshot;
+    replaceInFlight = true;
     elements.cancelReplace.disabled = true;
     elements.confirmReplace.disabled = true;
     try {
       state = await mutateState(
-        (current) => replaceImportedNotes(current, importValue),
+        (current) => {
+          if (JSON.stringify(current) !== confirmedStateSnapshot) {
+            throw new ValidationError(
+              "The library changed after this replacement was confirmed.",
+              "replace-conflict",
+            );
+          }
+          return replaceImportedNotes(current, importValue);
+        },
         storage,
       );
       hideUndo();
       pendingImport = null;
+      pendingImportPreview = null;
+      pendingReplaceStateSnapshot = null;
       closeDialog(elements.replaceDialog);
       applyTheme(state.settings.theme, documentValue);
       render();
@@ -1367,9 +1655,20 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
-      setStatus(elements.replaceStatus, errorMessage(error), "error");
-      timerApi.setTimeout(() => elements.confirmReplace.focus(), 0);
+      if (error instanceof ValidationError && error.code === "replace-conflict") {
+        state = await loadState(storage);
+        applyTheme(state.settings.theme, documentValue);
+        render();
+        replaceInFlight = false;
+        reopenImportPreview(
+          "The library changed in another window. Review the updated restore preview before replacing it.",
+        );
+      } else {
+        setStatus(elements.replaceStatus, errorMessage(error), "error");
+        timerApi.setTimeout(() => elements.confirmReplace.focus(), 0);
+      }
     } finally {
+      replaceInFlight = false;
       elements.cancelReplace.disabled = false;
       elements.confirmReplace.disabled = false;
     }
@@ -1392,9 +1691,36 @@ export async function initLibrary({
     }
   }
 
+  async function acknowledgeRecoveryNotice() {
+    if (!recoveryInfo.rejectedNotes && !recoveryInfo.rejectedDrafts) {
+      return;
+    }
+    elements.acknowledgeRecovery.disabled = true;
+    setStatus(elements.recoveryStatus, "", "info");
+    try {
+      const result = await acknowledgeRecovery(recoveryInfo, storage);
+      recoveryInfo = result.recovery;
+      renderRecoveryNotice();
+      if (result.acknowledged) {
+        setStatus(elements.status, "Recovery notice acknowledged.", "success");
+      } else {
+        setStatus(
+          elements.recoveryStatus,
+          "More recovery information arrived from another window. Review the updated counts before acknowledging it.",
+          "warning",
+        );
+        elements.acknowledgeRecovery.focus();
+      }
+    } catch (error) {
+      setStatus(elements.recoveryStatus, errorMessage(error), "error");
+      elements.acknowledgeRecovery.disabled = false;
+    }
+  }
+
   setLibraryAvailable(false);
   elements.resumeEditorDraft.addEventListener("click", () => void resumeEditorDraft());
   elements.discardEditorDraft.addEventListener("click", () => void discardRecoveredEditorDraft());
+  elements.acknowledgeRecovery.addEventListener("click", () => void acknowledgeRecoveryNotice());
   elements.newNote.addEventListener("click", (event) => openEditor(null, event.currentTarget));
   elements.emptyNewNote.addEventListener("click", (event) =>
     openEditor(null, event.currentTarget),
@@ -1445,18 +1771,20 @@ export async function initLibrary({
     visibleLimit += DISPLAY_BATCH;
     render();
     const firstNewCard = elements.list.querySelectorAll("[data-note-id]")[firstNewIndex];
-    firstNewCard?.querySelector("[data-action='edit']")?.focus();
+    firstNewCard?.querySelector("[data-action='view']")?.focus();
   });
   elements.list.addEventListener("click", (event) => {
     const button = event.target.closest?.("button[data-action]");
-    const card = button?.closest("[data-note-id]");
+    const card = event.target.closest?.("[data-note-id]");
     const note = viewMode === "trash"
       ? state?.trash.find((entry) => entry.note.id === card?.dataset.noteId)?.note
       : state?.notes.find((candidate) => candidate.id === card?.dataset.noteId);
-    if (!button || !note) {
+    if (!note || (!button && event.target.closest?.("a"))) {
       return;
     }
-    if (button.dataset.action === "edit") {
+    if (!button || button.dataset.action === "view") {
+      openDetail(note, button || event.target);
+    } else if (button.dataset.action === "edit") {
       openEditor(note, button);
     } else if (button.dataset.action === "delete") {
       openDelete(note, button);
@@ -1473,6 +1801,55 @@ export async function initLibrary({
         openPermanentDelete(entry, button);
       }
     }
+  });
+
+  elements.closeDetail.addEventListener("click", () => closeDialog(elements.detailDialog));
+  elements.detailDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeDialog(elements.detailDialog);
+  });
+  elements.detailDialog.addEventListener("close", () => {
+    detailNoteId = null;
+    detailReturnFocus?.focus?.();
+    detailReturnFocus = null;
+  });
+  elements.detailCopy.addEventListener("click", () => {
+    const record = findNoteRecord(detailNoteId);
+    if (record) {
+      void copyNote(record.note, elements.detailCopy, elements.detailStatus);
+    }
+  });
+  elements.detailEdit.addEventListener("click", () => {
+    const record = findNoteRecord(detailNoteId);
+    if (!record || record.trashEntry) {
+      return;
+    }
+    const trigger = closeDetailForAction();
+    openEditor(record.note, trigger);
+  });
+  elements.detailDelete.addEventListener("click", () => {
+    const record = findNoteRecord(detailNoteId);
+    if (!record || record.trashEntry) {
+      return;
+    }
+    const trigger = closeDetailForAction();
+    openDelete(record.note, trigger);
+  });
+  elements.detailRestore.addEventListener("click", () => {
+    const record = findNoteRecord(detailNoteId);
+    if (!record?.trashEntry) {
+      return;
+    }
+    const trigger = closeDetailForAction();
+    void restoreFromTrash(record.trashEntry, trigger);
+  });
+  elements.detailPermanentDelete.addEventListener("click", () => {
+    const record = findNoteRecord(detailNoteId);
+    if (!record?.trashEntry) {
+      return;
+    }
+    const trigger = closeDetailForAction();
+    openPermanentDelete(record.trashEntry, trigger);
   });
 
   elements.editorForm.addEventListener("submit", (event) => {
@@ -1584,14 +1961,18 @@ export async function initLibrary({
   elements.importFile.addEventListener("change", () => void readImportFile(elements.importFile.files[0]));
   elements.cancelImport.addEventListener("click", () => {
     pendingImport = null;
+    pendingImportPreview = null;
+    pendingReplaceStateSnapshot = null;
     closeDialog(elements.importDialog);
   });
   elements.importDialog.addEventListener("cancel", (event) => {
-    if (elements.mergeImport.disabled) {
+    if (elements.cancelImport.disabled) {
       event.preventDefault();
       return;
     }
     pendingImport = null;
+    pendingImportPreview = null;
+    pendingReplaceStateSnapshot = null;
   });
   elements.importDialog.addEventListener("close", () => {
     if (!elements.replaceDialog.open) {
@@ -1603,8 +1984,14 @@ export async function initLibrary({
     if (!pendingImport) {
       return;
     }
+    renderImportPreview();
+    const preview = pendingImportPreview;
+    if (!preview) {
+      return;
+    }
+    pendingReplaceStateSnapshot = JSON.stringify(state);
     closeDialog(elements.importDialog);
-    elements.replaceMessage.textContent = `This will remove ${numberFormatter.format(state.notes.length)} active ${noteWord(state.notes.length)} and ${numberFormatter.format(state.trash.length)} current Trash entries. It will restore ${numberFormatter.format(pendingImport.notes.length)} active ${noteWord(pendingImport.notes.length)} and ${numberFormatter.format(pendingImport.trash.length)} Trash entries.`;
+    renderReplaceConfirmation(preview);
     setStatus(elements.replaceStatus, "", "info");
     showDialog(elements.replaceDialog);
     elements.cancelReplace.focus();
@@ -1615,6 +2002,8 @@ export async function initLibrary({
   });
   elements.cancelReplace.addEventListener("click", () => {
     pendingImport = null;
+    pendingImportPreview = null;
+    pendingReplaceStateSnapshot = null;
     closeDialog(elements.replaceDialog);
   });
   elements.replaceDialog.addEventListener("cancel", (event) => {
@@ -1623,6 +2012,8 @@ export async function initLibrary({
       return;
     }
     pendingImport = null;
+    pendingImportPreview = null;
+    pendingReplaceStateSnapshot = null;
   });
   elements.replaceDialog.addEventListener("close", () => elements.importButton.focus());
 
@@ -1736,7 +2127,12 @@ export async function initLibrary({
   const storageChangeHandler = async (changes, areaName) => {
     const stateChanged = Boolean(changes[STORAGE_KEYS.state]);
     const editorDraftChanged = Boolean(changes[STORAGE_KEYS.editorDraft]);
-    if (destroyed || areaName !== "local" || (!stateChanged && !editorDraftChanged)) {
+    const recoveryChanged = Boolean(changes[STORAGE_KEYS.recovery]);
+    if (
+      destroyed ||
+      areaName !== "local" ||
+      (!stateChanged && !editorDraftChanged && !recoveryChanged)
+    ) {
       return;
     }
     try {
@@ -1749,6 +2145,19 @@ export async function initLibrary({
         state = nextState;
         applyTheme(state.settings.theme, documentValue);
         render();
+        if (pendingImport) {
+          renderImportPreview();
+          if (
+            elements.replaceDialog.open &&
+            !replaceInFlight &&
+            pendingReplaceStateSnapshot !== null &&
+            JSON.stringify(state) !== pendingReplaceStateSnapshot
+          ) {
+            reopenImportPreview(
+              "The library changed in another window. Review the updated restore preview before replacing it.",
+            );
+          }
+        }
         restoreCardFocus(focusTarget);
         if (elements.editorDialog.open) {
           const currentEditedNote = editingId
@@ -1801,6 +2210,11 @@ export async function initLibrary({
           }
         }
       }
+
+      if (recoveryChanged) {
+        recoveryInfo = await loadRecoveryNotice(storage);
+        renderRecoveryNotice();
+      }
     } catch (error) {
       if (error instanceof ValidationError && error.code === "editor-draft-version") {
         editorDraftUnavailable = true;
@@ -1848,17 +2262,12 @@ export async function initLibrary({
       render();
       renderEditorDraftRecovery();
       setLibraryAvailable(true);
-      const recovery = await loadRecoveryInfo(storage);
+      recoveryInfo = await loadRecoveryNotice(storage);
+      renderRecoveryNotice();
       if (editorDraftUnavailable) {
         setStatus(
           elements.status,
           "An unfinished draft was saved by a newer extension version. Update the extension before editing notes.",
-          "warning",
-        );
-      } else if (recovery.rejectedNotes || recovery.rejectedDrafts) {
-        setStatus(
-          elements.status,
-          "Some damaged saved data was discarded while the library was repaired.",
           "warning",
         );
       }
