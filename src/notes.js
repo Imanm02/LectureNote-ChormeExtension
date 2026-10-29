@@ -6,6 +6,7 @@ import {
   replaceImportedNotes,
   serializeBackup,
 } from "./backup.js";
+import { requireDataConsent } from "./consent.js";
 import {
   addNote,
   assignCourseToNotes,
@@ -30,7 +31,7 @@ import {
   acknowledgeRecovery,
   assertStateFits,
   clearEditorDraft,
-  loadDataEpoch,
+  loadDataConsent,
   loadEditorDraft,
   loadRecoveryNotice,
   loadState,
@@ -278,9 +279,10 @@ export async function initLibrary({
 } = {}) {
   const elements = libraryElements(documentValue);
   const storage = chromeApi.storage.local;
+  const consentEpoch = await requireDataConsent({ documentValue, chromeApi });
   const numberFormatter = new Intl.NumberFormat(documentValue.documentElement.lang || undefined);
   let state;
-  let dataEpoch = "";
+  let dataEpoch = consentEpoch;
   let dataResetConflict = false;
   let editingId = null;
   let editingSnapshot = null;
@@ -343,6 +345,8 @@ export async function initLibrary({
   let courseSignature = "";
   let managedCourseSignature = "";
   let ready = false;
+  let consentGateActive = false;
+  let consentGeneration = 0;
   let hashHandled = false;
   let destroyed = false;
 
@@ -354,77 +358,65 @@ export async function initLibrary({
     return count === 1 ? "Trash entry" : "Trash entries";
   }
 
-  function expectedEpochOptions(options = {}) {
-    return { ...options, expectedEpoch: dataEpoch };
+  function expectedEpochOptions(options = {}, expectedEpoch = dataEpoch) {
+    return { ...options, expectedEpoch };
+  }
+
+  function isCurrentConsent(generation, epoch) {
+    return !destroyed &&
+      !consentGateActive &&
+      generation === consentGeneration &&
+      epoch === dataEpoch;
+  }
+
+  function consentActionToken() {
+    return { generation: consentGeneration, epoch: dataEpoch };
+  }
+
+  function isCurrentConsentAction(token) {
+    return isCurrentConsent(token.generation, token.epoch);
   }
 
   function isDataResetError(error) {
     return error instanceof ValidationError && error.code === "data-reset";
   }
 
-  async function assertCurrentDataEpoch() {
-    const currentEpoch = await loadDataEpoch(storage);
-    if (dataEpoch && currentEpoch !== dataEpoch) {
+  async function assertCurrentDataEpoch(expectedEpoch = dataEpoch) {
+    const currentEpoch = await loadDataConsent(storage, { expectedEpoch });
+    if (!currentEpoch || currentEpoch !== expectedEpoch) {
       throw new ValidationError(
-        "The note data was reset in another window. This older page cannot read or save changes.",
+        "The note data choice changed in another window. This older page cannot read or save changes.",
         "data-reset",
       );
     }
   }
 
-  async function readStateForPage() {
-    await assertCurrentDataEpoch();
-    const value = await loadState(storage, expectedEpochOptions());
-    await assertCurrentDataEpoch();
+  async function readStateForPage(expectedEpoch = dataEpoch) {
+    await assertCurrentDataEpoch(expectedEpoch);
+    const value = await loadState(storage, { expectedEpoch });
+    await assertCurrentDataEpoch(expectedEpoch);
     return value;
   }
 
-  async function readEditorDraftForPage() {
-    await assertCurrentDataEpoch();
-    const value = await loadEditorDraft(storage, expectedEpochOptions());
-    await assertCurrentDataEpoch();
+  async function readEditorDraftForPage(expectedEpoch = dataEpoch) {
+    await assertCurrentDataEpoch(expectedEpoch);
+    const value = await loadEditorDraft(storage, { expectedEpoch });
+    await assertCurrentDataEpoch(expectedEpoch);
     return value;
   }
 
-  async function readRecoveryForPage() {
-    await assertCurrentDataEpoch();
-    const value = await loadRecoveryNotice(storage, expectedEpochOptions());
-    await assertCurrentDataEpoch();
+  async function readRecoveryForPage(expectedEpoch = dataEpoch) {
+    await assertCurrentDataEpoch(expectedEpoch);
+    const value = await loadRecoveryNotice(storage, { expectedEpoch });
+    await assertCurrentDataEpoch(expectedEpoch);
     return value;
   }
 
   function markDataResetConflict(statusElement = elements.status) {
-    dataResetConflict = true;
-    editorDraftBlocked = elements.editorDialog.open;
-    if (elements.editorDialog.open) {
-      if (editorDirty) {
-        editorDraftSynced = false;
-      }
-      setStatus(
-        elements.editorStatus,
-        editorDirty
-          ? "Saved data was reset in another window. This editor text is still here, but this older page cannot save it. Copy the text, then reload the library."
-          : "Saved data was reset in another window. This editor can no longer save from this older page. Reload the library before editing.",
-        "error",
-      );
-      setEditorBusy(false);
-    }
-    setLibraryAvailable(false);
-    elements.retryLoad.textContent = "Reload page";
-    elements.retryLoad.hidden = false;
-    elements.summary.textContent = "Reload required";
-    setStatus(
-      elements.status,
-      "Saved data was reset in another window. Reload this page before making more changes.",
-      "error",
+    void statusElement;
+    enterConsentGateAfterReset(
+      "Local data was cleared in another window. Allow local note capture to start again.",
     );
-    if (statusElement !== elements.status && statusElement !== elements.editorStatus) {
-      setStatus(
-        statusElement,
-        "Saved data was reset in another window. Reload this page before trying again.",
-        "error",
-      );
-    }
   }
 
   function reportActionError(error, statusElement = elements.status) {
@@ -516,6 +508,10 @@ export async function initLibrary({
   }
 
   function renderRecoveryNotice() {
+    if (consentGateActive || dataResetConflict || destroyed) {
+      elements.recoveryNotice.hidden = true;
+      return;
+    }
     const rejectedNotes = recoveryInfo.rejectedNotes || 0;
     const rejectedDrafts = recoveryInfo.rejectedDrafts || 0;
     const hasRecovery = rejectedNotes > 0 || rejectedDrafts > 0;
@@ -1099,6 +1095,9 @@ export async function initLibrary({
   }
 
   function render() {
+    if (!state || consentGateActive || dataResetConflict || destroyed) {
+      return;
+    }
     if (!state) {
       return;
     }
@@ -1248,33 +1247,44 @@ export async function initLibrary({
       return true;
     }
     const generation = editorDraftGeneration;
+    const consentToken = consentActionToken();
     const draft = formEditorDraft();
     try {
       return await enqueueEditorDraftOperation(async () => {
-        if (destroyed || !elements.editorDialog.open || (!force && generation !== editorDraftGeneration)) {
+        if (
+          !isCurrentConsentAction(consentToken) ||
+          !elements.editorDialog.open ||
+          (!force && generation !== editorDraftGeneration)
+        ) {
           return true;
         }
         if (editorDraftBlocked) {
           return false;
         }
         let result = await saveEditorDraft(draft, storage, {
-          expectedEpoch: dataEpoch,
+          expectedEpoch: consentToken.epoch,
           sessionId: editorSessionId,
           expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
           expectedGeneration: editorDraftRecord.generation,
           contentGeneration: generation,
         });
+        if (!isCurrentConsentAction(consentToken)) {
+          return false;
+        }
         if (!result.saved && !result.record.draft) {
           adoptEditorDraftRecord(result.record);
           externalEditorDraftRecord = null;
           editorDraftBlocked = false;
           result = await saveEditorDraft(draft, storage, {
-            expectedEpoch: dataEpoch,
+            expectedEpoch: consentToken.epoch,
             sessionId: editorSessionId,
             expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
             expectedGeneration: editorDraftRecord.generation,
             contentGeneration: generation,
           });
+          if (!isCurrentConsentAction(consentToken)) {
+            return false;
+          }
         }
         if (!result.saved) {
           if (
@@ -1300,6 +1310,9 @@ export async function initLibrary({
         return savedCurrentInput;
       });
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return false;
+      }
       editorDraftSynced = false;
       if (isDataResetError(error)) {
         markDataResetConflict(elements.editorStatus);
@@ -1316,8 +1329,12 @@ export async function initLibrary({
 
   async function clearCurrentEditorDraft() {
     const generation = editorDraftGeneration;
+    const consentToken = consentActionToken();
     try {
       return await enqueueEditorDraftOperation(async () => {
+        if (!isCurrentConsentAction(consentToken)) {
+          return false;
+        }
         if (editorDraftBlocked) {
           const cleanCurrentInput = generation === editorDraftGeneration && !editorDirty;
           editorDraftSynced = cleanCurrentInput;
@@ -1329,12 +1346,15 @@ export async function initLibrary({
           return cleanCurrentInput;
         }
         const result = await clearEditorDraft(storage, {
-          expectedEpoch: dataEpoch,
+          expectedEpoch: consentToken.epoch,
           sessionId: editorSessionId,
           expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
           expectedGeneration: editorDraftRecord.generation,
           contentGeneration: generation,
         });
+        if (!isCurrentConsentAction(consentToken)) {
+          return false;
+        }
         if (!result.saved) {
           if (
             !result.record.draft ||
@@ -1358,6 +1378,9 @@ export async function initLibrary({
         return clearedCurrentInput;
       });
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return false;
+      }
       editorDraftSynced = false;
       if (isDataResetError(error)) {
         markDataResetConflict(elements.editorStatus);
@@ -1378,13 +1401,24 @@ export async function initLibrary({
   }
 
   async function flushEditorDraft() {
+    const consentToken = consentActionToken();
     cancelEditorDraftTimer();
     const saved = editorDirty ? await persistEditorDraft(true) : await clearCurrentEditorDraft();
+    if (!isCurrentConsentAction(consentToken)) {
+      return false;
+    }
     await editorDraftQueue;
+    if (!isCurrentConsentAction(consentToken)) {
+      return false;
+    }
     return saved;
   }
 
   function renderEditorDraftRecovery(record = externalEditorDraftRecord || editorDraftRecord) {
+    if (consentGateActive || dataResetConflict || destroyed) {
+      elements.editorDraftRecovery.hidden = true;
+      return;
+    }
     const draft = record?.draft;
     if (!draft || elements.editorDialog.open) {
       elements.editorDraftRecovery.hidden = true;
@@ -1466,6 +1500,7 @@ export async function initLibrary({
     editorDraftBlocked = false;
     externalEditorDraftRecord = null;
     editorDraftSaveAnnounced = synced && editorDirty;
+    setEditorBusy(false);
     showDialog(elements.editorDialog);
     elements.editorDraftRecovery.hidden = true;
     elements.editorTitle.focus();
@@ -1520,9 +1555,13 @@ export async function initLibrary({
   }
 
   async function requestCloseEditor() {
+    const consentToken = consentActionToken();
     setEditorBusy(true);
     const hadDraft = editorDirty;
     const saved = await flushEditorDraft();
+    if (!isCurrentConsentAction(consentToken)) {
+      return;
+    }
     if (!saved) {
       setEditorBusy(false);
       const confirmDiscard = confirmDiscardDraft || ((message) => documentValue.defaultView.confirm(message));
@@ -1548,13 +1587,20 @@ export async function initLibrary({
   }
 
   async function resumeEditorDraft() {
+    const consentToken = consentActionToken();
     let focusAfter = null;
     elements.resumeEditorDraft.disabled = true;
     elements.discardEditorDraft.disabled = true;
     setStatus(elements.editorDraftStatus, "", "info");
     try {
-      const nextState = await readStateForPage();
-      const record = await readEditorDraftForPage();
+      const nextState = await readStateForPage(consentToken.epoch);
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
+      const record = await readEditorDraftForPage(consentToken.epoch);
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (!record.draft) {
         state = nextState;
         editorDraftRecord = record;
@@ -1578,12 +1624,15 @@ export async function initLibrary({
         : draft;
       const sessionId = crypto.randomUUID();
       const claimed = await saveEditorDraft(claimedDraft, storage, {
-        expectedEpoch: dataEpoch,
+        expectedEpoch: consentToken.epoch,
         sessionId,
         expectedOwnerSessionId: record.ownerSessionId,
         expectedGeneration: record.generation,
         contentGeneration: 1,
       });
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (!claimed.saved) {
         state = nextState;
         editorDraftRecord = claimed.record;
@@ -1625,6 +1674,9 @@ export async function initLibrary({
         recoveryCopy ? "warning" : "success",
       );
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (isDataResetError(error)) {
         markDataResetConflict(elements.editorDraftStatus);
       } else {
@@ -1632,14 +1684,17 @@ export async function initLibrary({
       }
       focusAfter = elements.resumeEditorDraft;
     } finally {
-      elements.resumeEditorDraft.disabled = false;
-      elements.discardEditorDraft.disabled = false;
-      focusAfter?.focus();
+      if (isCurrentConsentAction(consentToken)) {
+        elements.resumeEditorDraft.disabled = false;
+        elements.discardEditorDraft.disabled = false;
+        focusAfter?.focus();
+      }
     }
   }
 
   async function discardRecoveredEditorDraft() {
     const record = externalEditorDraftRecord || editorDraftRecord;
+    const consentToken = consentActionToken();
     if (!record.draft) {
       renderEditorDraftRecovery(record);
       return;
@@ -1656,11 +1711,14 @@ export async function initLibrary({
     let focusAfter = null;
     try {
       const result = await clearEditorDraft(storage, {
-        expectedEpoch: dataEpoch,
+        expectedEpoch: consentToken.epoch,
         sessionId: crypto.randomUUID(),
         expectedOwnerSessionId: record.ownerSessionId,
         expectedGeneration: record.generation,
       });
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (!result.saved) {
         editorDraftRecord = result.record;
         externalEditorDraftRecord = null;
@@ -1675,6 +1733,9 @@ export async function initLibrary({
       setStatus(elements.status, "Draft discarded.", "success");
       focusAfter = elements.newNote;
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (isDataResetError(error)) {
         markDataResetConflict(elements.editorDraftStatus);
       } else {
@@ -1682,9 +1743,11 @@ export async function initLibrary({
       }
       focusAfter = elements.discardEditorDraft;
     } finally {
-      elements.resumeEditorDraft.disabled = false;
-      elements.discardEditorDraft.disabled = false;
-      focusAfter?.focus();
+      if (isCurrentConsentAction(consentToken)) {
+        elements.resumeEditorDraft.disabled = false;
+        elements.discardEditorDraft.disabled = false;
+        focusAfter?.focus();
+      }
     }
   }
 
@@ -1713,6 +1776,7 @@ export async function initLibrary({
       return;
     }
     const editingIdentifier = editingId;
+    const consentToken = consentActionToken();
     const originalSnapshot = editingSnapshot;
     const input = editorInput();
     const wasRecoveryCopy = recoveringAsCopy;
@@ -1725,6 +1789,9 @@ export async function initLibrary({
       cancelEditorDraftTimer();
       editorDraftGeneration += 1;
       await flushEditorDraft();
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       const result = await mutateStateAndClearEditorDraft(
         (current) => {
           if (!editingIdentifier) {
@@ -1747,12 +1814,15 @@ export async function initLibrary({
         },
         storage,
         {
-          expectedEpoch: dataEpoch,
+          expectedEpoch: consentToken.epoch,
           sessionId: editorSessionId,
           expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
           expectedGeneration: editorDraftRecord.generation,
         },
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       editorDraftRecord = result.editorDraftRecord;
       externalEditorDraftRecord = null;
@@ -1776,19 +1846,30 @@ export async function initLibrary({
         ?.querySelector("[data-action='edit']")
         ?.focus();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (isDataResetError(error)) {
         markDataResetConflict(elements.editorStatus);
       } else if (error instanceof ValidationError && error.code === "duplicate") {
         elements.editorDuplicate.hidden = false;
         setStatus(elements.editorStatus, "Review the duplicate warning before saving.", "warning");
-        timerApi.setTimeout(() => elements.editorSaveDuplicate.focus(), 0);
+        timerApi.setTimeout(() => {
+          if (isCurrentConsentAction(consentToken)) {
+            elements.editorSaveDuplicate.focus();
+          }
+        }, 0);
       } else if (
         error instanceof ValidationError &&
         ["edit-conflict", "note-missing"].includes(error.code)
       ) {
         elements.editorConflict.hidden = false;
         setStatus(elements.editorStatus, "", "info");
-        timerApi.setTimeout(() => elements.saveEditorAsNew.focus(), 0);
+        timerApi.setTimeout(() => {
+          if (isCurrentConsentAction(consentToken)) {
+            elements.saveEditorAsNew.focus();
+          }
+        }, 0);
       } else {
         if (error instanceof ValidationError && error.code === "body-required") {
           elements.editorBody.setAttribute("aria-invalid", "true");
@@ -1802,9 +1883,13 @@ export async function initLibrary({
         setStatus(elements.editorStatus, errorMessage(error), "error");
       }
     } finally {
-      setEditorBusy(false);
+      if (isCurrentConsentAction(consentToken)) {
+        setEditorBusy(false);
+      }
     }
-    focusTarget?.focus();
+    if (isCurrentConsentAction(consentToken)) {
+      focusTarget?.focus();
+    }
   }
 
   function openDelete(note, trigger) {
@@ -1826,6 +1911,7 @@ export async function initLibrary({
 
   function hideUndo() {
     elements.undoBar.hidden = true;
+    elements.undo.disabled = false;
     undoRecord = null;
   }
 
@@ -1840,6 +1926,7 @@ export async function initLibrary({
       return;
     }
     const noteToDelete = pendingDelete;
+    const consentToken = consentActionToken();
     elements.confirmDelete.disabled = true;
     elements.cancelDelete.disabled = true;
     try {
@@ -1855,7 +1942,10 @@ export async function initLibrary({
           );
         }
         return moveNoteToTrash(current, noteToDelete.id);
-      }, storage, expectedEpochOptions());
+      }, storage, expectedEpochOptions({}, consentToken.epoch));
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       pendingDelete = null;
       deleteReturnFocus = null;
@@ -1866,11 +1956,20 @@ export async function initLibrary({
       const nextFocus = elements.list.querySelector("[data-action='view']") || elements.newNote;
       nextFocus.focus();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error, elements.deleteStatus);
-      timerApi.setTimeout(() => elements.confirmDelete.focus(), 0);
+      timerApi.setTimeout(() => {
+        if (isCurrentConsentAction(consentToken)) {
+          elements.confirmDelete.focus();
+        }
+      }, 0);
     } finally {
-      elements.confirmDelete.disabled = false;
-      elements.cancelDelete.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.confirmDelete.disabled = false;
+        elements.cancelDelete.disabled = false;
+      }
     }
   }
 
@@ -1879,13 +1978,17 @@ export async function initLibrary({
       return;
     }
     elements.undo.disabled = true;
+    const consentToken = consentActionToken();
     try {
       const record = undoRecord;
       const result = await mutateState(
         (current) => restoreTrashedNote(current, record.note.id),
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       hideUndo();
       render();
@@ -1895,13 +1998,19 @@ export async function initLibrary({
         ?.querySelector("[data-action='view']")
         ?.focus();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error);
     } finally {
-      elements.undo.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.undo.disabled = false;
+      }
     }
   }
 
   async function restoreFromTrash(entry, button) {
+    const consentToken = consentActionToken();
     button.disabled = true;
     try {
       const result = await mutateState((current) => {
@@ -1913,17 +2022,27 @@ export async function initLibrary({
           throw new ValidationError("This Trash entry changed in another window. Review it before restoring.", "trash-conflict");
         }
         return restoreTrashedNote(current, entry.note.id);
-      }, storage, expectedEpochOptions());
+      }, storage, expectedEpochOptions({}, consentToken.epoch));
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       hideUndo();
       render();
       setStatusWithValue(elements.status, "Restored “", result.note.title, "”.", "success");
       (elements.list.querySelector("[data-action='view']") || elements.trashView).focus();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error);
-      refreshReturnFocus(button)?.focus?.();
+      if (isCurrentConsentAction(consentToken)) {
+        refreshReturnFocus(button)?.focus?.();
+      }
     } finally {
-      button.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        button.disabled = false;
+      }
     }
   }
 
@@ -1944,6 +2063,7 @@ export async function initLibrary({
       return;
     }
     const entry = pendingPermanentDelete;
+    const consentToken = consentActionToken();
     elements.confirmPermanentDelete.disabled = true;
     elements.cancelPermanentDelete.disabled = true;
     try {
@@ -1956,7 +2076,10 @@ export async function initLibrary({
           throw new ValidationError("This Trash entry changed in another window. Close this confirmation and review it.", "trash-conflict");
         }
         return permanentlyDeleteTrashedNote(current, entry.note.id);
-      }, storage, expectedEpochOptions());
+      }, storage, expectedEpochOptions({}, consentToken.epoch));
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       pendingPermanentDelete = null;
       permanentDeleteReturnFocus = null;
@@ -1965,11 +2088,20 @@ export async function initLibrary({
       setStatus(elements.status, "Note permanently deleted.", "success");
       (elements.list.querySelector("[data-action='restore']") || elements.trashView).focus();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error, elements.permanentDeleteStatus);
-      timerApi.setTimeout(() => elements.confirmPermanentDelete.focus(), 0);
+      timerApi.setTimeout(() => {
+        if (isCurrentConsentAction(consentToken)) {
+          elements.confirmPermanentDelete.focus();
+        }
+      }, 0);
     } finally {
-      elements.confirmPermanentDelete.disabled = false;
-      elements.cancelPermanentDelete.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.confirmPermanentDelete.disabled = false;
+        elements.cancelPermanentDelete.disabled = false;
+      }
     }
   }
 
@@ -1990,6 +2122,7 @@ export async function initLibrary({
       return;
     }
     const snapshot = emptyTrashSnapshot;
+    const consentToken = consentActionToken();
     elements.confirmEmptyTrash.disabled = true;
     elements.cancelEmptyTrash.disabled = true;
     try {
@@ -2001,7 +2134,10 @@ export async function initLibrary({
           );
         }
         return emptyTrash(current);
-      }, storage, expectedEpochOptions());
+      }, storage, expectedEpochOptions({}, consentToken.epoch));
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       emptyTrashSnapshot = null;
       closeDialog(elements.emptyTrashDialog);
@@ -2009,21 +2145,34 @@ export async function initLibrary({
       setStatus(elements.status, `${numberFormatter.format(result.deleted)} ${noteWord(result.deleted)} permanently deleted.`, "success");
       elements.trashView.focus();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error, elements.emptyTrashStatus);
-      timerApi.setTimeout(() => elements.confirmEmptyTrash.focus(), 0);
+      timerApi.setTimeout(() => {
+        if (isCurrentConsentAction(consentToken)) {
+          elements.confirmEmptyTrash.focus();
+        }
+      }, 0);
     } finally {
-      elements.confirmEmptyTrash.disabled = false;
-      elements.cancelEmptyTrash.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.confirmEmptyTrash.disabled = false;
+        elements.cancelEmptyTrash.disabled = false;
+      }
     }
   }
 
   async function copyNote(note, button, statusElement = elements.status) {
+    const consentToken = consentActionToken();
     const idleLabel = button.dataset.copyIdleLabel || button.textContent;
     button.dataset.copyIdleLabel = idleLabel;
     try {
       await navigatorValue.clipboard.writeText(noteToPlainText(note, {
         includeSource: elements.includeSourceOnShare.checked,
       }));
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       const pendingReset = copyResetTimers.get(button);
       if (pendingReset !== undefined) {
         timerApi.clearTimeout(pendingReset);
@@ -2038,6 +2187,9 @@ export async function initLibrary({
       copyResetTimers.set(button, resetTimer);
       setStatusWithValue(statusElement, "Copied “", note.title, "”.", "success");
     } catch {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       setStatus(statusElement, "Chrome could not copy the note. Select its text in the editor instead.", "error");
     }
   }
@@ -2058,8 +2210,11 @@ export async function initLibrary({
     }
   }
 
-  async function readFreshExportState(validate) {
-    const nextState = await readStateForPage();
+  async function readFreshExportState(validate, consentToken = consentActionToken()) {
+    const nextState = await readStateForPage(consentToken.epoch);
+    if (!isCurrentConsentAction(consentToken)) {
+      return null;
+    }
     let validationError = null;
     try {
       validate?.(nextState);
@@ -2078,13 +2233,20 @@ export async function initLibrary({
       setStatus(statusElement, "The library is not available yet.", "error");
       return false;
     }
+    const consentToken = consentActionToken();
     try {
-      const latestState = await readFreshExportState();
+      const latestState = await readFreshExportState(undefined, consentToken);
+      if (!latestState || !isCurrentConsentAction(consentToken)) {
+        return false;
+      }
       const text = serializeBackup(latestState);
       downloadText(text, backupFilename("json"), "application/json", documentValue, urlApi);
       setStatus(statusElement, "Backup exported.", "success");
       return true;
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return false;
+      }
       reportActionError(error, statusElement);
       return false;
     }
@@ -2097,8 +2259,12 @@ export async function initLibrary({
     }
     const viewOptions = currentViewOptions();
     const includeSource = elements.includeSourceOnShare.checked;
+    const consentToken = consentActionToken();
     try {
-      const latestState = await readFreshExportState();
+      const latestState = await readFreshExportState(undefined, consentToken);
+      if (!latestState || !isCurrentConsentAction(consentToken)) {
+        return;
+      }
       const notes = notesForView(latestState, viewOptions);
       if (notes.length === 0) {
         setStatus(elements.status, "No notes match the current view.", "warning");
@@ -2114,6 +2280,9 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error);
     }
   }
@@ -2184,20 +2353,213 @@ export async function initLibrary({
     elements.cancelReset.focus();
   }
 
-  function resetLocalPage(result) {
+  function purgeLibraryDataFromPage() {
+    const windowValue = documentValue.defaultView;
+    if (windowValue?.location.hash) {
+      windowValue.history.replaceState(
+        null,
+        "",
+        `${windowValue.location.pathname}${windowValue.location.search}`,
+      );
+    }
+    const allCourses = documentValue.createElement("option");
+    allCourses.value = "";
+    allCourses.textContent = "All courses";
+    elements.course.replaceChildren(allCourses);
+    elements.courseSuggestions.replaceChildren();
+    elements.manageCourseSelect.replaceChildren();
+    elements.manageCourseSuggestions.replaceChildren();
+    elements.list.replaceChildren();
+    const detailCopyReset = copyResetTimers.get(elements.detailCopy);
+    if (detailCopyReset !== undefined) {
+      timerApi.clearTimeout(detailCopyReset);
+      copyResetTimers.delete(elements.detailCopy);
+    }
+    elements.detailCopy.textContent = "Copy note";
+    delete elements.detailCopy.dataset.copyIdleLabel;
+
+    for (const input of [
+      elements.search,
+      elements.importFile,
+      elements.editorTitle,
+      elements.editorCourse,
+      elements.editorBody,
+      elements.editorSourceTitle,
+      elements.editorSourceUrl,
+      elements.bulkCourseInput,
+      elements.manageCourseInput,
+      elements.resetConfirmation,
+    ]) {
+      input.value = "";
+    }
+
+    elements.course.value = "";
+    elements.sort.value = "updated-desc";
+    elements.theme.value = "system";
+    elements.includeSourceOnShare.checked = false;
+    elements.editorSourceDetails.open = false;
+    elements.editorDuplicate.hidden = true;
+    elements.editorConflict.hidden = true;
+    elements.editorForm.inert = false;
+    elements.editorForm.setAttribute("aria-busy", "false");
+    elements.saveEditor.disabled = true;
+    elements.editorSaveDuplicate.disabled = true;
+    elements.saveEditorAsNew.disabled = true;
+    elements.manageCoursesForm.setAttribute("aria-busy", "false");
+    elements.bulkCourseForm.setAttribute("aria-busy", "false");
+    elements.deleteForm.setAttribute("aria-busy", "false");
+    elements.permanentDeleteForm.setAttribute("aria-busy", "false");
+    elements.emptyTrashForm.setAttribute("aria-busy", "false");
+    elements.bulkConfirmForm.setAttribute("aria-busy", "false");
+    elements.importDialog.setAttribute("aria-busy", "false");
+    elements.replaceForm.setAttribute("aria-busy", "false");
+    for (const control of [
+      elements.cancelEditor,
+      elements.closeEditor,
+      elements.confirmDelete,
+      elements.cancelDelete,
+      elements.confirmPermanentDelete,
+      elements.cancelPermanentDelete,
+      elements.confirmEmptyTrash,
+      elements.cancelEmptyTrash,
+      elements.bulkCourseInput,
+      elements.cancelBulkCourse,
+      elements.clearBulkCourse,
+      elements.applyBulkCourse,
+      elements.cancelBulkConfirm,
+      elements.confirmBulkAction,
+      elements.manageCourseSelect,
+      elements.cancelManageCourses,
+      elements.cancelImport,
+      elements.mergeImport,
+      elements.replaceImport,
+      elements.cancelReplace,
+      elements.confirmReplace,
+    ]) {
+      control.disabled = false;
+    }
+    elements.editorDraftRecovery.hidden = true;
+    elements.recoveryNotice.hidden = true;
+    elements.detailCourseRow.hidden = true;
+    elements.detailSourceTitleRow.hidden = true;
+    elements.detailSourceUrlRow.hidden = true;
+    elements.detailDeletedRow.hidden = true;
+    elements.detailSourceUrl.removeAttribute("href");
+    elements.detailCreated.removeAttribute("datetime");
+    elements.detailUpdated.removeAttribute("datetime");
+    elements.detailDeleted.removeAttribute("datetime");
+    elements.detailCreated.removeAttribute("title");
+    elements.detailUpdated.removeAttribute("title");
+    elements.detailDeleted.removeAttribute("title");
+    for (const button of [
+      elements.detailCopy,
+      elements.detailEdit,
+      elements.detailDelete,
+      elements.detailRestore,
+      elements.detailPermanentDelete,
+    ]) {
+      button.removeAttribute("aria-label");
+    }
+    elements.importExportedAt.removeAttribute("title");
+    elements.detailActiveActions.hidden = false;
+    elements.detailTrashActions.hidden = true;
+    elements.activeFilters.hidden = true;
+    elements.selectionToolbar.hidden = true;
+    elements.activeSelectionActions.hidden = false;
+    elements.trashSelectionActions.hidden = true;
+    elements.empty.hidden = true;
+    elements.noResults.hidden = true;
+    elements.showMore.hidden = true;
+    elements.emptyTrash.hidden = true;
+    elements.undoBar.hidden = true;
+    elements.undo.disabled = false;
+
+    for (const node of [
+      elements.activeFilterSummary,
+      elements.editorDraftMessage,
+      elements.editorDraftStatus,
+      elements.recoveryMessage,
+      elements.recoveryStatus,
+      elements.detailHeading,
+      elements.detailCourse,
+      elements.detailSourceTitle,
+      elements.detailSourceUrl,
+      elements.detailCreated,
+      elements.detailUpdated,
+      elements.detailDeleted,
+      elements.detailBody,
+      elements.detailStatus,
+      elements.editorStatus,
+      elements.deleteMessage,
+      elements.deleteStatus,
+      elements.permanentDeleteMessage,
+      elements.permanentDeleteStatus,
+      elements.emptyTrashMessage,
+      elements.emptyTrashStatus,
+      elements.bulkCourseMessage,
+      elements.bulkCourseStatus,
+      elements.bulkConfirmEyebrow,
+      elements.bulkConfirmHeading,
+      elements.bulkConfirmMessage,
+      elements.bulkConfirmWarning,
+      elements.bulkConfirmStatus,
+      elements.manageCoursesMessage,
+      elements.manageCoursesPreview,
+      elements.manageCoursesStatus,
+      elements.resetMessage,
+      elements.resetStatus,
+      elements.importMessage,
+      elements.importExportedAt,
+      elements.importSchemaVersion,
+      elements.mergePreviewMessage,
+      elements.mergePreviewWarning,
+      elements.replacePreviewMessage,
+      elements.replaceSettingsMessage,
+      elements.importStatus,
+      elements.replaceMessage,
+      elements.replaceStatus,
+      elements.storageUsageWarning,
+    ]) {
+      node.replaceChildren();
+      node.removeAttribute("data-kind");
+    }
+
+    elements.editorHeading.textContent = "New note";
+    elements.saveEditor.textContent = "Save note";
+    elements.editorBodyCount.textContent = `0 / ${numberFormatter.format(LIMITS.body)}`;
+    elements.selectionCount.textContent = "0 notes selected";
+    elements.activeNoteCount.textContent = "0";
+    elements.trashNoteCount.textContent = "0";
+    elements.notesView.setAttribute("aria-pressed", "true");
+    elements.notesView.setAttribute("aria-label", "Notes, 0");
+    elements.notesView.className = "button button-secondary";
+    elements.trashView.setAttribute("aria-pressed", "false");
+    elements.trashView.setAttribute("aria-label", "Trash, 0");
+    elements.trashView.className = "button button-quiet";
+    elements.selectionMode.setAttribute("aria-pressed", "false");
+    elements.storageUsageText.textContent = "Consent required";
+    elements.storageUsageMeter.value = 0;
+    elements.storageUsageMeter.textContent = "0 of 10 MB";
+  }
+
+  function purgeLibrarySessionData() {
+    storageUsageRequestGeneration += 1;
     cancelEditorDraftTimer();
     if (searchTimer !== null) {
       timerApi.clearTimeout(searchTimer);
       searchTimer = null;
     }
-    dataEpoch = result.epoch;
-    state = result.state;
-    dataResetConflict = false;
-    resetOutcomeUnknown = false;
+    dataEpoch = "";
+    state = undefined;
     resetEventsSuppressed = false;
-    editorDraftRecord = result.editorDraftRecord;
+    editorDraftRecord = {
+      ownerSessionId: "",
+      generation: 0,
+      contentGeneration: 0,
+      draft: null,
+    };
     externalEditorDraftRecord = null;
-    editorDraftGeneration = result.editorDraftRecord?.contentGeneration || 0;
+    editorDraftGeneration = 0;
     editorDraftSynced = true;
     editorDraftBlocked = false;
     editorDraftUnavailable = false;
@@ -2220,6 +2582,10 @@ export async function initLibrary({
     emptyTrashSnapshot = null;
     pendingBulkCourse = null;
     pendingBulkAction = null;
+    pendingManagedCourse = null;
+    pendingManagedTarget = null;
+    manageCourseBusy = false;
+    managedCourseSignature = "";
     importReadGeneration += 1;
     pendingImport = null;
     pendingImportPreview = null;
@@ -2235,39 +2601,65 @@ export async function initLibrary({
     visibleLimit = DISPLAY_BATCH;
     courseSignature = "";
     undoRecord = null;
-    elements.undoBar.hidden = true;
-    elements.search.value = "";
-    elements.course.value = "";
-    elements.importFile.value = "";
-    elements.editorTitle.value = "";
-    elements.editorCourse.value = "";
-    elements.editorBody.value = "";
-    elements.editorSourceTitle.value = "";
-    elements.editorSourceUrl.value = "";
-    elements.editorSourceDetails.open = false;
-    elements.editorDuplicate.hidden = true;
-    elements.editorConflict.hidden = true;
-    elements.editorDraftRecovery.hidden = true;
-    elements.recoveryNotice.hidden = true;
     resetSnapshot = null;
     resetReturnFocus = null;
+    resetInFlight = false;
+    resetExportInFlight = false;
+    setLibraryAvailable(false);
     for (const dialog of documentValue.querySelectorAll("dialog[open]")) {
       closeDialog(dialog);
     }
-    applyTheme(state.settings.theme, documentValue);
-    render();
+    purgeLibraryDataFromPage();
+    applyTheme("system", documentValue);
+  }
+
+  function enterConsentGateAfterReset(message) {
+    if (consentGateActive || destroyed) {
+      return;
+    }
+    consentGateActive = true;
+    consentGeneration += 1;
+    dataResetConflict = true;
+    resetOutcomeUnknown = false;
+    purgeLibrarySessionData();
+    elements.retryLoad.hidden = true;
+    elements.summary.textContent = "Permission required";
+    setStatus(elements.status, message, "success");
+    void requireDataConsent({ documentValue, chromeApi, contextMessage: message }).then((epoch) => {
+      if (destroyed) {
+        return;
+      }
+      consentGateActive = false;
+      dataEpoch = epoch;
+      dataResetConflict = false;
+      void loadLibrary();
+    }).catch((error) => {
+      consentGateActive = false;
+      setStatus(
+        elements.status,
+        `The data choice could not be opened: ${errorMessage(error)}`,
+        "error",
+      );
+    });
   }
 
   async function inspectResetOutcome(previousEpoch) {
     try {
       const stored = await storage.get([
         STORAGE_KEYS.dataEpoch,
+        STORAGE_KEYS.dataConsent,
         STORAGE_KEYS.state,
         STORAGE_KEYS.editorDraft,
       ]);
       const epoch = stored[STORAGE_KEYS.dataEpoch];
+      const consent = stored[STORAGE_KEYS.dataConsent];
       const resetState = stored[STORAGE_KEYS.state];
       const editorRecord = stored[STORAGE_KEYS.editorDraft];
+      const consentRevoked = consent === undefined || (
+        consent?.version === 1 &&
+        consent.epoch === epoch &&
+        consent.accepted === false
+      );
       if (
         typeof epoch === "string" &&
         epoch !== previousEpoch &&
@@ -2275,11 +2667,11 @@ export async function initLibrary({
         resetState.notes.length === 0 &&
         Array.isArray(resetState?.trash) &&
         resetState.trash.length === 0 &&
-        editorRecord?.draft === null
+        editorRecord?.draft === null &&
+        consentRevoked
       ) {
         return {
           status: "completed",
-          result: { epoch, state: resetState, editorDraftRecord: editorRecord },
         };
       }
       return { status: epoch === previousEpoch ? "not-completed" : "unknown" };
@@ -2313,12 +2705,15 @@ export async function initLibrary({
   }
 
   function markResetOutcomeUnknown() {
+    consentGeneration += 1;
+    consentGateActive = false;
+    dataResetConflict = false;
     resetOutcomeUnknown = true;
-    resetEventsSuppressed = false;
-    setLibraryAvailable(false);
+    purgeLibrarySessionData();
     elements.retryLoad.textContent = "Reload page";
     elements.retryLoad.hidden = false;
     elements.summary.textContent = "Reload required";
+    elements.storageUsageText.textContent = "Reload required";
     setStatus(
       elements.status,
       "Chrome could not confirm whether local data was cleared. Reload this page before making more changes.",
@@ -2342,19 +2737,13 @@ export async function initLibrary({
     updateResetControls();
     setStatus(elements.resetStatus, "Clearing local data...", "info");
     try {
-      const result = await resetAllData(storage, {
+      await resetAllData(storage, {
         expectedEpoch: reviewed.epoch,
         expectedRevision: reviewed.revision,
       });
-      resetLocalPage(result);
-      setLibraryAvailable(true);
-      render();
-      setStatus(
-        elements.status,
-        "Local notes, drafts, settings, pending captures, and recovery data were cleared.",
-        "success",
+      enterConsentGateAfterReset(
+        "Local notes, drafts, settings, pending captures, and recovery data were cleared. Allow local note capture to start again.",
       );
-      elements.newNote.focus();
     } catch (error) {
       if (isDataResetError(error)) {
         resetReturnFocus = null;
@@ -2383,17 +2772,9 @@ export async function initLibrary({
       } else {
         const outcome = await inspectResetOutcome(reviewed.epoch);
         if (outcome.status === "completed") {
-          resetLocalPage(outcome.result);
-          setLibraryAvailable(false);
-          elements.retryLoad.textContent = "Retry cleanup";
-          elements.retryLoad.hidden = false;
-          elements.summary.textContent = "Local data cleared";
-          setStatus(
-            elements.status,
-            "Local data was cleared, but Chrome could not finish removing supporting data. Reload the library or retry cleanup before creating new notes.",
-            "error",
+          enterConsentGateAfterReset(
+            "Local data was cleared. Chrome will retry supporting-data cleanup when you allow local note capture again.",
           );
-          focusAfterReset = elements.retryLoad;
         } else if (outcome.status === "not-completed") {
           try {
             const restoredSuppressedChanges = await reconcileAfterFailedReset();
@@ -2428,7 +2809,9 @@ export async function initLibrary({
       if (elements.resetDialog.open) {
         updateResetControls();
       }
-      focusAfterReset?.focus();
+      if (!consentGateActive && !dataResetConflict) {
+        focusAfterReset?.focus();
+      }
     }
   }
 
@@ -2464,9 +2847,13 @@ export async function initLibrary({
     elements.manageCourseSelect.focus();
   }
 
-  async function refreshAfterManagedCourseConflict(error) {
+  async function refreshAfterManagedCourseConflict(error, consentToken = consentActionToken()) {
     try {
-      state = await readStateForPage();
+      const nextState = await readStateForPage(consentToken.epoch);
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
+      state = nextState;
       pendingManagedCourse = null;
       closeDialog(elements.manageCoursesDialog);
       render();
@@ -2477,12 +2864,12 @@ export async function initLibrary({
         elements.course.focus();
       }
     } catch (readError) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       pendingManagedCourse = null;
       closeDialog(elements.manageCoursesDialog);
       reportActionError(readError);
-      if (isDataResetError(readError)) {
-        elements.retryLoad.focus();
-      }
     }
   }
 
@@ -2491,6 +2878,7 @@ export async function initLibrary({
       return;
     }
     const review = pendingManagedCourse;
+    const consentToken = consentActionToken();
     let preview;
     let targetReview = null;
     try {
@@ -2523,8 +2911,11 @@ export async function initLibrary({
           return renameCourse(current, review.course, replacement);
         },
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       pendingManagedCourse = null;
       pendingManagedTarget = null;
@@ -2551,23 +2942,27 @@ export async function initLibrary({
       }
       (!elements.manageCourses.disabled ? elements.manageCourses : elements.course).focus();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (isDataResetError(error)) {
         pendingManagedCourse = null;
         pendingManagedTarget = null;
         closeDialog(elements.manageCoursesDialog);
         reportActionError(error);
-        elements.retryLoad.focus();
       } else if (
         error instanceof ValidationError &&
         ["course-conflict", "course-missing", "state-conflict"].includes(error.code)
       ) {
-        await refreshAfterManagedCourseConflict(error);
+        await refreshAfterManagedCourseConflict(error, consentToken);
       } else {
         reportActionError(error, elements.manageCoursesStatus);
         elements.manageCourseInput.focus();
       }
     } finally {
-      setManageCourseBusy(false);
+      if (isCurrentConsentAction(consentToken)) {
+        setManageCourseBusy(false);
+      }
     }
   }
 
@@ -2606,6 +3001,7 @@ export async function initLibrary({
       return;
     }
     const snapshot = pendingBulkCourse;
+    const consentToken = consentActionToken();
     setBulkCourseBusy(true);
     setStatus(elements.bulkCourseStatus, "", "info");
     try {
@@ -2615,8 +3011,11 @@ export async function initLibrary({
           return assignCourseToNotes(current, snapshot.identifiers, course);
         },
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       pendingBulkCourse = null;
       closeDialog(elements.bulkCourseDialog);
@@ -2634,10 +3033,19 @@ export async function initLibrary({
             : elements.selectionMode;
       focusTarget.focus();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error, elements.bulkCourseStatus);
-      timerApi.setTimeout(() => elements.bulkCourseInput.focus(), 0);
+      timerApi.setTimeout(() => {
+        if (isCurrentConsentAction(consentToken)) {
+          elements.bulkCourseInput.focus();
+        }
+      }, 0);
     } finally {
-      setBulkCourseBusy(false);
+      if (isCurrentConsentAction(consentToken)) {
+        setBulkCourseBusy(false);
+      }
     }
   }
 
@@ -2676,6 +3084,7 @@ export async function initLibrary({
       return;
     }
     const pending = pendingBulkAction;
+    const consentToken = consentActionToken();
     elements.cancelBulkConfirm.disabled = true;
     elements.confirmBulkAction.disabled = true;
     try {
@@ -2687,8 +3096,11 @@ export async function initLibrary({
             : permanentlyDeleteTrashedNotes(current, pending.snapshot.identifiers);
         },
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       hideUndo();
       pendingBulkAction = null;
@@ -2705,15 +3117,25 @@ export async function initLibrary({
       finishSelection(focusTarget);
       setStatus(elements.status, message, "success");
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error, elements.bulkConfirmStatus);
-      timerApi.setTimeout(() => elements.confirmBulkAction.focus(), 0);
+      timerApi.setTimeout(() => {
+        if (isCurrentConsentAction(consentToken)) {
+          elements.confirmBulkAction.focus();
+        }
+      }, 0);
     } finally {
-      elements.cancelBulkConfirm.disabled = false;
-      elements.confirmBulkAction.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.cancelBulkConfirm.disabled = false;
+        elements.confirmBulkAction.disabled = false;
+      }
     }
   }
 
   async function restoreBulkSelection() {
+    const consentToken = consentActionToken();
     let snapshot;
     try {
       snapshot = selectedRecordSnapshot();
@@ -2727,8 +3149,11 @@ export async function initLibrary({
           return restoreTrashedNotes(current, snapshot.identifiers);
         },
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       hideUndo();
       finishSelection(elements.trashView);
@@ -2738,13 +3163,19 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error);
     } finally {
-      elements.bulkRestore.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.bulkRestore.disabled = false;
+      }
     }
   }
 
   async function exportBulkSelection() {
+    const consentToken = consentActionToken();
     try {
       const snapshot = selectedRecordSnapshot();
       if (snapshot.view !== "notes") {
@@ -2753,7 +3184,10 @@ export async function initLibrary({
       const includeSource = elements.includeSourceOnShare.checked;
       const latestState = await readFreshExportState((current) =>
         assertSelectedRecords(current, snapshot),
-      );
+      consentToken);
+      if (!latestState || !isCurrentConsentAction(consentToken)) {
+        return;
+      }
       const selected = snapshot.identifiers.map((identifier) =>
         currentViewRecord(identifier, latestState, snapshot.view),
       );
@@ -2767,6 +3201,9 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error);
     }
   }
@@ -2776,7 +3213,7 @@ export async function initLibrary({
   }
 
   function reopenImportPreview(message) {
-    if (!pendingImport) {
+    if (!pendingImport || consentGateActive || dataResetConflict || destroyed) {
       return;
     }
     pendingReplaceStateSnapshot = null;
@@ -2788,7 +3225,7 @@ export async function initLibrary({
   }
 
   function renderImportPreview() {
-    if (!state || !pendingImport) {
+    if (!state || !pendingImport || consentGateActive || dataResetConflict || destroyed) {
       pendingImportPreview = null;
       return;
     }
@@ -2850,6 +3287,7 @@ export async function initLibrary({
     const generation = importReadGeneration + 1;
     importReadGeneration = generation;
     const expectedEpoch = dataEpoch;
+    const consentToken = consentActionToken();
     if (file.size > LIMITS.importBytes) {
       setStatus(elements.status, "The backup file is too large.", "error");
       elements.importFile.value = "";
@@ -2862,13 +3300,18 @@ export async function initLibrary({
         destroyed ||
         generation !== importReadGeneration ||
         expectedEpoch !== dataEpoch ||
+        !isCurrentConsentAction(consentToken) ||
         dataResetConflict ||
         resetOutcomeUnknown
       ) {
         return;
       }
-      await assertCurrentDataEpoch();
-      if (generation !== importReadGeneration || expectedEpoch !== dataEpoch) {
+      await assertCurrentDataEpoch(expectedEpoch);
+      if (
+        generation !== importReadGeneration ||
+        expectedEpoch !== dataEpoch ||
+        !isCurrentConsentAction(consentToken)
+      ) {
         return;
       }
       const parsed = parseBackup(contents);
@@ -2880,7 +3323,11 @@ export async function initLibrary({
       showDialog(elements.importDialog);
       elements.cancelImport.focus();
     } catch (error) {
-      if (generation !== importReadGeneration || expectedEpoch !== dataEpoch) {
+      if (
+        generation !== importReadGeneration ||
+        expectedEpoch !== dataEpoch ||
+        !isCurrentConsentAction(consentToken)
+      ) {
         return;
       }
       pendingImport = null;
@@ -2888,7 +3335,7 @@ export async function initLibrary({
       pendingReplaceStateSnapshot = null;
       reportActionError(error);
     } finally {
-      if (generation === importReadGeneration) {
+      if (generation === importReadGeneration && isCurrentConsentAction(consentToken)) {
         elements.importFile.value = "";
       }
     }
@@ -2903,6 +3350,7 @@ export async function initLibrary({
       return;
     }
     const importValue = pendingImport;
+    const consentToken = consentActionToken();
     elements.cancelImport.disabled = true;
     elements.mergeImport.disabled = true;
     elements.replaceImport.disabled = true;
@@ -2910,8 +3358,11 @@ export async function initLibrary({
       const result = await mutateState(
         (current) => mergeImportedBackup(current, importValue),
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       pendingImport = null;
       pendingImportPreview = null;
@@ -2924,15 +3375,24 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error, elements.importStatus);
-      timerApi.setTimeout(() => elements.mergeImport.focus(), 0);
+      timerApi.setTimeout(() => {
+        if (isCurrentConsentAction(consentToken)) {
+          elements.mergeImport.focus();
+        }
+      }, 0);
     } finally {
-      elements.cancelImport.disabled = false;
-      elements.replaceImport.disabled = false;
-      if (pendingImport) {
-        renderImportPreview();
-      } else {
-        elements.mergeImport.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.cancelImport.disabled = false;
+        elements.replaceImport.disabled = false;
+        if (pendingImport) {
+          renderImportPreview();
+        } else {
+          elements.mergeImport.disabled = false;
+        }
       }
     }
   }
@@ -2942,12 +3402,13 @@ export async function initLibrary({
       return;
     }
     const importValue = pendingImport;
+    const consentToken = consentActionToken();
     const confirmedStateSnapshot = pendingReplaceStateSnapshot;
     replaceInFlight = true;
     elements.cancelReplace.disabled = true;
     elements.confirmReplace.disabled = true;
     try {
-      state = await mutateState(
+      const nextState = await mutateState(
         (current) => {
           if (JSON.stringify(current) !== confirmedStateSnapshot) {
             throw new ValidationError(
@@ -2958,8 +3419,12 @@ export async function initLibrary({
           return replaceImportedNotes(current, importValue);
         },
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
+      state = nextState;
       hideUndo();
       pendingImport = null;
       pendingImportPreview = null;
@@ -2973,11 +3438,18 @@ export async function initLibrary({
         "success",
       );
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (isDataResetError(error)) {
         markDataResetConflict(elements.replaceStatus);
       } else if (error instanceof ValidationError && error.code === "replace-conflict") {
         try {
-          state = await readStateForPage();
+          const nextState = await readStateForPage(consentToken.epoch);
+          if (!isCurrentConsentAction(consentToken)) {
+            return;
+          }
+          state = nextState;
           applyTheme(state.settings.theme, documentValue);
           render();
           replaceInFlight = false;
@@ -2985,16 +3457,25 @@ export async function initLibrary({
             "The library changed in another window. Review the updated restore preview before replacing it.",
           );
         } catch (readError) {
+          if (!isCurrentConsentAction(consentToken)) {
+            return;
+          }
           reportActionError(readError, elements.replaceStatus);
         }
       } else {
         setStatus(elements.replaceStatus, errorMessage(error), "error");
-        timerApi.setTimeout(() => elements.confirmReplace.focus(), 0);
+        timerApi.setTimeout(() => {
+          if (isCurrentConsentAction(consentToken)) {
+            elements.confirmReplace.focus();
+          }
+        }, 0);
       }
     } finally {
-      replaceInFlight = false;
-      elements.cancelReplace.disabled = false;
-      elements.confirmReplace.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        replaceInFlight = false;
+        elements.cancelReplace.disabled = false;
+        elements.confirmReplace.disabled = false;
+      }
     }
   }
 
@@ -3002,17 +3483,25 @@ export async function initLibrary({
     if (!state) {
       return;
     }
+    const consentToken = consentActionToken();
     try {
-      state = await mutateState(
+      const nextState = await mutateState(
         (current) => updateSettings(current, changes),
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
+      state = nextState;
       applyTheme(state.settings.theme, documentValue);
       render();
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error);
-      if (state) {
+      if (isCurrentConsentAction(consentToken) && state) {
         elements.sort.value = state.settings.sort;
         elements.theme.value = state.settings.theme;
         elements.includeSourceOnShare.checked = state.settings.includeSourceOnShare;
@@ -3025,13 +3514,17 @@ export async function initLibrary({
       return;
     }
     elements.acknowledgeRecovery.disabled = true;
+    const consentToken = consentActionToken();
     setStatus(elements.recoveryStatus, "", "info");
     try {
       const result = await acknowledgeRecovery(
         recoveryInfo,
         storage,
-        expectedEpochOptions(),
+        expectedEpochOptions({}, consentToken.epoch),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       recoveryInfo = result.recovery;
       renderRecoveryNotice();
       if (result.acknowledged) {
@@ -3045,8 +3538,13 @@ export async function initLibrary({
         elements.acknowledgeRecovery.focus();
       }
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       reportActionError(error, elements.recoveryStatus);
-      elements.acknowledgeRecovery.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.acknowledgeRecovery.disabled = false;
+      }
     }
   }
 
@@ -3205,7 +3703,9 @@ export async function initLibrary({
   });
   elements.detailDialog.addEventListener("close", () => {
     detailNoteId = null;
-    detailReturnFocus?.focus?.();
+    if (ready && !consentGateActive && !dataResetConflict) {
+      detailReturnFocus?.focus?.();
+    }
     detailReturnFocus = null;
   });
   elements.detailCopy.addEventListener("click", () => {
@@ -3307,7 +3807,9 @@ export async function initLibrary({
   });
   elements.cancelDelete.addEventListener("click", () => closeDialog(elements.deleteDialog));
   elements.deleteDialog.addEventListener("close", () => {
-    deleteReturnFocus?.focus?.();
+    if (ready && !consentGateActive && !dataResetConflict) {
+      deleteReturnFocus?.focus?.();
+    }
     deleteReturnFocus = null;
     pendingDelete = null;
   });
@@ -3325,7 +3827,9 @@ export async function initLibrary({
   });
   elements.cancelPermanentDelete.addEventListener("click", () => closeDialog(elements.permanentDeleteDialog));
   elements.permanentDeleteDialog.addEventListener("close", () => {
-    permanentDeleteReturnFocus?.focus?.();
+    if (ready && !consentGateActive && !dataResetConflict) {
+      permanentDeleteReturnFocus?.focus?.();
+    }
     permanentDeleteReturnFocus = null;
     pendingPermanentDelete = null;
   });
@@ -3342,7 +3846,9 @@ export async function initLibrary({
   elements.cancelEmptyTrash.addEventListener("click", () => closeDialog(elements.emptyTrashDialog));
   elements.emptyTrashDialog.addEventListener("close", () => {
     emptyTrashSnapshot = null;
-    elements.emptyTrash.focus();
+    if (ready && !consentGateActive && !dataResetConflict) {
+      elements.emptyTrash.focus();
+    }
   });
   elements.emptyTrashDialog.addEventListener("cancel", (event) => {
     if (elements.confirmEmptyTrash.disabled) {
@@ -3368,7 +3874,7 @@ export async function initLibrary({
   elements.cancelBulkCourse.addEventListener("click", () => closeDialog(elements.bulkCourseDialog));
   elements.bulkCourseDialog.addEventListener("close", () => {
     pendingBulkCourse = null;
-    if (selectionMode) {
+    if (ready && !consentGateActive && !dataResetConflict && selectionMode) {
       elements.bulkCourse.focus();
     }
   });
@@ -3405,7 +3911,7 @@ export async function initLibrary({
     pendingManagedCourse = null;
     pendingManagedTarget = null;
     setManageCourseBusy(false);
-    if (ready) {
+    if (ready && !consentGateActive && !dataResetConflict) {
       (!elements.manageCourses.disabled ? elements.manageCourses : elements.course).focus();
     }
   });
@@ -3423,7 +3929,7 @@ export async function initLibrary({
   elements.bulkConfirmDialog.addEventListener("close", () => {
     const action = pendingBulkAction?.kind;
     pendingBulkAction = null;
-    if (selectionMode) {
+    if (ready && !consentGateActive && !dataResetConflict && selectionMode) {
       (action === "permanent-delete" ? elements.bulkPermanentDelete : elements.bulkTrash).focus();
     }
   });
@@ -3439,10 +3945,14 @@ export async function initLibrary({
       return;
     }
     const reviewedState = resetSnapshot?.state || null;
+    const consentToken = consentActionToken();
     resetExportInFlight = true;
     updateResetControls();
     try {
       const exported = await exportJson(elements.resetStatus);
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (exported) {
         const reviewChanged = reviewedState !== null && resetSnapshot?.state !== reviewedState;
         setStatus(
@@ -3458,9 +3968,11 @@ export async function initLibrary({
         elements.retryLoad.focus();
       }
     } finally {
-      resetExportInFlight = false;
-      if (elements.resetDialog.open) {
-        updateResetControls();
+      if (isCurrentConsentAction(consentToken)) {
+        resetExportInFlight = false;
+        if (elements.resetDialog.open) {
+          updateResetControls();
+        }
       }
     }
   });
@@ -3480,7 +3992,9 @@ export async function initLibrary({
     setStatus(elements.resetStatus, "", "info");
     const target = resetReturnFocus;
     resetReturnFocus = null;
-    target?.focus?.();
+    if (ready && !consentGateActive && !dataResetConflict) {
+      target?.focus?.();
+    }
   });
 
   elements.exportJson.addEventListener("click", () => void exportJson());
@@ -3503,7 +4017,12 @@ export async function initLibrary({
     pendingReplaceStateSnapshot = null;
   });
   elements.importDialog.addEventListener("close", () => {
-    if (!elements.replaceDialog.open) {
+    if (
+      ready &&
+      !consentGateActive &&
+      !dataResetConflict &&
+      !elements.replaceDialog.open
+    ) {
       elements.importButton.focus();
     }
   });
@@ -3543,7 +4062,11 @@ export async function initLibrary({
     pendingImportPreview = null;
     pendingReplaceStateSnapshot = null;
   });
-  elements.replaceDialog.addEventListener("close", () => elements.importButton.focus());
+  elements.replaceDialog.addEventListener("close", () => {
+    if (ready && !consentGateActive && !dataResetConflict) {
+      elements.importButton.focus();
+    }
+  });
 
   const keyHandler = (event) => {
     if (
@@ -3581,8 +4104,9 @@ export async function initLibrary({
       return;
     }
     const draft = formEditorDraft();
+    const consentToken = consentActionToken();
     const options = {
-      expectedEpoch: dataEpoch,
+      expectedEpoch: consentToken.epoch,
       sessionId: editorSessionId,
       expectedOwnerSessionId: editorDraftRecord.ownerSessionId,
       expectedGeneration: editorDraftRecord.generation,
@@ -3590,6 +4114,9 @@ export async function initLibrary({
     };
     const saveDirectly = async () => {
       const result = await saveEditorDraft(draft, storage, options);
+      if (!isCurrentConsentAction(consentToken)) {
+        return result;
+      }
       if (
         (result.saved || result.record.ownerSessionId === editorSessionId) &&
         result.record.contentGeneration === editorDraftGeneration &&
@@ -3604,6 +4131,9 @@ export async function initLibrary({
       void chromeApi.runtime
         .sendMessage({ type: MESSAGE_TYPES.saveEditorDraft, draft, ...options })
         .then((response) => {
+          if (!isCurrentConsentAction(consentToken)) {
+            return undefined;
+          }
           if (response?.ok !== true) {
             if (typeof response?.code === "string") {
               throw new ValidationError(response?.error || "Draft handoff failed.", response.code);
@@ -3623,6 +4153,9 @@ export async function initLibrary({
           return undefined;
         })
         .catch((error) => {
+          if (!isCurrentConsentAction(consentToken)) {
+            return undefined;
+          }
           if (isDataResetError(error)) {
             markDataResetConflict();
             return undefined;
@@ -3630,7 +4163,7 @@ export async function initLibrary({
           return saveDirectly();
         })
         .catch((error) => {
-          if (isDataResetError(error)) {
+          if (isCurrentConsentAction(consentToken) && isDataResetError(error)) {
             markDataResetConflict();
           }
         });
@@ -3679,36 +4212,51 @@ export async function initLibrary({
     const editorDraftChanged = Boolean(changes[STORAGE_KEYS.editorDraft]);
     const recoveryChanged = Boolean(changes[STORAGE_KEYS.recovery]);
     const dataEpochChanged = Boolean(changes[STORAGE_KEYS.dataEpoch]);
+    const dataConsentChanged = Boolean(changes[STORAGE_KEYS.dataConsent]);
     const storageUsageChanged = Object.keys(changes).some((key) =>
       Object.values(STORAGE_KEYS).includes(key),
     );
     if (destroyed || areaName !== "local") {
       return;
     }
+    const changeGeneration = consentGeneration;
+    const changeEpoch = dataEpoch;
     if (resetInFlight) {
       resetEventsSuppressed = true;
       return;
+    }
+    if (dataConsentChanged) {
+      try {
+        const acceptedEpoch = await loadDataConsent(storage, {
+          expectedEpoch: changeEpoch,
+        });
+        if (!isCurrentConsent(changeGeneration, changeEpoch)) {
+          return;
+        }
+        if (acceptedEpoch !== changeEpoch) {
+          enterConsentGateAfterReset(
+            "The data choice changed in another window. Allow local note capture to open the library again.",
+          );
+          return;
+        }
+      } catch {
+        if (!isCurrentConsent(changeGeneration, changeEpoch)) {
+          return;
+        }
+        enterConsentGateAfterReset(
+          "Local data was cleared in another window. Allow local note capture to start again.",
+        );
+        return;
+      }
     }
     if (
       dataEpochChanged &&
       dataEpoch &&
       changes[STORAGE_KEYS.dataEpoch].newValue !== dataEpoch
     ) {
-      const resetDialogWasOpen = elements.resetDialog.open;
-      const manageCourseDialogWasOpen = elements.manageCoursesDialog.open;
-      if (resetDialogWasOpen) {
-        resetReturnFocus = null;
-        closeDialog(elements.resetDialog);
-      }
-      if (manageCourseDialogWasOpen) {
-        pendingManagedCourse = null;
-        pendingManagedTarget = null;
-        closeDialog(elements.manageCoursesDialog);
-      }
-      markDataResetConflict();
-      if (resetDialogWasOpen || manageCourseDialogWasOpen) {
-        elements.retryLoad.focus();
-      }
+      enterConsentGateAfterReset(
+        "Local data was cleared in another window. Allow local note capture to start again.",
+      );
       return;
     }
     if (dataResetConflict) {
@@ -3723,7 +4271,10 @@ export async function initLibrary({
     try {
       if (stateChanged) {
         const focusTarget = focusedCardAction();
-        const nextState = await readStateForPage();
+        const nextState = await readStateForPage(changeEpoch);
+        if (!isCurrentConsent(changeGeneration, changeEpoch)) {
+          return;
+        }
         if (undoRecord && JSON.stringify(nextState) !== undoRecord.stateSnapshot) {
           hideUndo();
         }
@@ -3763,7 +4314,10 @@ export async function initLibrary({
       }
 
       if (editorDraftChanged) {
-        const record = await readEditorDraftForPage();
+        const record = await readEditorDraftForPage(changeEpoch);
+        if (!isCurrentConsent(changeGeneration, changeEpoch)) {
+          return;
+        }
         editorDraftUnavailable = false;
         if (elements.editorDialog.open) {
           if (record.ownerSessionId === editorSessionId) {
@@ -3797,10 +4351,17 @@ export async function initLibrary({
       }
 
       if (recoveryChanged) {
-        recoveryInfo = await readRecoveryForPage();
+        const nextRecovery = await readRecoveryForPage(changeEpoch);
+        if (!isCurrentConsent(changeGeneration, changeEpoch)) {
+          return;
+        }
+        recoveryInfo = nextRecovery;
         renderRecoveryNotice();
       }
     } catch (error) {
+      if (!isCurrentConsent(changeGeneration, changeEpoch)) {
+        return;
+      }
       if (error instanceof ValidationError && error.code === "editor-draft-version") {
         editorDraftUnavailable = true;
         editorDraftBlocked = elements.editorDialog.open;
@@ -3820,49 +4381,54 @@ export async function initLibrary({
   chromeApi.storage.onChanged?.addListener(storageChangeHandler);
 
   async function loadLibrary() {
+    const loadGeneration = ++consentGeneration;
+    const loadEpoch = dataEpoch;
     setLibraryAvailable(false);
     elements.retryLoad.hidden = true;
     elements.retryLoad.textContent = "Retry";
     elements.summary.textContent = "Loading notes...";
     setStatus(elements.status, "", "info");
     try {
-      if (!dataEpoch) {
-        dataEpoch = await loadDataEpoch(storage);
-      }
-      state = await readStateForPage();
-      if (dataResetConflict) {
-        markDataResetConflict();
+      const loadedState = await readStateForPage(loadEpoch);
+      if (!isCurrentConsent(loadGeneration, loadEpoch)) {
         return;
       }
+      let loadedEditorDraft;
+      let loadedEditorDraftUnavailable = false;
       try {
-        editorDraftRecord = await readEditorDraftForPage();
-        editorDraftUnavailable = false;
+        loadedEditorDraft = await readEditorDraftForPage(loadEpoch);
       } catch (error) {
         if (!(error instanceof ValidationError) || error.code !== "editor-draft-version") {
           throw error;
         }
-        editorDraftRecord = {
+        loadedEditorDraft = {
           ownerSessionId: "",
           generation: 0,
           contentGeneration: 0,
           draft: null,
         };
-        editorDraftUnavailable = true;
+        loadedEditorDraftUnavailable = true;
       }
-      if (dataResetConflict) {
-        markDataResetConflict();
+      if (!isCurrentConsent(loadGeneration, loadEpoch)) {
         return;
       }
+      const loadedRecovery = await readRecoveryForPage(loadEpoch);
+      if (!isCurrentConsent(loadGeneration, loadEpoch)) {
+        return;
+      }
+      state = loadedState;
+      editorDraftRecord = loadedEditorDraft;
+      editorDraftUnavailable = loadedEditorDraftUnavailable;
+      recoveryInfo = loadedRecovery;
       externalEditorDraftRecord = null;
-      applyTheme(state.settings.theme, documentValue);
-      elements.sort.value = state.settings.sort;
-      elements.theme.value = state.settings.theme;
+      applyTheme(loadedState.settings.theme, documentValue);
+      elements.sort.value = loadedState.settings.sort;
+      elements.theme.value = loadedState.settings.theme;
       visibleLimit = DISPLAY_BATCH;
       render();
       renderEditorDraftRecovery();
-      setLibraryAvailable(true);
-      recoveryInfo = await readRecoveryForPage();
       renderRecoveryNotice();
+      setLibraryAvailable(true);
       if (editorDraftUnavailable) {
         setStatus(
           elements.status,
@@ -3881,6 +4447,9 @@ export async function initLibrary({
         }
       }
     } catch (error) {
+      if (!isCurrentConsent(loadGeneration, loadEpoch)) {
+        return;
+      }
       if (isDataResetError(error)) {
         markDataResetConflict();
       } else {
@@ -3902,13 +4471,14 @@ export async function initLibrary({
   await loadLibrary();
 
   return {
-    getState: () => state,
+    getState: () => dataResetConflict || consentGateActive ? undefined : state,
     getEditorDraftRecord: () => editorDraftRecord,
     flushEditorDraft,
     render,
     openEditor,
     destroy() {
       destroyed = true;
+      consentGeneration += 1;
       storageUsageRequestGeneration += 1;
       if (searchTimer !== null) {
         timerApi.clearTimeout(searchTimer);

@@ -10,6 +10,7 @@ import {
   isAuthorizedDraftMessage,
   normalizeContextSelection,
   openCaptureSurface,
+  syncCaptureContextMenu,
 } from "../src/background.js";
 import { MESSAGE_TYPES } from "../src/messages.js";
 import { LIMITS } from "../src/model.js";
@@ -21,10 +22,23 @@ import {
   resetAllData,
   STORAGE_KEYS,
 } from "../src/storage.js";
-import { memoryStorage } from "./helpers.js";
+import { memoryStorage as createMemoryStorage } from "./helpers.js";
 
 const RUNTIME_ID = "abcdefghijklmnopabcdefghijklmnop";
 const DATA_EPOCH = "background-test-epoch";
+
+function memoryStorage(initial = {}) {
+  const epoch = initial[STORAGE_KEYS.dataEpoch] || DATA_EPOCH;
+  return createMemoryStorage({
+    ...initial,
+    [STORAGE_KEYS.dataEpoch]: epoch,
+    [STORAGE_KEYS.dataConsent]: {
+      version: 1,
+      epoch,
+      accepted: true,
+    },
+  });
+}
 
 test("stores a draft handed off by an extension page", async () => {
   const storage = memoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
@@ -250,6 +264,31 @@ test("rejects a draft handoff from before a data reset", async () => {
   assert.equal(await loadDraft(storage), null);
 });
 
+test("rejects draft handoff before consent without creating storage", async () => {
+  const storage = createMemoryStorage({ [STORAGE_KEYS.dataEpoch]: DATA_EPOCH });
+  const before = structuredClone(storage.values);
+
+  await assert.rejects(
+    () => handleDraftMessage(
+      {
+        type: MESSAGE_TYPES.saveDraft,
+        sessionId: "unaccepted-popup",
+        expectedOwnerSessionId: "",
+        expectedGeneration: 0,
+        contentGeneration: 1,
+        expectedEpoch: DATA_EPOCH,
+        draft: { body: "Do not handle this draft", sessionId: "unaccepted-popup" },
+      },
+      { id: RUNTIME_ID },
+      storage,
+      RUNTIME_ID,
+    ),
+    { code: "consent-required" },
+  );
+
+  assert.deepEqual(storage.values, before);
+});
+
 test("rejects unknown internal message types", async () => {
   const storage = memoryStorage();
   const message = { type: "save-anywhere", draft: { body: "Do not save" } };
@@ -409,6 +448,74 @@ test("queues a normalized context-menu capture", async () => {
   assert.equal(result.capture.title.length, LIMITS.title);
   assert.equal(result.capture.url, "https://example.com/lecture?week=2");
   assert.deepEqual(await loadPendingCaptures(storage), [result.capture]);
+});
+
+test("does not inspect context-menu data before consent", async () => {
+  const storage = createMemoryStorage({
+    [STORAGE_KEYS.state]: { private: "existing notes" },
+  });
+  const before = structuredClone(storage.values);
+  let selectionRead = false;
+  let titleRead = false;
+  const info = {};
+  Object.defineProperty(info, "selectionText", {
+    get() {
+      selectionRead = true;
+      return "Private selection";
+    },
+  });
+  const tab = {};
+  Object.defineProperty(tab, "title", {
+    get() {
+      titleRead = true;
+      return "Private page title";
+    },
+  });
+
+  await assert.rejects(
+    () => captureContextSelection(info, tab, storage, () => "not-created"),
+    { code: "consent-required" },
+  );
+
+  assert.equal(selectionRead, false);
+  assert.equal(titleRead, false);
+  assert.deepEqual(storage.values, before);
+});
+
+test("context-menu sync removes the menu before checking consent", async () => {
+  const storage = createMemoryStorage();
+  const calls = [];
+  const contextMenus = {
+    async remove(identifier) {
+      calls.push(["remove", identifier]);
+    },
+    async create(options) {
+      calls.push(["create", options.id]);
+    },
+  };
+
+  assert.equal(await syncCaptureContextMenu(storage, contextMenus, {}), false);
+  assert.deepEqual(calls, [["remove", CAPTURE_CONTEXT_MENU_ID]]);
+
+  storage.values[STORAGE_KEYS.dataEpoch] = DATA_EPOCH;
+  storage.values[STORAGE_KEYS.dataConsent] = {
+    version: 1,
+    epoch: DATA_EPOCH,
+    accepted: true,
+  };
+  assert.equal(await syncCaptureContextMenu(storage, contextMenus, {}), true);
+  assert.deepEqual(calls.slice(-2), [
+    ["remove", CAPTURE_CONTEXT_MENU_ID],
+    ["create", CAPTURE_CONTEXT_MENU_ID],
+  ]);
+
+  storage.values[STORAGE_KEYS.dataConsent] = {
+    version: 1,
+    epoch: DATA_EPOCH,
+    accepted: false,
+  };
+  assert.equal(await syncCaptureContextMenu(storage, contextMenus, {}), false);
+  assert.deepEqual(calls.at(-1), ["remove", CAPTURE_CONTEXT_MENU_ID]);
 });
 
 test("does not queue a context capture across a data reset", async () => {
@@ -611,6 +718,34 @@ test("handles only the Lecture Notes capture menu item", async () => {
   assert.equal(createdWindows[0].url, "chrome-extension://test/popup.html");
   assert.equal(await loadDraft(storage), null);
   assert.equal((await loadPendingCaptures(storage))[0].text, "Selected theorem");
+});
+
+test("a stale context-menu click opens the consent gate without reading selection", async () => {
+  const storage = createMemoryStorage();
+  let selectionRead = false;
+  let opened = false;
+  const info = { menuItemId: CAPTURE_CONTEXT_MENU_ID };
+  Object.defineProperty(info, "selectionText", {
+    get() {
+      selectionRead = true;
+      return "Do not read this selection";
+    },
+  });
+
+  const result = await handleContextMenuClick(info, {}, {
+    storage: { local: storage },
+    runtime: { getURL: (path) => `chrome-extension://test/${path}` },
+    windows: {
+      async create() {
+        opened = true;
+      },
+    },
+  });
+
+  assert.equal(result.capture.reason, "consent-required");
+  assert.equal(opened, true);
+  assert.equal(selectionRead, false);
+  assert.deepEqual(storage.values, {});
 });
 
 test("does not open an editor for an empty context-menu selection", async () => {

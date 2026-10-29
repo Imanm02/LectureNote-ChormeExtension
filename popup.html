@@ -8,6 +8,35 @@
     <link rel="stylesheet" href="popup.css">
   </head>
   <body class="popup-body">
+    <dialog id="dataConsentDialog" class="consent-dialog" aria-labelledby="dataConsentHeading" aria-describedby="dataConsentSummary dataConsentDetails dataConsentNote">
+      <form id="dataConsentForm" class="consent-card">
+        <div>
+          <p class="eyebrow">Your data choice</p>
+          <h2 id="dataConsentHeading" tabindex="-1">Allow local note capture?</h2>
+        </div>
+        <p id="dataConsentSummary">Lecture Notes needs your permission before it reads page details or handles saved note data.</p>
+        <ul id="dataConsentDetails">
+          <li>When you open Quick capture or choose Capture selection, it can read selected text, the page title, and the page URL from the current tab.</li>
+          <li>It stores notes, drafts, settings, and pending captures in Chrome storage in this profile.</li>
+          <li>It does not send this data to a server.</li>
+        </ul>
+        <p id="dataConsentNote" class="consent-note">Nothing is read until you choose Allow local note capture. You can close this page without accepting.</p>
+        <a href="PRIVACY.md" target="_blank" rel="noreferrer">Read the privacy notice</a>
+        <p id="dataConsentStatus" class="status" role="status" aria-live="polite" aria-atomic="true"></p>
+        <div id="dataConsentClearPanel" class="consent-clear-panel notice notice-warning" role="group" aria-labelledby="dataConsentClearHeading" hidden>
+          <p><strong id="dataConsentClearHeading">Clear all stored extension data?</strong></p>
+          <p>This permanently removes notes, drafts, settings, and captured selections from this Chrome profile. The data is not opened first.</p>
+          <div class="consent-actions">
+            <button id="dataConsentKeepButton" class="button button-secondary" type="button">Keep stored data</button>
+            <button id="dataConsentConfirmClearButton" class="button button-danger" type="button">Clear stored data</button>
+          </div>
+        </div>
+        <div class="consent-actions">
+          <button id="dataConsentClearButton" class="button button-quiet danger-text" type="button">Clear stored data</button>
+          <button id="dataConsentAcceptButton" class="button button-primary" type="submit">Allow local note capture</button>
+        </div>
+      </form>
+    </dialog>
     <header class="app-header popup-header">
       <div class="brand">
         <img src="Images/icon48.png" width="32" height="32" alt="">

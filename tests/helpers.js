@@ -19,10 +19,24 @@ export function memoryStorage(initial = {}) {
         delete values[key];
       }
     },
+    async clear() {
+      for (const key of Object.keys(values)) {
+        delete values[key];
+      }
+    },
   };
 }
 
-export function chromeMock(storage, capture = {}) {
+export function chromeMock(storage, capture = {}, { dataConsent = true } = {}) {
+  if (dataConsent && storage?.values) {
+    const epoch = storage.values.lectureNoteDataEpoch || "test-data-epoch";
+    storage.values.lectureNoteDataEpoch = epoch;
+    storage.values.lectureNoteDataConsent = {
+      version: 1,
+      epoch,
+      accepted: true,
+    };
+  }
   const listeners = new Set();
   return {
     async emitStorageChange(changes, areaName = "local") {

@@ -164,66 +164,30 @@ async function assertServiceWorkerHealth(context) {
   const healthPage = await context.newPage();
   try {
     await healthPage.goto(`chrome-extension://${health.runtimeId}/manifest.json`);
-    const response = await healthPage.evaluate(async () => {
-      const epochKey = "lectureNoteDataEpoch";
-      const stored = await globalThis.chrome.storage.local.get(epochKey);
-      const hadEpoch = Object.hasOwn(stored, epochKey);
-      const previousEpoch = stored[epochKey];
-      const validEpoch = typeof previousEpoch === "string" &&
-        /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(previousEpoch);
-      const expectedEpoch = validEpoch ? previousEpoch : globalThis.crypto.randomUUID();
-      if (!validEpoch) {
-        await globalThis.chrome.storage.local.set({ [epochKey]: expectedEpoch });
-      }
-
-      try {
-        return await new Promise((resolveResponse, rejectResponse) => {
-          const timeout = globalThis.setTimeout(
-            () => rejectResponse(new Error("The service worker health request timed out.")),
-            5_000,
-          );
-          globalThis.chrome.runtime.sendMessage(
-            {
-              type: "save-draft",
-              draft: null,
-              sessionId: `browser-smoke-health-${globalThis.crypto.randomUUID()}`,
-              // The mismatched cursor exercises the real handler without writing a draft.
-              expectedOwnerSessionId:
-                `browser-smoke-mismatch-${globalThis.crypto.randomUUID()}`,
-              expectedGeneration: Number.MAX_SAFE_INTEGER,
-              contentGeneration: 1,
-              expectedEpoch,
-            },
-            (messageResponse) => {
-              globalThis.clearTimeout(timeout);
-              const lastError = globalThis.chrome.runtime.lastError;
-              if (lastError) {
-                rejectResponse(new Error(lastError.message));
-              } else {
-                resolveResponse(messageResponse);
-              }
-            },
-          );
-        });
-      } finally {
-        if (hadEpoch) {
-          await globalThis.chrome.storage.local.set({ [epochKey]: previousEpoch });
-        } else {
-          await globalThis.chrome.storage.local.remove(epochKey);
-        }
-      }
-    });
+    const response = await healthPage.evaluate(() => new Promise((resolveResponse, rejectResponse) => {
+      const timeout = globalThis.setTimeout(
+        () => rejectResponse(new Error("The service worker health request timed out.")),
+        5_000,
+      );
+      globalThis.chrome.runtime.sendMessage(
+        { type: "data-consent-changed" },
+        (messageResponse) => {
+          globalThis.clearTimeout(timeout);
+          const lastError = globalThis.chrome.runtime.lastError;
+          if (lastError) {
+            rejectResponse(new Error(lastError.message));
+          } else {
+            resolveResponse(messageResponse);
+          }
+        },
+      );
+    }));
 
     assert.equal(response?.ok, true, "The service worker health request failed");
     assert.equal(
-      response?.saved,
-      false,
-      "The service worker health request unexpectedly changed the draft",
-    );
-    assert.equal(
-      typeof response?.cursor?.generation,
-      "number",
-      "The service worker health response is incomplete",
+      typeof response?.consent,
+      "boolean",
+      "The service worker health response did not report consent state",
     );
   } finally {
     await healthPage.close().catch(() => undefined);
@@ -343,6 +307,29 @@ async function createPersianNote(page) {
   await page.locator("#libraryStatus").filter({ hasText: "Note saved" }).waitFor();
 }
 
+async function captureMenuExists(page) {
+  return page.evaluate(() => new Promise((resolveCheck) => {
+    globalThis.chrome.contextMenus.update(
+      "save-selection-to-lecture-notes",
+      { title: "Capture selection in Lecture Notes" },
+      () => {
+        const lastError = globalThis.chrome.runtime.lastError;
+        resolveCheck(!lastError);
+      },
+    );
+  }));
+}
+
+async function waitForCaptureMenu(page, expected) {
+  const started = Date.now();
+  while (await captureMenuExists(page) !== expected) {
+    if (Date.now() - started > 5_000) {
+      throw new Error(`The capture context menu did not become ${expected ? "available" : "unavailable"}.`);
+    }
+    await page.waitForTimeout(50);
+  }
+}
+
 let context;
 let fixtureServer;
 let shortcutCaptureVerified = false;
@@ -353,6 +340,44 @@ try {
   const identifier = await extensionId(context);
   const popupUrl = `chrome-extension://${identifier}/popup.html`;
   const notesUrl = `chrome-extension://${identifier}/notes.html`;
+
+  const consentPopup = await context.newPage();
+  await consentPopup.goto(popupUrl);
+  await consentPopup.locator("#dataConsentDialog[open]").waitFor();
+  await consentPopup.locator("#dataConsentAcceptButton:not([disabled])").waitFor();
+  assert.equal(
+    await consentPopup.evaluate(() => globalThis.document.activeElement?.id),
+    "dataConsentHeading",
+  );
+  assert.equal(await consentPopup.locator("#bodyInput").inputValue(), "");
+  assert.deepEqual(
+    await consentPopup.evaluate(() => globalThis.chrome.storage.local.get(null)),
+    {},
+    "The extension wrote local data before consent",
+  );
+  await waitForCaptureMenu(consentPopup, false);
+  await consentPopup.keyboard.press("Escape");
+  assert.equal(await consentPopup.locator("#dataConsentDialog").getAttribute("open"), "");
+  assert.equal(
+    await consentPopup.evaluate(() => globalThis.document.activeElement?.id),
+    "dataConsentHeading",
+  );
+  await consentPopup.getByRole("button", { name: "Allow local note capture" }).click();
+  await consentPopup.locator("#dataConsentDialog").waitFor({ state: "hidden" });
+  await consentPopup.locator("#noteForm[aria-busy='false']").waitFor();
+  const acceptedData = await consentPopup.evaluate(() => globalThis.chrome.storage.local.get([
+    "lectureNoteDataEpoch",
+    "lectureNoteDataConsent",
+  ]));
+  assert.match(acceptedData.lectureNoteDataEpoch, /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u);
+  assert.deepEqual(acceptedData.lectureNoteDataConsent, {
+    version: 1,
+    epoch: acceptedData.lectureNoteDataEpoch,
+    accepted: true,
+  });
+  const acceptedEpoch = acceptedData.lectureNoteDataEpoch;
+  await waitForCaptureMenu(consentPopup, true);
+  await consentPopup.close();
 
   const sourcePage = await context.newPage();
   await sourcePage.goto(fixture.url);
@@ -431,6 +456,23 @@ try {
   assert.equal(restartedIdentifier, identifier, "The extension ID changed after restart");
   const library = await context.newPage();
   await library.goto(notesUrl);
+  await library.locator("#libraryMain[aria-busy='false']").waitFor();
+  assert.equal(await library.locator("#dataConsentDialog").getAttribute("open"), null);
+  assert.deepEqual(
+    await library.evaluate(() => globalThis.chrome.storage.local.get([
+      "lectureNoteDataEpoch",
+      "lectureNoteDataConsent",
+    ])),
+    {
+      lectureNoteDataEpoch: acceptedEpoch,
+      lectureNoteDataConsent: {
+        version: 1,
+        epoch: acceptedEpoch,
+        accepted: true,
+      },
+    },
+  );
+  await waitForCaptureMenu(library, true);
   await library.getByRole("heading", { name: "Graph basics" }).waitFor();
   assert.equal(await library.locator(".note-card").count(), 1);
 
@@ -591,15 +633,24 @@ try {
   await recoveredLibrary.getByRole("button", { name: "Clear local data" }).click();
   await recoveredLibrary.locator("#resetConfirmationInput").fill("DELETE");
   await recoveredLibrary.locator("#resetForm").getByRole("button", { name: "Clear local data" }).click();
-  await recoveredLibrary.locator("#libraryStatus").filter({ hasText: "Local notes" }).waitFor();
+  await recoveredLibrary.locator("#dataConsentDialog[open]").waitFor();
+  await recoveredLibrary.locator("#dataConsentAcceptButton:not([disabled])").waitFor();
   assert.equal(await recoveredLibrary.locator("#activeNoteCount").textContent(), "0");
   assert.equal(await recoveredLibrary.locator("#trashNoteCount").textContent(), "0");
   assert.equal(await recoveredLibrary.locator("html").getAttribute("data-theme"), "system");
-  assert.equal(await recoveredLibrary.getByRole("button", { name: /New note/u }).isEnabled(), true);
+  assert.equal(await recoveredLibrary.getByRole("button", { name: /New note/u }).isDisabled(), true);
+  assert.equal(
+    await recoveredLibrary.evaluate(() => globalThis.document.activeElement?.id),
+    "dataConsentHeading",
+  );
+  await waitForCaptureMenu(recoveredLibrary, false);
   const resetValues = await recoveredLibrary.evaluate(async () =>
     globalThis.chrome.storage.local.get([
       "lectureNoteState",
       "lectureNoteDataEpoch",
+      "lectureNoteDataConsent",
+      "lectureNoteDraft",
+      "lectureNoteEditorDraft",
       "lectureNotePendingCaptures",
       "lectureNoteRecovery",
       "lectureNoteHelpSeen",
@@ -613,6 +664,26 @@ try {
   assert.equal("lectureNoteRecovery" in resetValues, false);
   assert.equal("lectureNoteHelpSeen" in resetValues, false);
   assert.equal("lectureNoteResetCleanup" in resetValues, false);
+  assert.equal("lectureNoteDataConsent" in resetValues, false);
+  assert.equal(resetValues.lectureNoteDraft.draft, null);
+  assert.equal(resetValues.lectureNoteEditorDraft.draft, null);
+
+  await recoveredLibrary.reload();
+  await recoveredLibrary.locator("#dataConsentDialog[open]").waitFor();
+  await recoveredLibrary.locator("#dataConsentAcceptButton:not([disabled])").waitFor();
+  assert.equal(await recoveredLibrary.getByRole("button", { name: /New note/u }).isDisabled(), true);
+  await recoveredLibrary.getByRole("button", { name: "Allow local note capture" }).click();
+  await recoveredLibrary.locator("#dataConsentDialog").waitFor({ state: "hidden" });
+  await recoveredLibrary.locator("#libraryMain[aria-busy='false']").waitFor();
+  const reacceptedData = await recoveredLibrary.evaluate(() =>
+    globalThis.chrome.storage.local.get(["lectureNoteDataEpoch", "lectureNoteDataConsent"]),
+  );
+  assert.equal(reacceptedData.lectureNoteDataEpoch, resetValues.lectureNoteDataEpoch);
+  assert.equal(reacceptedData.lectureNoteDataConsent.epoch, resetValues.lectureNoteDataEpoch);
+  assert.equal(reacceptedData.lectureNoteDataConsent.accepted, true);
+  assert.equal(await recoveredLibrary.locator("#activeNoteCount").textContent(), "0");
+  assert.equal(await recoveredLibrary.locator("#trashNoteCount").textContent(), "0");
+  await waitForCaptureMenu(recoveredLibrary, true);
 
   await recoveredLibrary.getByRole("button", { name: /New note/u }).click();
   await recoveredLibrary.getByRole("heading", { name: "New note" }).waitFor();

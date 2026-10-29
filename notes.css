@@ -438,10 +438,6 @@
   gap: var(--space-2);
 }
 
-.danger-text {
-  color: var(--danger);
-}
-
 .empty-state {
   padding: clamp(32px, 8vw, 88px) var(--space-5);
   border: 1px dashed var(--border-strong);

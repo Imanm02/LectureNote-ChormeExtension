@@ -351,6 +351,73 @@ summary:focus-visible {
   background: var(--success-soft);
 }
 
+.danger-text {
+  color: var(--danger);
+}
+
+.consent-dialog {
+  width: min(520px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  padding: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.consent-dialog::backdrop {
+  background: rgba(12, 18, 24, 0.72);
+  backdrop-filter: blur(3px);
+}
+
+.consent-card {
+  display: grid;
+  gap: var(--space-4);
+  padding: var(--space-5);
+}
+
+.consent-card h2,
+.consent-card p,
+.consent-card ul {
+  margin: 0;
+}
+
+.consent-card ul {
+  display: grid;
+  gap: var(--space-2);
+  padding-inline-start: 1.25rem;
+  line-height: 1.5;
+}
+
+.consent-note {
+  color: var(--text-muted);
+  font-size: 0.86rem;
+}
+
+.consent-clear-panel {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.consent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: end;
+  gap: var(--space-2);
+}
+
+@media (max-width: 420px) {
+  .consent-card {
+    padding: var(--space-4);
+  }
+
+  .consent-actions .button {
+    width: 100%;
+  }
+}
+
 .count-badge {
   display: inline-flex;
   min-width: 28px;

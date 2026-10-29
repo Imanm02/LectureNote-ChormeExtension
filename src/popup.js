@@ -1,9 +1,10 @@
 import { captureActivePage, CaptureError } from "./capture.js";
+import { requireDataConsent } from "./consent.js";
 import { addNote, LIMITS, normalizeSource, ValidationError } from "./model.js";
 import { MESSAGE_TYPES } from "./messages.js";
 import {
   clearPopupDraft,
-  loadDataEpoch,
+  loadDataConsent,
   loadHelpSeen,
   loadPendingCaptures,
   loadPopupDraft,
@@ -62,7 +63,7 @@ function errorMessage(error) {
 }
 
 const DATA_RESET_MESSAGE =
-  "Note data was reset in another window. This popup cannot save. Your text is still here so you can copy it, then reopen Lecture Notes.";
+  "Local data was cleared or access was revoked. Allow local note capture to start again.";
 
 export async function openLibraryBesidePage(chromeApi = chrome) {
   const libraryUrl = typeof chromeApi.runtime?.getURL === "function"
@@ -104,6 +105,7 @@ export async function initPopup({
 } = {}) {
   const elements = popupElements(documentValue);
   const storage = chromeApi.storage.local;
+  const consentEpoch = await requireDataConsent({ documentValue, chromeApi });
   const numberFormatter = new Intl.NumberFormat(documentValue.documentElement.lang || undefined);
   const draftSessionId = crypto.randomUUID();
   let state;
@@ -128,19 +130,40 @@ export async function initPopup({
   let ready = false;
   let destroyed = false;
   let helpSeen = false;
-  let dataEpoch = "";
+  let dataEpoch = consentEpoch;
   let dataResetConflict = false;
+  let consentGateActive = false;
+  let consentGeneration = 0;
+
+  function consentActionToken() {
+    return { generation: consentGeneration, epoch: dataEpoch };
+  }
+
+  function isCurrentConsentAction(token) {
+    return !destroyed &&
+      !consentGateActive &&
+      !dataResetConflict &&
+      token.generation === consentGeneration &&
+      token.epoch === dataEpoch;
+  }
 
   async function showHelp({ persist = true } = {}) {
+    const consentToken = consentActionToken();
     elements.helpPanel.hidden = false;
     elements.help.setAttribute("aria-expanded", "true");
     if (!persist || helpSeen) {
       return;
     }
     try {
-      await saveHelpSeen(storage, { expectedEpoch: dataEpoch });
+      await saveHelpSeen(storage, { expectedEpoch: consentToken.epoch });
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       helpSeen = true;
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (!handleDataResetError(error)) {
         setStatus(elements.status, `Help preference not saved: ${errorMessage(error)}`, "warning");
       }
@@ -175,13 +198,54 @@ export async function initPopup({
   }
 
   function markDataResetConflict() {
-    if (!dataResetConflict) {
-      dataResetConflict = true;
-      cancelDraftTimer();
-      setBusy(false);
-      updateDiscardControl();
+    if (consentGateActive || destroyed) {
+      return;
     }
+    consentGateActive = true;
+    consentGeneration += 1;
+    dataResetConflict = true;
+    ready = false;
+    cancelDraftTimer();
+    draftDirty = false;
+    state = undefined;
+    currentSource = { title: "", url: "" };
+    restorableSource = { title: "", url: "" };
+    livePageCapture = null;
+    pendingCaptures = [];
+    pendingCapture = null;
+    appliedPendingCaptureId = "";
+    pageCapture = null;
+    hasDiscardableDraft = false;
+    helpSeen = false;
+    elements.form.reset();
+    elements.helpPanel.hidden = true;
+    elements.help.setAttribute("aria-expanded", "false");
+    elements.openSidePanel.disabled = false;
+    elements.recentList.replaceChildren();
+    elements.courseSuggestions.replaceChildren();
+    elements.recentEmpty.hidden = false;
+    elements.noteCount.textContent = "0";
+    showSource({});
+    updateBodyCount();
+    setBusy(true);
+    applyTheme("system", documentValue);
     setStatus(elements.status, DATA_RESET_MESSAGE, "error");
+    void requireDataConsent({
+      documentValue,
+      chromeApi,
+      contextMessage: "Local data was cleared or access was revoked. Allow local note capture to start again.",
+    }).then((epoch) => {
+      if (destroyed) {
+        return;
+      }
+      dataEpoch = epoch;
+      dataResetConflict = false;
+      consentGateActive = false;
+      void loadPopup();
+    }).catch((error) => {
+      consentGateActive = false;
+      setStatus(elements.status, errorMessage(error), "error");
+    });
   }
 
   function handleDataResetError(error) {
@@ -234,6 +298,9 @@ export async function initPopup({
   }
 
   function renderRecentNotes() {
+    if (!state || consentGateActive || dataResetConflict || destroyed) {
+      return;
+    }
     const notes = selectNotes(state.notes).slice(0, 3);
     const courses = listCourses(state.notes);
     elements.noteCount.textContent = String(state.notes.length);
@@ -312,12 +379,17 @@ export async function initPopup({
       return false;
     }
     const generation = draftGeneration;
+    const consentToken = consentActionToken();
     const draft = formDraft();
     const pendingCaptureId = hasSource(draft.source) ? appliedPendingCaptureId : "";
     let saved = false;
     try {
       await enqueueDraftOperation(async () => {
-        if (destroyed || !draftDirty || generation !== draftGeneration) {
+        if (
+          !isCurrentConsentAction(consentToken) ||
+          !draftDirty ||
+          generation !== draftGeneration
+        ) {
           return;
         }
         const result = await savePopupDraft(draft, storage, {
@@ -325,8 +397,11 @@ export async function initPopup({
           expectedOwnerSessionId: draftCursor.ownerSessionId,
           expectedGeneration: draftCursor.generation,
           contentGeneration: generation,
-          expectedEpoch: dataEpoch,
+          expectedEpoch: consentToken.epoch,
         });
+        if (!isCurrentConsentAction(consentToken)) {
+          return;
+        }
         if (!result.saved) {
           throw new ValidationError(
             "Another popup saved a newer draft. This popup did not overwrite it.",
@@ -340,6 +415,9 @@ export async function initPopup({
         saved = true;
       });
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return false;
+      }
       if (!handleDataResetError(error) && draftDirty && generation === draftGeneration) {
         setStatus(elements.status, `Draft not saved: ${errorMessage(error)}`, "error");
       }
@@ -348,7 +426,13 @@ export async function initPopup({
     if (saved && pendingCaptureId) {
       try {
         await consumePendingCapture(pendingCaptureId);
+        if (!isCurrentConsentAction(consentToken)) {
+          return false;
+        }
       } catch (error) {
+        if (!isCurrentConsentAction(consentToken)) {
+          return false;
+        }
         if (!handleDataResetError(error)) {
           setStatus(
             elements.status,
@@ -398,9 +482,13 @@ export async function initPopup({
   }
 
   async function consumePendingCapture(identifier, { offerSelection = true } = {}) {
+    const consentToken = consentActionToken();
     const result = await removePendingCapture(identifier, storage, {
-      expectedEpoch: dataEpoch,
+      expectedEpoch: consentToken.epoch,
     });
+    if (!isCurrentConsentAction(consentToken)) {
+      return null;
+    }
     if (appliedPendingCaptureId === identifier) {
       appliedPendingCaptureId = "";
     }
@@ -507,6 +595,7 @@ export async function initPopup({
       return;
     }
     let focusTarget = null;
+    const consentToken = consentActionToken();
     const savedCourse = elements.course.value;
     const savedWithSource = hasSource(currentSource);
     const pendingCaptureId = appliedPendingCaptureId;
@@ -537,10 +626,13 @@ export async function initPopup({
               draftGeneration + 1,
               draftCursor.contentGeneration + 1,
             ),
-            expectedEpoch: dataEpoch,
+            expectedEpoch: consentToken.epoch,
           },
         ),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       state = result.state;
       draftDirty = false;
       updateDraftCursor(result.popupDraftRecord);
@@ -552,7 +644,13 @@ export async function initPopup({
       if (pendingCaptureId) {
         try {
           await consumePendingCapture(pendingCaptureId);
+          if (!isCurrentConsentAction(consentToken)) {
+            return;
+          }
         } catch (error) {
+          if (!isCurrentConsentAction(consentToken)) {
+            return;
+          }
           if (handleDataResetError(error)) {
             throw error;
           }
@@ -571,6 +669,9 @@ export async function initPopup({
       setStatus(elements.status, warning || successMessage, warning ? "warning" : "success");
       focusTarget = elements.body;
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       const resetConflict = handleDataResetError(error);
       if (draftDirty && !resetConflict) {
         scheduleDraftSave();
@@ -580,7 +681,11 @@ export async function initPopup({
       } else if (error instanceof ValidationError && error.code === "duplicate") {
         elements.duplicate.hidden = false;
         setStatus(elements.status, "Review the duplicate warning before saving.", "warning");
-        timerApi.setTimeout(() => elements.saveCopy.focus(), 0);
+        timerApi.setTimeout(() => {
+          if (isCurrentConsentAction(consentToken)) {
+            elements.saveCopy.focus();
+          }
+        }, 0);
       } else {
         if (error instanceof ValidationError && error.code === "body-required") {
           elements.body.setAttribute("aria-invalid", "true");
@@ -589,9 +694,13 @@ export async function initPopup({
         setStatus(elements.status, errorMessage(error), "error");
       }
     } finally {
-      setBusy(false);
+      if (isCurrentConsentAction(consentToken)) {
+        setBusy(false);
+      }
     }
-    focusTarget?.focus();
+    if (isCurrentConsentAction(consentToken)) {
+      focusTarget?.focus();
+    }
   }
 
   elements.help.addEventListener("click", () => {
@@ -604,9 +713,13 @@ export async function initPopup({
   });
   elements.closeHelp.addEventListener("click", hideHelp);
   elements.openSidePanel.addEventListener("click", async () => {
+    const consentToken = consentActionToken();
     elements.openSidePanel.disabled = true;
     try {
       const result = await openLibraryBesidePage(chromeApi);
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (result.opened === "side-panel") {
         setStatus(elements.status, "Library opened beside the page.", "success");
       } else if (result.panelError) {
@@ -623,9 +736,14 @@ export async function initPopup({
         );
       }
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       setStatus(elements.status, errorMessage(error), "error");
     } finally {
-      elements.openSidePanel.disabled = false;
+      if (isCurrentConsentAction(consentToken)) {
+        elements.openSidePanel.disabled = false;
+      }
     }
   });
 
@@ -683,6 +801,7 @@ export async function initPopup({
       return;
     }
     const capture = pageCapture;
+    const consentToken = consentActionToken();
     const pendingCaptureId = pendingCapture?.id === capture.id ? capture.id : "";
     fillFromCapture(capture);
     appliedPendingCaptureId = pendingCaptureId;
@@ -694,6 +813,9 @@ export async function initPopup({
     if (pendingCaptureId) {
       setBusy(true);
       await persistDraft();
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       setBusy(false);
       updateDiscardControl();
     } else {
@@ -710,14 +832,21 @@ export async function initPopup({
       return;
     }
     const captureId = pendingCapture.id;
+    const consentToken = consentActionToken();
     const wasApplied = appliedPendingCaptureId === captureId;
     setBusy(true);
     try {
       await consumePendingCapture(captureId, { offerSelection: !wasApplied });
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (wasApplied) {
         const currentDraftRecord = await loadPopupDraft(storage, {
-          expectedEpoch: dataEpoch,
+          expectedEpoch: consentToken.epoch,
         });
+        if (!isCurrentConsentAction(consentToken)) {
+          return;
+        }
         updateDraftCursor(currentDraftRecord);
         draftGeneration = Math.max(draftGeneration, currentDraftRecord.contentGeneration);
         draftDirty = false;
@@ -749,13 +878,20 @@ export async function initPopup({
         : "Captured selection discarded.";
       setStatus(elements.status, message, "success");
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (!handleDataResetError(error)) {
         setStatus(elements.status, `Captured selection not discarded: ${errorMessage(error)}`, "error");
       }
     } finally {
-      setBusy(false);
+      if (isCurrentConsentAction(consentToken)) {
+        setBusy(false);
+      }
     }
-    elements.body.focus();
+    if (isCurrentConsentAction(consentToken)) {
+      elements.body.focus();
+    }
   });
   elements.discard.addEventListener("click", async () => {
     if (!hasDiscardableDraft) {
@@ -771,6 +907,7 @@ export async function initPopup({
       return;
     }
     let shouldFocusBody = false;
+    const consentToken = consentActionToken();
     setBusy(true);
     cancelDraftTimer();
     draftDirty = false;
@@ -785,9 +922,12 @@ export async function initPopup({
             draftGeneration,
             draftCursor.contentGeneration + 1,
           ),
-          expectedEpoch: dataEpoch,
+          expectedEpoch: consentToken.epoch,
         }),
       );
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       updateDraftCursor(result.record);
       hasDiscardableDraft = false;
       elements.form.reset();
@@ -807,14 +947,19 @@ export async function initPopup({
       }
       shouldFocusBody = true;
     } catch (error) {
+      if (!isCurrentConsentAction(consentToken)) {
+        return;
+      }
       if (!handleDataResetError(error)) {
         setStatus(elements.status, errorMessage(error), "error");
       }
     } finally {
-      setBusy(false);
-      updateDiscardControl();
+      if (isCurrentConsentAction(consentToken)) {
+        setBusy(false);
+        updateDiscardControl();
+      }
     }
-    if (shouldFocusBody) {
+    if (shouldFocusBody && isCurrentConsentAction(consentToken)) {
       elements.body.focus();
     }
   });
@@ -825,10 +970,13 @@ export async function initPopup({
       destroyed ||
       (!changes[STORAGE_KEYS.state] &&
         !changes[STORAGE_KEYS.pendingCaptures] &&
+        !changes[STORAGE_KEYS.dataConsent] &&
         !changes[STORAGE_KEYS.dataEpoch])
     ) {
       return;
     }
+    const changeGeneration = consentGeneration;
+    const changeEpoch = dataEpoch;
     if (
       changes[STORAGE_KEYS.dataEpoch] &&
       dataEpoch &&
@@ -837,16 +985,63 @@ export async function initPopup({
       markDataResetConflict();
       return;
     }
+    if (changes[STORAGE_KEYS.dataConsent]) {
+      try {
+        const acceptedEpoch = await loadDataConsent(storage, {
+          expectedEpoch: changeEpoch,
+        });
+        if (
+          changeGeneration !== consentGeneration ||
+          changeEpoch !== dataEpoch ||
+          consentGateActive ||
+          destroyed
+        ) {
+          return;
+        }
+        if (acceptedEpoch !== dataEpoch) {
+          markDataResetConflict();
+          return;
+        }
+      } catch {
+        if (
+          changeGeneration !== consentGeneration ||
+          changeEpoch !== dataEpoch ||
+          consentGateActive ||
+          destroyed
+        ) {
+          return;
+        }
+        markDataResetConflict();
+        return;
+      }
+    }
     try {
       if (changes[STORAGE_KEYS.state]) {
-        state = await loadState(storage, { expectedEpoch: dataEpoch });
-        applyTheme(state.settings.theme, documentValue);
+        const nextState = await loadState(storage, { expectedEpoch: changeEpoch });
+        if (
+          destroyed ||
+          consentGateActive ||
+          changeGeneration !== consentGeneration ||
+          changeEpoch !== dataEpoch
+        ) {
+          return;
+        }
+        state = nextState;
+        applyTheme(nextState.settings.theme, documentValue);
         renderRecentNotes();
       }
       if (changes[STORAGE_KEYS.pendingCaptures]) {
         const captures = await loadPendingCaptures(storage, {
-          expectedEpoch: dataEpoch,
+          expectedEpoch: changeEpoch,
         });
+        if (
+          destroyed ||
+          consentGateActive ||
+          changeGeneration !== consentGeneration ||
+          changeEpoch !== dataEpoch
+        ) {
+          return;
+        }
         const offerSelection = Boolean(
           captures[0] && captures[0].id !== appliedPendingCaptureId,
         );
@@ -856,6 +1051,14 @@ export async function initPopup({
         }
       }
     } catch (error) {
+      if (
+        destroyed ||
+        consentGateActive ||
+        changeGeneration !== consentGeneration ||
+        changeEpoch !== dataEpoch
+      ) {
+        return;
+      }
       if (!handleDataResetError(error)) {
         setStatus(elements.status, errorMessage(error), "error");
       }
@@ -863,20 +1066,53 @@ export async function initPopup({
   };
   chromeApi.storage.onChanged?.addListener(storageChangeHandler);
 
-  setBusy(true);
-  let loadSucceeded = false;
-  try {
+  async function loadPopup() {
+    const loadGeneration = ++consentGeneration;
+    const loadEpoch = dataEpoch;
+    const isCurrentLoad = () =>
+      !destroyed &&
+      !consentGateActive &&
+      !dataResetConflict &&
+      loadGeneration === consentGeneration &&
+      loadEpoch === dataEpoch;
+    setBusy(true);
+    let loadSucceeded = false;
+    try {
+      const acceptedEpoch = await loadDataConsent(storage, {
+        expectedEpoch: loadEpoch,
+      });
+      if (!isCurrentLoad() || acceptedEpoch !== loadEpoch) {
+        throw new ValidationError(
+          "Local note capture has not been allowed.",
+          "data-reset",
+        );
+      }
     const capturePromise = captureActivePage(chromeApi).catch((error) => error);
-    dataEpoch = await loadDataEpoch(storage);
-    state = await loadState(storage, { expectedEpoch: dataEpoch });
-    applyTheme(state.settings.theme, documentValue);
+    const loadedState = await loadState(storage, { expectedEpoch: loadEpoch });
+    if (!isCurrentLoad()) {
+      return;
+    }
     const [draftRecord, capture, recovery, savedHelpSeen, queuedCaptures] = await Promise.all([
-      loadPopupDraft(storage, { expectedEpoch: dataEpoch }),
+      loadPopupDraft(storage, { expectedEpoch: loadEpoch }),
       capturePromise,
-      loadRecoveryInfo(storage, { expectedEpoch: dataEpoch }),
-      loadHelpSeen(storage, { expectedEpoch: dataEpoch }),
-      loadPendingCaptures(storage, { expectedEpoch: dataEpoch }),
+      loadRecoveryInfo(storage, { expectedEpoch: loadEpoch }),
+      loadHelpSeen(storage, { expectedEpoch: loadEpoch }),
+      loadPendingCaptures(storage, { expectedEpoch: loadEpoch }),
     ]);
+    if (!isCurrentLoad()) {
+      return;
+    }
+    const confirmedEpoch = await loadDataConsent(storage, {
+      expectedEpoch: loadEpoch,
+    });
+    if (!isCurrentLoad() || confirmedEpoch !== loadEpoch) {
+      throw new ValidationError(
+        "Local note capture has not been allowed.",
+        "data-reset",
+      );
+    }
+    state = loadedState;
+    applyTheme(loadedState.settings.theme, documentValue);
     const draft = draftRecord.draft;
     updateDraftCursor(draftRecord);
     draftGeneration = Math.max(draftGeneration, draftRecord.contentGeneration);
@@ -925,18 +1161,26 @@ export async function initPopup({
       await showHelp();
     }
 
-  } catch (error) {
-    if (!handleDataResetError(error)) {
-      setStatus(elements.status, `Notes could not be loaded: ${errorMessage(error)}`, "error");
-    }
-  } finally {
-    setBusy(!loadSucceeded);
-    updateDiscardControl();
-    updateBodyCount();
-    if (loadSucceeded) {
-      (elements.body.value ? elements.title : elements.body).focus();
+    } catch (error) {
+      if (!isCurrentLoad()) {
+        return;
+      }
+      if (!handleDataResetError(error)) {
+        setStatus(elements.status, `Notes could not be loaded: ${errorMessage(error)}`, "error");
+      }
+    } finally {
+      if (isCurrentLoad()) {
+        setBusy(!loadSucceeded);
+        updateDiscardControl();
+        updateBodyCount();
+        if (loadSucceeded) {
+          (elements.body.value ? elements.title : elements.body).focus();
+        }
+      }
     }
   }
+
+  await loadPopup();
 
   function handoffDraft() {
     cancelDraftTimer();
@@ -944,6 +1188,7 @@ export async function initPopup({
       return;
     }
     const draft = formDraft();
+    const consentToken = consentActionToken();
     const contentGeneration = draftGeneration;
     const expectedOwnerSessionId = draftCursor.ownerSessionId;
     const expectedGeneration = draftCursor.generation;
@@ -955,8 +1200,11 @@ export async function initPopup({
         expectedOwnerSessionId,
         expectedGeneration,
         contentGeneration,
-        expectedEpoch: dataEpoch,
+        expectedEpoch: consentToken.epoch,
       });
+      if (!isCurrentConsentAction(consentToken)) {
+        return result;
+      }
       if (
         result.saved &&
         result.record.contentGeneration >= draftCursor.contentGeneration
@@ -964,7 +1212,7 @@ export async function initPopup({
         updateDraftCursor(result.record);
         if (pendingCaptureId) {
           await removePendingCapture(pendingCaptureId, storage, {
-            expectedEpoch: dataEpoch,
+            expectedEpoch: consentToken.epoch,
           });
         }
       }
@@ -980,9 +1228,12 @@ export async function initPopup({
           expectedGeneration,
           contentGeneration,
           pendingCaptureId,
-          expectedEpoch: dataEpoch,
+          expectedEpoch: consentToken.epoch,
         })
         .then((response) => {
+          if (!isCurrentConsentAction(consentToken)) {
+            return;
+          }
           if (!response?.ok) {
             const message = response?.error || "The background page did not save the draft.";
             throw response?.code
@@ -997,6 +1248,9 @@ export async function initPopup({
           }
         })
         .catch((error) => {
+          if (!isCurrentConsentAction(consentToken)) {
+            return undefined;
+          }
           if (error instanceof ValidationError && error.code === "data-reset") {
             throw error;
           }
@@ -1006,7 +1260,7 @@ export async function initPopup({
       operation = saveDirectly();
     }
     const guardedOperation = operation.catch((error) => {
-      if (!destroyed && !handleDataResetError(error)) {
+      if (isCurrentConsentAction(consentToken) && !handleDataResetError(error)) {
         setStatus(elements.status, `Draft not saved: ${errorMessage(error)}`, "error");
       }
     });
@@ -1023,7 +1277,7 @@ export async function initPopup({
   documentValue.addEventListener("visibilitychange", visibilityChangeHandler);
 
   return {
-    getState: () => state,
+    getState: () => dataResetConflict || consentGateActive ? undefined : state,
     async flushDraft() {
       cancelDraftTimer();
       await persistDraft();
@@ -1032,6 +1286,7 @@ export async function initPopup({
     },
     destroy() {
       destroyed = true;
+      consentGeneration += 1;
       cancelDraftTimer();
       chromeApi.storage.onChanged?.removeListener(storageChangeHandler);
       documentValue.defaultView?.removeEventListener("pagehide", pageHideHandler);

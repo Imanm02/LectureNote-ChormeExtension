@@ -307,53 +307,24 @@ async function sendWorkerHealthRequest(context, extensionId) {
   const healthPage = await context.newPage();
   try {
     await healthPage.goto(`chrome-extension://${extensionId}/manifest.json`);
-    return await healthPage.evaluate(async () => {
-      const epochKey = "lectureNoteDataEpoch";
-      const stored = await globalThis.chrome.storage.local.get(epochKey);
-      const hadEpoch = Object.hasOwn(stored, epochKey);
-      const previousEpoch = stored[epochKey];
-      const validEpoch = typeof previousEpoch === "string" &&
-        /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(previousEpoch);
-      const expectedEpoch = validEpoch ? previousEpoch : globalThis.crypto.randomUUID();
-      if (!validEpoch) {
-        await globalThis.chrome.storage.local.set({ [epochKey]: expectedEpoch });
-      }
-      try {
-        return await new Promise((resolveResponse, rejectResponse) => {
-          const timeout = globalThis.setTimeout(
-            () => rejectResponse(new Error("The packaged worker health request timed out.")),
-            5_000,
-          );
-          globalThis.chrome.runtime.sendMessage(
-            {
-              type: "save-draft",
-              draft: null,
-              sessionId: `store-screenshot-health-${globalThis.crypto.randomUUID()}`,
-              expectedOwnerSessionId:
-                `store-screenshot-mismatch-${globalThis.crypto.randomUUID()}`,
-              expectedGeneration: Number.MAX_SAFE_INTEGER,
-              contentGeneration: 1,
-              expectedEpoch,
-            },
-            (messageResponse) => {
-              globalThis.clearTimeout(timeout);
-              const lastError = globalThis.chrome.runtime.lastError;
-              if (lastError) {
-                rejectResponse(new Error(lastError.message));
-              } else {
-                resolveResponse(messageResponse);
-              }
-            },
-          );
-        });
-      } finally {
-        if (hadEpoch) {
-          await globalThis.chrome.storage.local.set({ [epochKey]: previousEpoch });
-        } else {
-          await globalThis.chrome.storage.local.remove(epochKey);
-        }
-      }
-    });
+    return await healthPage.evaluate(() => new Promise((resolveResponse, rejectResponse) => {
+      const timeout = globalThis.setTimeout(
+        () => rejectResponse(new Error("The packaged worker health request timed out.")),
+        5_000,
+      );
+      globalThis.chrome.runtime.sendMessage(
+        { type: "data-consent-changed" },
+        (messageResponse) => {
+          globalThis.clearTimeout(timeout);
+          const lastError = globalThis.chrome.runtime.lastError;
+          if (lastError) {
+            rejectResponse(new Error(lastError.message));
+          } else {
+            resolveResponse(messageResponse);
+          }
+        },
+      );
+    }));
   } finally {
     await healthPage.close().catch(() => undefined);
   }
@@ -410,9 +381,9 @@ async function loadExtensionAfterTracking(
     const healthResponse = await sendWorkerHealthRequest(context, loadResult.id);
     assert.equal(healthResponse?.ok, true, "The packaged worker did not handle its health request");
     assert.equal(
-      healthResponse?.saved,
-      false,
-      "The worker health request changed the popup draft",
+      typeof healthResponse?.consent,
+      "boolean",
+      "The worker health request did not report consent state",
     );
     return { extensionId: loadResult.id, worker };
   } catch (error) {
@@ -616,6 +587,20 @@ async function capturePackagedExtension(extensionRoot, outputDirectory) {
 
     const library = await context.newPage();
     await library.goto(`chrome-extension://${extensionId}/notes.html`);
+    await library.locator("#dataConsentDialog[open]").waitFor();
+    await library.locator("#dataConsentAcceptButton:not([disabled])").waitFor();
+    assert.equal(
+      await library.evaluate(() => globalThis.document.activeElement?.id),
+      "dataConsentHeading",
+      "The first-use disclosure did not receive initial focus",
+    );
+    assert.deepEqual(
+      await library.evaluate(() => globalThis.chrome.storage.local.get(null)),
+      {},
+      "The packaged extension wrote local data before consent",
+    );
+    await library.getByRole("button", { name: "Allow local note capture" }).click();
+    await library.locator("#dataConsentDialog").waitFor({ state: "hidden" });
     await library.locator("#libraryMain[aria-busy='false']").waitFor();
     await library.locator("#themeSelect").selectOption("light");
     await library.locator('html[data-theme="light"]').waitFor();

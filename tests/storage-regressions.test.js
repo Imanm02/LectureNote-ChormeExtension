@@ -473,6 +473,11 @@ test("resets all stored data and advances draft tombstones", async () => {
       settings: { theme: "dark", sort: "title-asc" },
     },
     [STORAGE_KEYS.dataEpoch]: "epoch-before",
+    [STORAGE_KEYS.dataConsent]: {
+      version: 1,
+      epoch: "epoch-before",
+      accepted: true,
+    },
     [STORAGE_KEYS.draft]: {
       version: 1,
       ownerSessionId: "popup-before",
@@ -493,6 +498,14 @@ test("resets all stored data and advances draft tombstones", async () => {
     [STORAGE_KEYS.legacyResult]: "Old generated note",
     [STORAGE_KEYS.legacySelection]: "Old selection",
   });
+  const resetWrites = [];
+  const baseSet = storage.set.bind(storage);
+  storage.set = async (update) => {
+    if (Object.hasOwn(update, STORAGE_KEYS.resetCleanup)) {
+      resetWrites.push(structuredClone(update));
+    }
+    await baseSet(update);
+  };
 
   const reset = await resetAllData(storage, {
     lockManager: null,
@@ -523,8 +536,14 @@ test("resets all stored data and advances draft tombstones", async () => {
     draft: null,
   });
   assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "epoch-after");
+  assert.deepEqual(resetWrites[0][STORAGE_KEYS.dataConsent], {
+    version: 1,
+    epoch: "epoch-after",
+    accepted: false,
+  });
   for (const key of [
     STORAGE_KEYS.resetCleanup,
+    STORAGE_KEYS.dataConsent,
     STORAGE_KEYS.pendingCaptures,
     STORAGE_KEYS.recovery,
     STORAGE_KEYS.helpSeen,
@@ -810,6 +829,11 @@ test("finishes reset cleanup after an interrupted removal", async () => {
   assert.deepEqual(storage.values[STORAGE_KEYS.state].notes, []);
   assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "epoch-after");
   assert.equal(storage.values[STORAGE_KEYS.resetCleanup], "epoch-after");
+  assert.deepEqual(storage.values[STORAGE_KEYS.dataConsent], {
+    version: 1,
+    epoch: "epoch-after",
+    accepted: false,
+  });
   assert.equal(STORAGE_KEYS.pendingCaptures in storage.values, true);
   assert.equal(STORAGE_KEYS.recovery in storage.values, false);
 

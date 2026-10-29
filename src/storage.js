@@ -13,6 +13,7 @@ import {
 export const STORAGE_KEYS = Object.freeze({
   state: "lectureNoteState",
   dataEpoch: "lectureNoteDataEpoch",
+  dataConsent: "lectureNoteDataConsent",
   resetCleanup: "lectureNoteResetCleanup",
   draft: "lectureNoteDraft",
   editorDraft: "lectureNoteEditorDraft",
@@ -27,8 +28,10 @@ const STATE_LOCK = "lecture-note-state";
 const POPUP_DRAFT_VERSION = 1;
 const EDITOR_DRAFT_VERSION = 1;
 const PENDING_CAPTURE_VERSION = 1;
+const DATA_CONSENT_VERSION = 1;
 const DATA_EPOCH_ATTEMPTS = 25;
 const RESET_CLEANUP_KEYS = Object.freeze([
+  STORAGE_KEYS.dataConsent,
   STORAGE_KEYS.pendingCaptures,
   STORAGE_KEYS.recovery,
   STORAGE_KEYS.helpSeen,
@@ -380,17 +383,18 @@ async function assertExistingExpectedDataEpochUnlocked(area, options = {}) {
   }
   const stored = await area.get(STORAGE_KEYS.dataEpoch);
   const epoch = stored[STORAGE_KEYS.dataEpoch];
-  if (isValidIdentifier(epoch) && options.expectedEpoch !== epoch) {
+  if (options.expectedEpoch !== epoch) {
     throwDataResetConflict();
   }
 }
 
 async function assertExpectedDataEpochUnlocked(area, options = {}) {
   validateExpectedDataEpoch(options);
-  const epoch = await loadDataEpochUnlocked(area, options);
-  if (options.expectedEpoch !== undefined && options.expectedEpoch !== epoch) {
-    throwDataResetConflict();
+  if (options.expectedEpoch !== undefined) {
+    await assertExistingExpectedDataEpochUnlocked(area, options);
+    return options.expectedEpoch;
   }
+  const epoch = await loadDataEpochUnlocked(area, options);
   return epoch;
 }
 
@@ -400,6 +404,65 @@ export async function loadDataEpoch(
 ) {
   const area = getStorage(storage);
   return withStateLock(() => loadDataEpochUnlocked(area, options), lockManager);
+}
+
+export async function loadDataConsent(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    validateExpectedDataEpoch(options);
+    const stored = await area.get([STORAGE_KEYS.dataConsent, STORAGE_KEYS.dataEpoch]);
+    const consent = stored[STORAGE_KEYS.dataConsent];
+    const epoch = stored[STORAGE_KEYS.dataEpoch];
+    if (options.expectedEpoch !== undefined && epoch !== options.expectedEpoch) {
+      throwDataResetConflict();
+    }
+    const accepted = Boolean(
+      consent &&
+        typeof consent === "object" &&
+        !Array.isArray(consent) &&
+        consent.version === DATA_CONSENT_VERSION &&
+        consent.accepted === true &&
+        isValidIdentifier(epoch) &&
+        consent.epoch === epoch,
+    );
+    return accepted ? epoch : null;
+  }, lockManager);
+}
+
+export async function saveDataConsent(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks, ...options } = {},
+) {
+  const area = getStorage(storage);
+  return withStateLock(async () => {
+    const epoch = await assertExpectedDataEpochUnlocked(area, options);
+    await area.set({
+      [STORAGE_KEYS.dataConsent]: {
+        version: DATA_CONSENT_VERSION,
+        epoch,
+        accepted: true,
+      },
+    });
+    await assertExpectedDataEpochUnlocked(area, { expectedEpoch: epoch });
+    return epoch;
+  }, lockManager);
+}
+
+export async function clearStoredDataBeforeConsent(
+  storage = chrome.storage.local,
+  { lockManager = globalThis.navigator?.locks } = {},
+) {
+  const area = getStorage(storage);
+  if (typeof area.clear !== "function") {
+    throw new TypeError("The storage area cannot clear saved extension data.");
+  }
+  return withStateLock(async () => {
+    await area.clear();
+    return true;
+  }, lockManager);
 }
 
 export async function loadHelpSeen(
@@ -519,6 +582,11 @@ export async function resetAllData(
     await area.set({
       [STORAGE_KEYS.state]: state,
       [STORAGE_KEYS.dataEpoch]: nextEpoch,
+      [STORAGE_KEYS.dataConsent]: {
+        version: DATA_CONSENT_VERSION,
+        epoch: nextEpoch,
+        accepted: false,
+      },
       [STORAGE_KEYS.resetCleanup]: nextEpoch,
       [STORAGE_KEYS.draft]: popupDraftRecord,
       [STORAGE_KEYS.editorDraft]: editorDraftRecord,

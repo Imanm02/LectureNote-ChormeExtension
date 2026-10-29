@@ -41,6 +41,58 @@ function blockingDraftStorage(initial = {}) {
   return { storage, draftStarted: draftStarted.promise, releaseDraft: releaseDraft.resolve };
 }
 
+test("a first-use popup does not inspect the page or saved notes before consent", async () => {
+  const dom = loadPage("popup.html");
+  const storedState = { private: "saved-notes-not-read" };
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: storedState });
+  const reads = [];
+  const baseGet = storage.get.bind(storage);
+  storage.get = async (keys) => {
+    reads.push(Array.isArray(keys) ? [...keys] : [keys]);
+    return baseGet(keys);
+  };
+  const chromeApi = chromeMock(
+    storage,
+    { title: "Private page", text: "Private selection" },
+    { dataConsent: false },
+  );
+  let tabQueries = 0;
+  let scriptExecutions = 0;
+  const baseQuery = chromeApi.tabs.query;
+  const baseExecute = chromeApi.scripting.executeScript;
+  chromeApi.tabs.query = async (...args) => {
+    tabQueries += 1;
+    return baseQuery(...args);
+  };
+  chromeApi.scripting.executeScript = async (...args) => {
+    scriptExecutions += 1;
+    return baseExecute(...args);
+  };
+
+  const controllerPromise = initPopup({
+    documentValue: dom.window.document,
+    chromeApi,
+  });
+  await waitFor(() =>
+    dom.window.document.getElementById("dataConsentDialog").open &&
+    !dom.window.document.getElementById("dataConsentAcceptButton").disabled,
+  );
+
+  assert.equal(tabQueries, 0);
+  assert.equal(scriptExecutions, 0);
+  assert.deepEqual(reads, [[STORAGE_KEYS.dataConsent, STORAGE_KEYS.dataEpoch]]);
+  assert.deepEqual(storage.values[STORAGE_KEYS.state], storedState);
+  assert.equal(dom.window.document.getElementById("titleInput").value, "");
+  assert.equal(dom.window.document.getElementById("bodyInput").value, "");
+
+  dom.window.document.getElementById("dataConsentAcceptButton").click();
+  const controller = await controllerPromise;
+  assert.equal(tabQueries, 1);
+  assert.equal(scriptExecutions, 1);
+  controller.destroy();
+  dom.window.close();
+});
+
 test("bounds long page metadata before saving a captured note", async () => {
   const dom = loadPage("popup.html");
   const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
@@ -210,7 +262,7 @@ test("falls back to direct storage when background handoff reports an error", as
   dom.window.close();
 });
 
-test("does not retry a background data reset conflict", async () => {
+test("clears the form and gates a background data reset conflict", async () => {
   const dom = loadPage("popup.html");
   const storage = memoryStorage({
     [STORAGE_KEYS.state]: createEmptyState(),
@@ -219,6 +271,12 @@ test("does not retry a background data reset conflict", async () => {
   const chromeApi = chromeMock(storage);
   chromeApi.runtime = {
     async sendMessage() {
+      storage.values[STORAGE_KEYS.dataEpoch] = "background-reset-epoch";
+      storage.values[STORAGE_KEYS.dataConsent] = {
+        version: 1,
+        epoch: "background-reset-epoch",
+        accepted: false,
+      };
       return {
         ok: false,
         error: "The note data was reset in another window.",
@@ -238,10 +296,11 @@ test("does not retry a background data reset conflict", async () => {
   await controller.flushDraft();
 
   assert.equal(await loadDraft(storage), null);
-  assert.equal(body.value, "Keep the rejected handoff visible");
+  assert.equal(body.value, "");
+  assert.equal(dom.window.document.getElementById("dataConsentDialog").open, true);
   assert.match(
     dom.window.document.getElementById("status").textContent,
-    /copy it, then reopen Lecture Notes/iu,
+    /Allow local note capture/iu,
   );
   controller.destroy();
   dom.window.close();
@@ -270,7 +329,7 @@ test("hands off a dirty draft when the popup becomes hidden", async () => {
   dom.window.close();
 });
 
-test("stops autosave and handoff after observing a data reset", async () => {
+test("clears captured data and stops writes after observing a reset", async () => {
   const dom = loadPage("popup.html");
   const storage = memoryStorage({
     [STORAGE_KEYS.state]: createEmptyState(),
@@ -306,10 +365,11 @@ test("stops autosave and handoff after observing a data reset", async () => {
   dom.window.dispatchEvent(new dom.window.Event("pagehide"));
   await controller.flushDraft();
 
-  assert.equal(body.value, "Keep this visible for manual copy");
+  assert.equal(body.value, "");
+  assert.equal(dom.window.document.getElementById("dataConsentDialog").open, true);
   assert.match(
     dom.window.document.getElementById("status").textContent,
-    /copy it, then reopen Lecture Notes/iu,
+    /Allow local note capture/iu,
   );
   assert.equal(dom.window.document.getElementById("saveButton").disabled, true);
   assert.equal(sentMessages.length, 0);
@@ -319,7 +379,7 @@ test("stops autosave and handoff after observing a data reset", async () => {
   dom.window.close();
 });
 
-test("rejects a stale popup save and lets a new popup save", async () => {
+test("gates a stale popup save and lets a new popup save after consent", async () => {
   const storage = memoryStorage({
     [STORAGE_KEYS.state]: createEmptyState(),
     [STORAGE_KEYS.helpSeen]: true,
@@ -339,10 +399,11 @@ test("rejects a stale popup save and lets a new popup save", async () => {
 
   submit(staleDom.window, staleDom.window.document.getElementById("noteForm"));
   await waitFor(() =>
-    staleDom.window.document.getElementById("status").textContent.includes("reopen Lecture Notes"),
+    staleDom.window.document.getElementById("status").textContent.includes("Allow local note capture"),
   );
 
-  assert.equal(staleBody.value, "Copy this stale text before reopening");
+  assert.equal(staleBody.value, "");
+  assert.equal(staleDom.window.document.getElementById("dataConsentDialog").open, true);
   assert.equal(storage.values[STORAGE_KEYS.state].notes.length, 0);
   assert.equal(await loadDraft(storage), null);
   staleController.destroy();
@@ -386,7 +447,7 @@ test("blocks a first-use popup when reset races with its help preference", async
   assert.equal(dom.window.document.getElementById("saveButton").disabled, true);
   assert.match(
     dom.window.document.getElementById("status").textContent,
-    /copy it, then reopen Lecture Notes/iu,
+    /Allow local note capture/iu,
   );
   controller.destroy();
   dom.window.close();

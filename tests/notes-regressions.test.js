@@ -92,7 +92,11 @@ test("keeps state actions disabled after load failure and supports retry", async
   const storage = {
     values: stored.values,
     async get(keys) {
-      if (failReads) {
+      const names = Array.isArray(keys) ? keys : [keys];
+      const consentCheck = names.length === 2 &&
+        names.includes(STORAGE_KEYS.dataConsent) &&
+        names.includes(STORAGE_KEYS.dataEpoch);
+      if (failReads && !consentCheck) {
         throw new Error("Storage read blocked.");
       }
       return stored.get(keys);
@@ -170,9 +174,10 @@ test("rejects a library read when data resets without a storage event", async (t
 
   assert.equal(controller.getState(), undefined);
   assert.equal(documentValue.querySelectorAll(".note-card").length, 0);
-  assert.equal(documentValue.getElementById("resultSummary").textContent, "Reload required");
-  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
-  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+  assert.equal(documentValue.getElementById("resultSummary").textContent, "Permission required");
+  assert.equal(documentValue.getElementById("retryLoadButton").hidden, true);
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /cleared in another window/u);
   assert.deepEqual(storage.values[STORAGE_KEYS.state], createEmptyState());
 });
 
@@ -1575,12 +1580,13 @@ test("stops reset backup when the saved data epoch changed", async (t) => {
   await waitFor(() => documentValue.getElementById("resetDialog").open === false);
 
   assert.equal(blobs.length, 0);
-  assert.equal(documentValue.getElementById("resultSummary").textContent, "Reload required");
-  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
-  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
+  assert.equal(documentValue.getElementById("resultSummary").textContent, "Permission required");
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /cleared in another window/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("dataConsentHeading"));
 });
 
-test("clears local data and keeps the current library ready", async (t) => {
+test("clears local data, revokes consent, and starts fresh after acceptance", async (t) => {
   const initialState = {
     ...createEmptyState(),
     revision: 4,
@@ -1606,16 +1612,16 @@ test("clears local data and keeps the current library ready", async (t) => {
   confirmation.value = "DELETE";
   confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
   submit(documentValue, "resetForm");
-  await waitFor(() => controller.getState().notes.length === 0);
+  await waitFor(() => documentValue.getElementById("dataConsentDialog").open);
 
   assert.equal(documentValue.getElementById("resetDialog").open, false);
-  assert.equal(controller.getState().revision, 5);
-  assert.equal(controller.getState().trash.length, 0);
-  assert.equal(controller.getState().settings.theme, "system");
+  assert.equal(controller.getState(), undefined);
+  assert.equal(storage.values[STORAGE_KEYS.state].revision, 5);
+  assert.equal(storage.values[STORAGE_KEYS.state].trash.length, 0);
   assert.equal(documentValue.documentElement.dataset.theme, "system");
-  assert.equal(documentValue.getElementById("libraryMain").getAttribute("aria-busy"), "false");
-  assert.equal(documentValue.getElementById("newNoteButton").disabled, false);
-  assert.equal(documentValue.activeElement, documentValue.getElementById("newNoteButton"));
+  assert.equal(documentValue.getElementById("libraryMain").getAttribute("aria-busy"), "true");
+  assert.equal(documentValue.getElementById("newNoteButton").disabled, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("dataConsentHeading"));
   assert.notEqual(storage.values[STORAGE_KEYS.dataEpoch], "reset-ui-before");
   assert.equal(storage.values[STORAGE_KEYS.editorDraft].draft, null);
   for (const key of [
@@ -1626,6 +1632,12 @@ test("clears local data and keeps the current library ready", async (t) => {
   ]) {
     assert.equal(key in storage.values, false, key);
   }
+
+  documentValue.getElementById("dataConsentAcceptButton").click();
+  await waitFor(() => controller.getState()?.notes.length === 0);
+  assert.equal(controller.getState().settings.theme, "system");
+  assert.equal(documentValue.getElementById("libraryMain").getAttribute("aria-busy"), "false");
+  assert.equal(documentValue.getElementById("newNoteButton").disabled, false);
 
   documentValue.getElementById("newNoteButton").click();
   documentValue.getElementById("editorTitle").value = "After reset";
@@ -1705,18 +1717,18 @@ test("reports a completed reset when supporting-data cleanup fails", async (t) =
   confirmation.value = "DELETE";
   confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
   submit(documentValue, "resetForm");
-  await waitFor(() => documentValue.getElementById("retryLoadButton").textContent === "Retry cleanup");
+  await waitFor(() => documentValue.getElementById("dataConsentDialog").open);
 
-  assert.equal(controller.getState().notes.length, 0);
+  assert.equal(controller.getState(), undefined);
   assert.equal(storage.values[STORAGE_KEYS.state].revision, 3);
   assert.equal(storage.values[STORAGE_KEYS.resetCleanup], storage.values[STORAGE_KEYS.dataEpoch]);
   assert.equal(documentValue.getElementById("newNoteButton").disabled, true);
   assert.match(documentValue.getElementById("libraryStatus").textContent, /Local data was cleared/u);
-  assert.match(documentValue.getElementById("libraryStatus").textContent, /retry cleanup/u);
-  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
+  assert.match(documentValue.getElementById("dataConsentStatus").textContent, /retry supporting-data cleanup/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("dataConsentHeading"));
 
   failCleanup = false;
-  documentValue.getElementById("retryLoadButton").click();
+  documentValue.getElementById("dataConsentAcceptButton").click();
   await waitFor(() =>
     !(STORAGE_KEYS.resetCleanup in storage.values) &&
     !documentValue.getElementById("newNoteButton").disabled,
@@ -1766,8 +1778,11 @@ test("requires a reload when a reset outcome cannot be read back", async (t) => 
 
   assert.equal(storage.values[STORAGE_KEYS.state].notes.length, 0);
   assert.notEqual(storage.values[STORAGE_KEYS.dataEpoch], "unknown-before");
-  assert.equal(controller.getState().notes.length, 1);
+  assert.equal(controller.getState(), undefined);
   assert.equal(documentValue.getElementById("resetDialog").open, false);
+  assert.equal(documentValue.querySelector(".note-card"), null);
+  assert.equal(documentValue.body.textContent.includes("Saved body"), false);
+  assert.equal(documentValue.getElementById("activeNoteCount").textContent, "0");
   assert.equal(documentValue.getElementById("newNoteButton").disabled, true);
   assert.equal(documentValue.getElementById("clearLocalDataButton").disabled, true);
   assert.match(documentValue.getElementById("libraryStatus").textContent, /could not confirm/u);
@@ -1792,10 +1807,10 @@ test("focuses Reload page after a stale reset confirmation", async (t) => {
   submit(documentValue, "resetForm");
   await waitFor(() => documentValue.getElementById("resetDialog").open === false);
 
-  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
   assert.equal(documentValue.getElementById("clearLocalDataButton").disabled, true);
-  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
-  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("dataConsentHeading"));
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /cleared in another window/u);
 });
 
 test("closes a reset review when another window resets the data", async (t) => {
@@ -1829,9 +1844,9 @@ test("closes a reset review when another window resets the data", async (t) => {
   assert.equal(dialog.open, false);
   assert.equal(confirmation.value, "");
   assert.equal(documentValue.getElementById("clearLocalDataButton").disabled, true);
-  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
-  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
-  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("dataConsentHeading"));
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /cleared in another window/u);
   assert.deepEqual(storage.values[STORAGE_KEYS.state], resetState);
 });
 
@@ -1859,9 +1874,162 @@ test("closes course management when another window resets the data", async (t) =
 
   assert.equal(documentValue.getElementById("manageCoursesDialog").open, false);
   assert.equal(documentValue.getElementById("manageCoursesButton").disabled, true);
-  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
-  assert.equal(documentValue.activeElement, documentValue.getElementById("retryLoadButton"));
-  assert.match(documentValue.getElementById("libraryStatus").textContent, /reset in another window/u);
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("dataConsentHeading"));
+  assert.match(documentValue.getElementById("libraryStatus").textContent, /cleared in another window/u);
+});
+
+test("purges every rendered note value when consent is revoked", async (t) => {
+  const sentinel = "PRIVATE_RESET_SENTINEL";
+  const original = note("private-note-id", sentinel, {
+    title: sentinel,
+    course: sentinel,
+    source: { title: sentinel, url: `https://example.com/${sentinel}` },
+  });
+  const storage = memoryStorage({
+    [STORAGE_KEYS.dataEpoch]: "purge-before",
+    [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
+  });
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, controller, documentValue } = setup;
+  const windowValue = documentValue.defaultView;
+  windowValue.history.replaceState(null, "", `notes.html#note=${sentinel}`);
+
+  documentValue.getElementById("detailHeading").textContent = sentinel;
+  documentValue.getElementById("detailBody").textContent = sentinel;
+  documentValue.getElementById("detailSourceUrl").href = `https://example.com/${sentinel}`;
+  for (const identifier of ["detailCreated", "detailUpdated", "detailDeleted"]) {
+    const time = documentValue.getElementById(identifier);
+    time.textContent = sentinel;
+    time.setAttribute("datetime", sentinel);
+    time.title = sentinel;
+  }
+  for (const identifier of [
+    "detailCopyButton",
+    "detailEditButton",
+    "detailDeleteButton",
+    "detailRestoreButton",
+    "detailPermanentDeleteButton",
+  ]) {
+    documentValue.getElementById(identifier).setAttribute("aria-label", sentinel);
+  }
+  documentValue.getElementById("manageCourseInput").value = sentinel;
+  documentValue.getElementById("manageCoursesMessage").textContent = sentinel;
+  documentValue.getElementById("importMessage").textContent = sentinel;
+  documentValue.getElementById("importExportedAt").title = sentinel;
+  for (const identifier of [
+    "courseFilter",
+    "editorCourseSuggestions",
+    "manageCourseSelect",
+    "manageCourseSuggestions",
+  ]) {
+    const option = documentValue.createElement("option");
+    option.value = sentinel;
+    option.textContent = sentinel;
+    documentValue.getElementById(identifier).append(option);
+  }
+
+  const oldEpoch = storage.values[STORAGE_KEYS.dataEpoch];
+  const oldConsent = storage.values[STORAGE_KEYS.dataConsent];
+  const oldState = controller.getState();
+  const resetState = createEmptyState();
+  const newConsent = { version: 1, epoch: "purge-after", accepted: false };
+  storage.values[STORAGE_KEYS.dataEpoch] = "purge-after";
+  storage.values[STORAGE_KEYS.dataConsent] = newConsent;
+  storage.values[STORAGE_KEYS.state] = resetState;
+  await chromeApi.emitStorageChange({
+    [STORAGE_KEYS.dataEpoch]: { oldValue: oldEpoch, newValue: "purge-after" },
+    [STORAGE_KEYS.dataConsent]: { oldValue: oldConsent, newValue: newConsent },
+    [STORAGE_KEYS.state]: { oldValue: oldState, newValue: resetState },
+  });
+  await waitFor(() => documentValue.getElementById("dataConsentDialog").open);
+
+  assert.equal(documentValue.body.textContent.includes(sentinel), false);
+  assert.equal(
+    [...documentValue.querySelectorAll("input, textarea")]
+      .some((input) => input.value.includes(sentinel)),
+    false,
+  );
+  assert.equal(
+    [...documentValue.querySelectorAll("option")]
+      .some((option) => option.value.includes(sentinel) || option.textContent.includes(sentinel)),
+    false,
+  );
+  assert.equal(
+    [...documentValue.querySelectorAll("[href], [datetime], [title], [aria-label]")]
+      .some((element) => ["href", "datetime", "title", "aria-label"]
+        .some((name) => element.getAttribute(name)?.includes(sentinel))),
+    false,
+  );
+  assert.equal(windowValue.location.hash, "");
+  assert.equal(controller.getState(), undefined);
+  assert.equal(documentValue.activeElement, documentValue.getElementById("dataConsentHeading"));
+});
+
+test("a deferred editor save cannot restore data or busy state after reset", async (t) => {
+  const storage = memoryStorage({ [STORAGE_KEYS.state]: createEmptyState() });
+  const setup = await setupLibrary(t, [], storage);
+  const { chromeApi, controller, documentValue } = setup;
+  const oldEpoch = storage.values[STORAGE_KEYS.dataEpoch];
+  const oldConsent = storage.values[STORAGE_KEYS.dataConsent];
+  const baseSet = storage.set.bind(storage);
+  const releaseWrite = deferred();
+  t.after(() => releaseWrite.resolve());
+  let writeStarted = false;
+  let blockDraft = true;
+  storage.set = async (update) => {
+    await baseSet(update);
+    if (blockDraft && update[STORAGE_KEYS.editorDraft]?.draft) {
+      blockDraft = false;
+      writeStarted = true;
+      await releaseWrite.promise;
+    }
+  };
+
+  documentValue.getElementById("newNoteButton").click();
+  const editorBody = documentValue.getElementById("editorBody");
+  editorBody.value = "DEFERRED_PRIVATE_EDITOR_TEXT";
+  editorBody.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
+  submit(documentValue, "editorForm");
+  await waitFor(() => writeStarted);
+
+  const resetState = createEmptyState();
+  const resetDraft = {
+    version: 1,
+    ownerSessionId: "reset_editor-after",
+    generation: 2,
+    contentGeneration: 2,
+    draft: null,
+  };
+  const newConsent = { version: 1, epoch: "editor-after", accepted: false };
+  storage.values[STORAGE_KEYS.dataEpoch] = "editor-after";
+  storage.values[STORAGE_KEYS.dataConsent] = newConsent;
+  storage.values[STORAGE_KEYS.state] = resetState;
+  storage.values[STORAGE_KEYS.editorDraft] = resetDraft;
+  const storageChange = chromeApi.emitStorageChange({
+    [STORAGE_KEYS.dataEpoch]: { oldValue: oldEpoch, newValue: "editor-after" },
+    [STORAGE_KEYS.dataConsent]: { oldValue: oldConsent, newValue: newConsent },
+    [STORAGE_KEYS.state]: { oldValue: controller.getState(), newValue: resetState },
+  });
+  releaseWrite.resolve();
+  await storageChange;
+
+  assert.equal(editorBody.value, "");
+  assert.equal(documentValue.getElementById("editorDialog").open, false);
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
+  assert.equal(controller.getState(), undefined);
+  assert.equal(documentValue.body.textContent.includes("DEFERRED_PRIVATE_EDITOR_TEXT"), false);
+
+  await waitFor(() => !documentValue.getElementById("dataConsentAcceptButton").disabled);
+  documentValue.getElementById("dataConsentAcceptButton").click();
+  await waitFor(() => controller.getState()?.notes.length === 0);
+  documentValue.getElementById("newNoteButton").click();
+
+  assert.equal(documentValue.getElementById("editorDialog").open, true);
+  assert.equal(documentValue.getElementById("editorForm").inert, false);
+  assert.equal(documentValue.getElementById("editorForm").getAttribute("aria-busy"), "false");
+  assert.equal(documentValue.getElementById("saveEditorButton").disabled, false);
+  assert.equal(documentValue.getElementById("cancelEditorButton").disabled, false);
 });
 
 test("discards an import file that finishes reading after reset", async (t) => {
@@ -1900,13 +2068,13 @@ test("discards an import file that finishes reading after reset", async (t) => {
   confirmation.value = "DELETE";
   confirmation.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
   submit(documentValue, "resetForm");
-  await waitFor(() => controller.getState().notes.length === 0);
+  await waitFor(() => documentValue.getElementById("dataConsentDialog").open);
   readGate.resolve(backupText);
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 
   assert.equal(documentValue.getElementById("importDialog").open, false);
-  assert.equal(controller.getState().notes.length, 0);
-  assert.match(documentValue.getElementById("libraryStatus").textContent, /Local notes/u);
+  assert.equal(controller.getState(), undefined);
+  assert.match(documentValue.getElementById("dataConsentStatus").textContent, /Local notes/u);
 });
 
 test("reconciles storage events suppressed by a failed reset", async (t) => {
@@ -1993,7 +2161,7 @@ test("reconciles storage events suppressed by a failed reset", async (t) => {
   assert.equal(storage.values[STORAGE_KEYS.dataEpoch], "failed-reset-epoch");
 });
 
-test("keeps editor text visible and blocks writes after a data reset", async (t) => {
+test("purges editor text and blocks writes after a data reset", async (t) => {
   const original = note("first", "Original body");
   const storage = memoryStorage({
     [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
@@ -2020,21 +2188,19 @@ test("keeps editor text visible and blocks writes after a data reset", async (t)
     },
   });
 
-  assert.equal(body.value, "Text kept in the old page");
-  assert.equal(documentValue.getElementById("editorDialog").open, true);
+  assert.equal(body.value, "");
+  assert.equal(documentValue.getElementById("editorDialog").open, false);
   assert.equal(documentValue.getElementById("newNoteButton").disabled, true);
-  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
-  assert.match(documentValue.getElementById("editorStatus").textContent, /still here/u);
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
+  assert.equal(documentValue.getElementById("editorStatus").textContent, "");
 
   submit(documentValue, "editorForm");
-  await waitFor(() => documentValue.getElementById("libraryStatus").textContent.includes("reset in another window"));
-
-  assert.equal(body.value, "Text kept in the old page");
-  assert.equal(documentValue.getElementById("editorDialog").open, true);
+  assert.equal(body.value, "");
+  assert.equal(documentValue.getElementById("editorDialog").open, false);
   assert.deepEqual(storage.values[STORAGE_KEYS.state], resetState);
 });
 
-test("blocks a clean editor after reset, keeps text, and closes on cancel", async (t) => {
+test("closes and purges a clean editor after reset", async (t) => {
   const original = note("first", "Original body");
   const storage = memoryStorage({
     [STORAGE_KEYS.state]: { ...createEmptyState(), notes: [original] },
@@ -2059,24 +2225,21 @@ test("blocks a clean editor after reset, keeps text, and closes on cancel", asyn
   });
 
   const body = documentValue.getElementById("editorBody");
-  assert.match(documentValue.getElementById("editorStatus").textContent, /can no longer save/u);
+  assert.equal(documentValue.getElementById("editorStatus").textContent, "");
+  assert.equal(documentValue.getElementById("editorDialog").open, false);
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
   assert.equal(documentValue.getElementById("saveEditorButton").disabled, true);
   assert.equal(documentValue.getElementById("editorSaveDuplicateButton").disabled, true);
   assert.equal(documentValue.getElementById("saveEditorAsNewButton").disabled, true);
-  assert.equal(body.disabled, false);
+  assert.equal(body.value, "");
 
   body.value = "Text entered after the reset";
   body.dispatchEvent(new documentValue.defaultView.Event("input", { bubbles: true }));
   submit(documentValue, "editorForm");
 
   assert.equal(body.value, "Text entered after the reset");
-  assert.match(documentValue.getElementById("editorStatus").textContent, /can no longer save/u);
+  assert.equal(documentValue.getElementById("editorStatus").textContent, "");
   assert.deepEqual(storage.values[STORAGE_KEYS.state], resetState);
-
-  documentValue.getElementById("editorDialog").dispatchEvent(
-    new documentValue.defaultView.Event("cancel", { cancelable: true }),
-  );
-  await waitFor(() => documentValue.getElementById("editorDialog").open === false);
 });
 
 test("suggests saved courses and labels the active date sort", async (t) => {
@@ -2826,6 +2989,12 @@ test("does not retry an editor handoff rejected after a data reset", async (t) =
     runtime: {
       async sendMessage(message) {
         messages.push(message);
+        storage.values[STORAGE_KEYS.dataEpoch] = "handoff-reset-epoch";
+        storage.values[STORAGE_KEYS.dataConsent] = {
+          version: 1,
+          epoch: "handoff-reset-epoch",
+          accepted: false,
+        };
         return {
           ok: false,
           error: "The note data was reset in another window.",
@@ -2851,12 +3020,12 @@ test("does not retry an editor handoff rejected after a data reset", async (t) =
   body.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
   dom.window.dispatchEvent(new dom.window.Event("pagehide"));
   await waitFor(() => messages.length === 1);
-  await waitFor(() => documentValue.getElementById("libraryStatus").textContent.includes("reset in another window"));
+  await waitFor(() => documentValue.getElementById("libraryStatus").textContent.includes("cleared in another window"));
 
-  assert.equal(messages[0].expectedEpoch, storage.values[STORAGE_KEYS.dataEpoch]);
+  assert.notEqual(messages[0].expectedEpoch, storage.values[STORAGE_KEYS.dataEpoch]);
   assert.equal(STORAGE_KEYS.editorDraft in storage.values, false);
-  assert.equal(body.value, "Keep this editor text");
-  assert.equal(documentValue.getElementById("retryLoadButton").textContent, "Reload page");
+  assert.equal(body.value, "");
+  assert.equal(documentValue.getElementById("dataConsentDialog").open, true);
 });
 
 test("keeps an autosaved draft when the editor closes", async (t) => {

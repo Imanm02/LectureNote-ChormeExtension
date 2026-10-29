@@ -1,8 +1,13 @@
-import { isValidIdentifier, LIMITS, normalizeSource } from "./model.js";
+import {
+  isValidIdentifier,
+  LIMITS,
+  normalizeSource,
+  ValidationError,
+} from "./model.js";
 import { MESSAGE_TYPES } from "./messages.js";
 import {
   enqueuePendingCapture,
-  loadDataEpoch,
+  loadDataConsent,
   removePendingCapture,
   saveEditorDraft,
   savePopupDraft,
@@ -23,6 +28,12 @@ export function isAuthorizedDraftMessage(message, sender, runtimeId) {
 export async function handleDraftMessage(message, sender, storage, runtimeId) {
   if (!isAuthorizedDraftMessage(message, sender, runtimeId)) {
     return { handled: false };
+  }
+  if (!(await loadDataConsent(storage, { expectedEpoch: message.expectedEpoch }))) {
+    throw new ValidationError(
+      "Local note capture has not been allowed.",
+      "consent-required",
+    );
   }
   if (message.type === MESSAGE_TYPES.saveEditorDraft) {
     const result = await saveEditorDraft(message.draft, storage, {
@@ -101,23 +112,27 @@ function isMissingContextMenuError(error) {
   return error instanceof Error && /cannot find|does not exist|not found/iu.test(error.message);
 }
 
+async function removeCaptureContextMenuDirect(contextMenus, runtime) {
+  try {
+    await runContextMenuMethod(
+      contextMenus,
+      "remove",
+      [CAPTURE_CONTEXT_MENU_ID],
+      runtime,
+    );
+  } catch (error) {
+    if (!isMissingContextMenuError(error)) {
+      throw error;
+    }
+  }
+}
+
 export function ensureCaptureContextMenu(
   contextMenus = chrome.contextMenus,
   runtime = chrome.runtime,
 ) {
   const register = async () => {
-    try {
-      await runContextMenuMethod(
-        contextMenus,
-        "remove",
-        [CAPTURE_CONTEXT_MENU_ID],
-        runtime,
-      );
-    } catch (error) {
-      if (!isMissingContextMenuError(error)) {
-        throw error;
-      }
-    }
+    await removeCaptureContextMenuDirect(contextMenus, runtime);
     await runContextMenuMethod(
       contextMenus,
       "create",
@@ -132,6 +147,52 @@ export function ensureCaptureContextMenu(
     );
   };
   const operation = contextMenuRegistrationQueue.then(register, register);
+  contextMenuRegistrationQueue = operation.catch(() => undefined);
+  return operation;
+}
+
+export function removeCaptureContextMenu(
+  contextMenus = chrome.contextMenus,
+  runtime = chrome.runtime,
+) {
+  const remove = () => removeCaptureContextMenuDirect(contextMenus, runtime);
+  const operation = contextMenuRegistrationQueue.then(remove, remove);
+  contextMenuRegistrationQueue = operation.catch(() => undefined);
+  return operation;
+}
+
+export function syncCaptureContextMenu(
+  storage = chrome.storage.local,
+  contextMenus = chrome.contextMenus,
+  runtime = chrome.runtime,
+) {
+  const sync = async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await removeCaptureContextMenuDirect(contextMenus, runtime);
+      const acceptedEpoch = await loadDataConsent(storage);
+      if (acceptedEpoch) {
+        await runContextMenuMethod(
+          contextMenus,
+          "create",
+          [
+            {
+              id: CAPTURE_CONTEXT_MENU_ID,
+              title: "Capture selection in Lecture Notes",
+              contexts: ["selection"],
+            },
+          ],
+          runtime,
+        );
+      }
+      const current = await loadDataConsent(storage);
+      if (current === acceptedEpoch) {
+        return Boolean(acceptedEpoch);
+      }
+    }
+    await removeCaptureContextMenuDirect(contextMenus, runtime);
+    return false;
+  };
+  const operation = contextMenuRegistrationQueue.then(sync, sync);
   contextMenuRegistrationQueue = operation.catch(() => undefined);
   return operation;
 }
@@ -176,7 +237,18 @@ export async function captureContextSelection(
   tab,
   storage = chrome.storage.local,
   captureIdFactory = () => `context-menu-${crypto.randomUUID()}`,
+  { expectedConsentEpoch } = {},
 ) {
+  const acceptedEpoch = await loadDataConsent(
+    storage,
+    expectedConsentEpoch ? { expectedEpoch: expectedConsentEpoch } : {},
+  );
+  if (!acceptedEpoch || (expectedConsentEpoch && acceptedEpoch !== expectedConsentEpoch)) {
+    throw new ValidationError(
+      "Local note capture has not been allowed.",
+      "consent-required",
+    );
+  }
   const selection = normalizeContextSelection(info?.selectionText);
   if (!selection.text) {
     return { saved: false, reason: "empty-selection", wasTruncated: false };
@@ -187,7 +259,6 @@ export async function captureContextSelection(
     (value) => typeof value === "string" && value.length <= LIMITS.captureUrl,
   );
   const source = normalizeSource({ title, url: rawUrl || "" });
-  const expectedEpoch = await loadDataEpoch(storage);
   const result = await enqueuePendingCapture(
     {
       id: captureIdFactory(),
@@ -197,7 +268,7 @@ export async function captureContextSelection(
       wasTruncated: selection.wasTruncated,
     },
     storage,
-    { expectedEpoch },
+    { expectedEpoch: acceptedEpoch },
   );
 
   return {
@@ -209,8 +280,14 @@ export async function captureContextSelection(
   };
 }
 
-export async function openCaptureSurface(chromeApi = chrome) {
+export async function openCaptureSurface(
+  chromeApi = chrome,
+  { captureQueued = true } = {},
+) {
   const popupUrl = chromeApi.runtime.getURL("popup.html");
+  const failureMessage = captureQueued
+    ? "The captured selection was queued, but its editor could not open."
+    : "Lecture Notes could not open the consent gate.";
   let windowError = null;
   if (typeof chromeApi.windows?.create === "function") {
     try {
@@ -238,20 +315,62 @@ export async function openCaptureSurface(chromeApi = chrome) {
         : error instanceof Error
           ? error.message
           : "Tab failed.";
-      throw new Error(`The captured selection was queued, but its editor could not open. ${detail}`, {
+      throw new Error(`${failureMessage} ${detail}`, {
         cause: error,
       });
     }
   }
 
-  throw windowError || new Error("The captured selection was queued, but its editor could not open.");
+  if (windowError) {
+    throw new Error(`${failureMessage} ${windowError.message}`, { cause: windowError });
+  }
+  throw new Error(failureMessage);
 }
 
 export async function handleContextMenuClick(info, tab, chromeApi = chrome) {
   if (info?.menuItemId !== CAPTURE_CONTEXT_MENU_ID) {
     return { handled: false };
   }
-  const capture = await captureContextSelection(info, tab, chromeApi.storage.local);
+  const acceptedEpoch = await loadDataConsent(chromeApi.storage.local);
+  if (!acceptedEpoch) {
+    const surface = await openCaptureSurface(chromeApi, { captureQueued: false });
+    return {
+      handled: true,
+      capture: {
+        saved: false,
+        reason: "consent-required",
+        wasTruncated: false,
+      },
+      surface,
+    };
+  }
+  let capture;
+  try {
+    capture = await captureContextSelection(
+      info,
+      tab,
+      chromeApi.storage.local,
+      undefined,
+      { expectedConsentEpoch: acceptedEpoch },
+    );
+  } catch (error) {
+    if (
+      error instanceof ValidationError &&
+      ["consent-required", "data-reset"].includes(error.code)
+    ) {
+      const surface = await openCaptureSurface(chromeApi, { captureQueued: false });
+      return {
+        handled: true,
+        capture: {
+          saved: false,
+          reason: "consent-required",
+          wasTruncated: false,
+        },
+        surface,
+      };
+    }
+    throw error;
+  }
   if (!capture.saved) {
     return { handled: true, capture, surface: null };
   }
@@ -261,13 +380,25 @@ export async function handleContextMenuClick(info, tab, chromeApi = chrome) {
 
 if (typeof chrome !== "undefined") {
   const registerContextMenu = () => {
-    void ensureCaptureContextMenu(chrome.contextMenus, chrome.runtime).catch((error) => {
-      console.error("Lecture Notes context menu could not be created.", error);
+    void syncCaptureContextMenu(
+      chrome.storage.local,
+      chrome.contextMenus,
+      chrome.runtime,
+    ).catch((error) => {
+      console.error("Lecture Notes context menu could not be updated.", error);
     });
   };
 
   chrome.runtime.onInstalled.addListener(registerContextMenu);
   chrome.runtime.onStartup.addListener(registerContextMenu);
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (
+      areaName === "local" &&
+      (changes["lectureNoteDataConsent"] || changes["lectureNoteDataEpoch"])
+    ) {
+      registerContextMenu();
+    }
+  });
   chrome.contextMenus.onClicked.addListener((info, tab) => {
     void handleContextMenuClick(info, tab, chrome).catch((error) => {
       console.error("Lecture Notes could not capture the selected text.", error);
@@ -275,6 +406,23 @@ if (typeof chrome !== "undefined") {
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (
+      message?.type === MESSAGE_TYPES.dataConsentChanged &&
+      sender?.id === chrome.runtime.id
+    ) {
+      void syncCaptureContextMenu(
+        chrome.storage.local,
+        chrome.contextMenus,
+        chrome.runtime,
+      ).then(
+        (consent) => sendResponse({ ok: true, consent }),
+        (error) => sendResponse({
+          ok: false,
+          error: error instanceof Error ? error.message : "Consent status not checked",
+        }),
+      );
+      return true;
+    }
     if (!isAuthorizedDraftMessage(message, sender, chrome.runtime.id)) {
       return false;
     }
@@ -288,4 +436,5 @@ if (typeof chrome !== "undefined") {
     );
     return true;
   });
+  registerContextMenu();
 }
